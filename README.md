@@ -1,35 +1,45 @@
-# LOL_Skin_Modder_VN
+# LeagueSkinManagerVN
 
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/Quinntana/LOL_Skin_Modder)
-![GitHub license](https://img.shields.io/github/license/Quinntana/LOL_Skin_Modder)
-![GitHub stars](https://img.shields.io/github/stars/Quinntana/LOL_Skin_Modder?style=social)
-
-**LOL_Skin_Modder_VN** is a powerful tool designed to enhance your League of Legends experience by automating the management of custom skins. It downloads official skins from community repositories, integrates with CSLOL Manager for seamless installation, and offers features like batch processing and factory reset. Built with Python, this project is perfect for players looking to bypass Riot’s pricing barriers or explore custom skin options in a post-Vanguard world.
+> **A lightweight Windows service for automating League of Legends custom skin installation**
+> Built with Python, Poetry, and PyInstaller.
+> Includes background service (`LeagueSkinManagerVN.exe`) and standalone UI (`cslol-manager.exe`).
 
 ---
 
-## Features
+## 📌 Features
 
-- **Automatic Skin Downloading**: Retrieves official League of Legends skins from the `darkseal-org/lol-skins` GitHub repository.
-- **CSLOL Manager Integration**: Automatically updates CSLOL Manager, preserving your installed skins during upgrades.
-- **Current Champion Detection**: Identifies your in-game champion and installs skins with a single command.
-- **Batch Skin Installation**: Downloads and installs skins for all champions in one go.
-- **Factory Reset**: Clears downloaded skins and resets the installation directory while keeping user-installed mods intact.
-- **Cross-Platform Support**: Compatible with Windows (ZIP extraction) and macOS (tarball support).
-- **Detailed Logging**: Tracks operations and errors in `skin_manager.log` for easy debugging.
-- **Modular Design**: Organized into modules (`champ_list.py`, `skin_downloader.py`, `skin_installer.py`, `update_checker.py`) for maintainability.
+- **Automatic skin installation** — installs *all champion skins* (excluding chromas) without user input.
+- **Fast install check** — uses a lightweight folder-hash to detect missing or outdated skins.
+- **Single-instance service** — prevents multiple background services from running at once.
+- **Tray integration** — hide to system tray with:
+  - `Start CSLOL Manager`
+  - `Exit`
+- **CSLOL Manager integration** — launches automatically after skin installation or when League Client is detected.
+- **Robust version control**:
+  - Writes LoL version only after successful skin installation.
+  - Writes CSLOL Manager version only after successful install/update.
+- **Windows startup support** — can run silently in the background.
 
 ---
 
-## Usage
-Download and run the exe or if you want to run it yourself, follow the step below:
-1. Install dependencies.
-   ```bash
-   pip install -r requirements.txt
-3. Run:
-   ```bash
-   cd src
-   python main.py
+## 🖥️ Executables
 
-## Showcase
-https://www.youtube.com/watch?v=WTbJWBQ6bfI
+| Executable                 | Role                                                                                   |
+|----------------------------|----------------------------------------------------------------------------------------|
+| `LeagueSkinManagerVN.exe`  | Background service — auto-installs skins, launches CSLOL Manager, manages tray icon.  |
+| `cslol-manager.exe`        | Standalone UI for skin management. Installed automatically from GitHub release.       |
+| `LeagueSkinManagerVNUninstall.exe` | Cleans all data, requires no network connection, prompts if other instances running. |
+
+---
+
+## 📂 Data & Paths
+
+All data is stored in: %APPDATA%\LeagueSkinManagerVN\
+
+---
+
+## 🚀 Requirements
+
+- **Windows** (x64)
+- Python 3.10+
+- [Poetry](https://python-poetry.org/)
