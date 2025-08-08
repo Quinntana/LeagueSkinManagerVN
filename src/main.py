@@ -1,31 +1,45 @@
+import sys
 import os
 import time
-import shutil
+import threading
 import subprocess
 import ctypes
 from ctypes import wintypes
-from config import PROJECT_ROOT, DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, DATA_DIR
+import zlib
+import logging
+
+import psutil
 from logger import setup_logger
-from champions import get_current_champion, get_champion_names
+from champions import get_champion_names
 from skin_downloader import download_repo
 from skin_installer import install_skins
-from update_checker import check_and_update
+from update_checker import check_and_update, get_installed_version, get_latest_manager_version
+from config import (
+    PROJECT_ROOT, DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, DATA_DIR,
+    INSTALLED_DIR, LOL_VERSION_FILE, VERSION_FILE, INSTALLED_HASH_FILE
+)
 
-APP_MUTEX_NAME = "{LeagueSkinManagerVN}"
+import pystray
+from PIL import Image, ImageDraw
+
+APP_MUTEX_NAME = "LeagueSkinManagerVN_Mutex_v1"
 
 logger = setup_logger(__name__)
 
-def verify_paths():
-    """Ensure all required directories exist"""
-    required_dirs = [DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR]
-    for directory in required_dirs:
-        os.makedirs(directory, exist_ok=True)
-        logger.info(f"Verified directory: {directory}")
+# ---------- Utilities ----------
 
-def ensure_single_instance():
-    """Ensure only one instance of the application runs at a time"""
-    logger.info("Checking for existing application instance...")
+def ensure_windows():
+    if sys.platform != "win32":
+        logger.error("This executable is Windows-only.")
+        print("Error: This executable only runs on Windows.")
+        sys.exit(1)
 
+def ensure_paths():
+    for d in (DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, INSTALLED_DIR):
+        os.makedirs(d, exist_ok=True)
+
+def create_mutex():
+    """Create a named mutex to ensure single instance (Win32)."""
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     CreateMutexW = kernel32.CreateMutexW
     CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
@@ -33,146 +47,251 @@ def ensure_single_instance():
 
     mutex = CreateMutexW(None, False, APP_MUTEX_NAME)
     if not mutex:
-        error_code = ctypes.get_last_error()
-        logger.error(f"Failed to create mutex. Error code: {error_code}")
-        return False
+        err = ctypes.get_last_error()
+        logger.error(f"CreateMutexW failed: {err}")
+        return None
 
     last_error = ctypes.get_last_error()
-    if last_error == 0x000000B7:
-        logger.warning("Another instance of the application is already running.")
-        return False
+    if last_error == 183:
+        return None
+    return mutex
 
-    logger.info("No other instance detected. Continuing.")
-    return True
+def exit_if_already_running():
+    mutex = create_mutex()
+    if not mutex:
+        if os.path.exists(INSTALLED_HASH_FILE):
+            exe_path = os.path.join(INSTALL_DIR, "cslol-manager.exe")
+            if os.path.exists(exe_path):
+                try:
+                    subprocess.Popen([exe_path], shell=False)
+                    print("Another instance is running. Launching CSLOL-Manager. Closing in 3 seconds...")
+                    logger.info("Another instance detected; launched CSLOL Manager and exiting.")
+                except Exception:
+                    logger.exception("Another instance detected but failed to launch CSLOL Manager.")
+                    print("Another instance is running. Closing in 3 seconds...")
+            else:
+                print("Another instance is running. Closing in 3 seconds...")
+                logger.warning("Another instance detected; CSLOL Manager exe not found.")
+        else:
+            print("Another instance is running. Closing in 3 seconds...")
+            logger.warning("Another instance detected during install; exiting.")
+        time.sleep(3)
+        sys.exit(0)
+    return mutex
 
-
-def process_champion(champion, skip_chromas=False):
-    """Full processing pipeline for a champion"""
-    logger.info(f"Processing {champion}")
-
-    if not download_repo():
-        logger.error("Failed to download skins repository")
-        return 0
-
-    installed = install_skins(champion, skip_chromas)
-    logger.info(f"Installed {installed} skins for {champion}")
-    return installed
-
-def factory_reset():
-    """Reset all downloaded and installed content"""
-    logger.info("Performing factory reset")
-
+def simple_folder_hash(path):
+    """Very fast (not cryptographically secure) hash of folder names in INSTALLED_DIR."""
     try:
-        if os.path.exists(DATA_DIR):
-            shutil.rmtree(DATA_DIR)
-            os.makedirs(DOWNLOAD_DIR)
-            os.makedirs(INSTALL_DIR)
-            logger.info("Reset CSLOL Manager installation")
-
-        return True
+        entries = []
+        if os.path.exists(path):
+            for name in os.listdir(path):
+                if os.path.isdir(os.path.join(path, name)):
+                    entries.append(name)
+        entries.sort()
+        s = "|".join(entries).encode("utf-8", errors="ignore")
+        return format(zlib.crc32(s) & 0xFFFFFFFF, '08x')
     except Exception as e:
-        logger.error(f"Factory reset failed: {e}")
+        logger.exception("Hashing failed")
+        return None
+
+def read_hash():
+    try:
+        with open(INSTALLED_HASH_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+def write_hash(h):
+    try:
+        with open(INSTALLED_HASH_FILE, "w") as f:
+            f.write(str(h))
+    except Exception:
+        logger.exception("Failed to write hash file")
+
+def is_process_running_by_name(name):
+    name = name.lower()
+    for p in psutil.process_iter(["name"]):
+        try:
+            if p.info["name"] and p.info["name"].lower() == name:
+                return True
+        except Exception:
+            continue
+    return False
+
+def launch_cslol_manager():
+    exe_path = os.path.join(INSTALL_DIR, "cslol-manager.exe")
+    if os.path.exists(exe_path):
+        try:
+            subprocess.Popen([exe_path], shell=False)
+            logger.info("Launched CSLOL Manager.")
+            return True
+        except Exception as e:
+            logger.exception(f"Failed to launch CSLOL Manager: {e}")
+            return False
+    else:
+        logger.warning("CSLOL Manager exe not found.")
         return False
 
-def main_menu():
-    """Command-line interface"""
-    print("\nLeague Skin Manager VN")
-    print("1. Install skins for a single champion (with chromas)")
-    print("2. Install skins for all champions")
-    print("3. Factory reset")
-    print("4. Open CSLOL Manager")
-    print("5. Manage Mods")
-    print("6. Exit")
+# ---------- Installation Logic ----------
 
-    while True:
-        choice = input("\nSelect option: ").strip()
+_install_lock = threading.Lock()
+_install_in_progress = threading.Event()
+_install_successful = threading.Event()
 
-        if choice == "1":
-            champion = get_current_champion()
-            if not champion:
-                print("Champion detection failed. Enter manually:")
-                champion = input("Champion name: ").strip()
-
-            if champion:
-                process_champion(champion, skip_chromas=False)
-            else:
-                print("Invalid champion name")
-
-        elif choice == "2":
-            print("\nWARNING: Installing chromas for all champions may cause CSLOL Manager to become slow/laggy.")
-            print("If CSLOL Manager becomes unresponsive, perform a Factory Reset (option 3).")
-
-            install_chromas = ""
-            while install_chromas.lower() not in ["y", "n"]:
-                install_chromas = input("Include chromas? (y/n): ").strip()
-
-            skip_chromas = (install_chromas.lower() == "n")
-
-            champions = get_champion_names()
-            if not champions:
-                print("Failed to get champion list")
-                continue
-
-            print(f"Found {len(champions)} champions")
-            start = time.time()
-
-            for i, champ in enumerate(champions, 1):
-                print(f"\nProcessing {i}/{len(champions)}: {champ}")
-                process_champion(champ, skip_chromas=skip_chromas)
-
-            print(f"\nCompleted in {time.time()-start:.1f} seconds")
-
-        elif choice == "3":
-            if factory_reset():
-                print("Reset complete")
-                return
-            else:
-                print("Reset failed - see logs for details")
-                return
-
-        elif choice == "4":
-            try:
-                cslol_path = os.path.join(INSTALL_DIR, "cslol-manager.exe")
-
-                if os.path.exists(cslol_path):
-                    print(f"Launching CSLOL Manager")
-                    subprocess.Popen([cslol_path], shell=True)
-                else:
-                    print("CSLOL Manager not found. Please install it first.")
-            except Exception as e:
-                logger.error(f"Failed to launch CSLOL Manager: {e}")
-                print(f"Error launching CSLOL Manager: {e}")
-
-        elif choice == "5":
-            from mod_manager import main as mod_manager_main
-            mod_manager_main()
-
-        elif choice == "6":
+def install_all_skins(skip_chromas=True):
+    """Download repo (if needed) and install every champion's skins (skip chromas by default)."""
+    if _install_in_progress.is_set():
+        return
+    _install_in_progress.set()
+    try:
+        logger.info("Starting auto-install of all champion skins (skip chromas=%s)", skip_chromas)
+        if not download_repo():
+            logger.error("Failed to download skins repository.")
             return
 
-        else:
-            print("Invalid option")
+        champions = get_champion_names()
+        if not champions:
+            logger.warning("Could not fetch champion list; aborting install.")
+            return
+
+        total_installed = 0
+        for i, champ in enumerate(champions, 1):
+            logger.info("Installing (%d/%d): %s", i, len(champions), champ)
+            installed = install_skins(champ, skip_chromas)
+            total_installed += (installed or 0)
+
+        # After a successful install write LoL version file (done in update_checker when fetch available)
+        # Compute and store installed hash
+        h = simple_folder_hash(INSTALLED_DIR)
+        if h:
+            write_hash(h)
+            logger.info("Wrote installed hash %s", h)
+        _install_successful.set()
+        logger.info("Auto-install finished. Total installed skins (approx): %d", total_installed)
+
+    except Exception:
+        logger.exception("Auto-install encountered an error")
+    finally:
+        _install_in_progress.clear()
+
+# ---------- Tray / Polling ----------
+
+tray_icon = None
+tray_thread = None
+polling_thread = None
+_stop_threads = threading.Event()
+
+def make_default_icon():
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((8, 8, 56, 56), fill=(30, 144, 255))
+    return img
+
+def on_start_manager(icon, item):
+    launch_cslol_manager()
+
+def on_exit(icon, item):
+    logger.info("User requested exit from tray")
+    _stop_threads.set()
+    try:
+        icon.stop()
+    except Exception:
+        pass
+    time.sleep(0.5)
+    sys.exit(0)
+
+def polling_loop():
+    logger.info("Polling thread started (looking for LeagueClient.exe every 5s)")
+    while not _stop_threads.is_set():
+        try:
+            if is_process_running_by_name("LeagueClient.exe"):
+                logger.debug("LeagueClient.exe detected")
+                if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")) and not is_process_running_by_name("cslol-manager.exe"):
+                    logger.info("Launching CSLOL Manager because LeagueClient.exe is active")
+                    launch_cslol_manager()
+        except Exception:
+            logger.exception("Polling loop error")
+        _stop_threads.wait(5)
+
+def start_tray():
+    global tray_icon, tray_thread, polling_thread
+    icon_image = None
+    exe_icon_path = os.path.join(PROJECT_ROOT, "icon.ico")
+    if os.path.exists(exe_icon_path):
+        try:
+            icon_image = Image.open(exe_icon_path)
+        except Exception:
+            icon_image = None
+    if icon_image is None:
+        icon_image = make_default_icon()
+
+    menu = pystray.Menu(
+        pystray.MenuItem('Start CSLOL Manager', on_start_manager),
+        pystray.MenuItem('Exit', on_exit)
+    )
+    tray_icon = pystray.Icon("LeagueSkinManagerVN", icon_image, "LeagueSkinManagerVN", menu)
+
+    polling_thread = threading.Thread(target=polling_loop, daemon=True)
+    polling_thread.start()
+
+    tray_icon.run()
+
+# ---------- Startup ----------
+
+def main():
+    ensure_windows()
+    mutex = exit_if_already_running()
+    ensure_paths()
+
+    logger.info("Checking for updates")
+    try:
+        update_results = check_and_update()
+        if update_results.get('manager_updated'):
+            logger.info("CSLOL Manager updated by update checker")
+        if update_results.get('lol_version_changed'):
+            logger.info("LoL version changed and skins were reset by update checker")
+    except Exception:
+        logger.exception("Update check failed")
+
+    current_hash = read_hash()
+    new_hash = simple_folder_hash(INSTALLED_DIR)
+    needs_install = False
+    if current_hash is None or new_hash is None:
+        needs_install = True
+    elif current_hash != new_hash:
+        needs_install = True
+
+    logger.info("Installed hash (file)=%s computed=%s needs_install=%s", current_hash, new_hash, needs_install)
+
+    if needs_install:
+        installer_thread = threading.Thread(target=install_all_skins, kwargs={'skip_chromas': True}, daemon=True)
+        installer_thread.start()
+    else:
+        logger.info("No install required; skipping auto-install.")
+        _install_successful.set()
+
+    try:
+        while installer_thread.is_alive() and not _install_successful.is_set():
+            time.sleep(1)
+        if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")):
+            if not is_process_running_by_name("cslol-manager.exe"):
+                launch_cslol_manager()
+    except Exception:
+        logger.exception("Failed to auto-launch cslol-manager at startup")
+
+    try:
+        start_tray()
+    except Exception:
+        logger.exception("Tray failed to start")
+        while installer_thread.is_alive():
+            time.sleep(1)
+        sys.exit(0)
 
 if __name__ == "__main__":
     try:
-        if not ensure_single_instance():
-            print("Cannot run multiple instances")
-            exit(1)
-
-        verify_paths()
-        os.chdir(PROJECT_ROOT)
-        print("Checking for updates...")
-        update_result = check_and_update()
-        if update_result['lol_version_changed']:
-            print("Skins have been reset")
-        if update_result['manager_updated']:
-            print("CSLOL Manager updated successfully")
-
-        main_menu()
+        main()
     except KeyboardInterrupt:
-        print("\nOperation cancelled")
-    except Exception as e:
-        logger.exception("Critical error occurred")
-        print(f"Error: {e}\nSee logs for details")
-    finally:
-        print("Exiting application")
+        logger.info("Interrupted by user")
+    except Exception:
+        logger.exception("Fatal error in main")
+        raise

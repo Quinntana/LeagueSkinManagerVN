@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "LeagueSkinManagerVN"
+version = "0.0.3"
+description = "A tool for managing League of Legends custom skins"
+authors = ["Quinntana <archimedesstar@gmail.com>"]
+license = "GPL-3.0"
+readme = "README.md"
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.8,<3.15"
+requests = "^2.31.0"
+pystray = "^0.19.4"
+psutil = "^5.9.8"
+Pillow = "^10.0.0"
+pyinstaller = "^6.15.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

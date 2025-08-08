@@ -1,0 +1,41 @@
+# Byte-compiled / optimized
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenvs
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# Poetry lock (optional to ignore)
+poetry.lock
+
+# PyInstaller build/dist
+build/
+dist/
+*.spec
+
+# Logs and data
+data/
+**/data/
+logs/
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows executable artifacts
+*.exe
+
+# Concat
+concat_ignore_this.py
+project_combined.txt
