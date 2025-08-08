@@ -160,14 +160,19 @@ def install_all_skins(skip_chromas=True):
             installed = install_skins(champ, skip_chromas)
             total_installed += (installed or 0)
 
-        # After a successful install write LoL version file (done in update_checker when fetch available)
-        # Compute and store installed hash
         h = simple_folder_hash(INSTALLED_DIR)
         if h:
             write_hash(h)
             logger.info("Wrote installed hash %s", h)
         _install_successful.set()
         logger.info("Auto-install finished. Total installed skins (approx): %d", total_installed)
+
+        try:
+            if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")):
+                if not is_process_running_by_name("cslol-manager.exe"):
+                    launch_cslol_manager()
+        except Exception:
+            logger.exception("Failed to auto-launch cslol-manager after skin installation")
 
     except Exception:
         logger.exception("Auto-install encountered an error")
@@ -271,13 +276,12 @@ def main():
         _install_successful.set()
 
     try:
-        while installer_thread.is_alive() and not _install_successful.is_set():
-            time.sleep(1)
-        if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")):
-            if not is_process_running_by_name("cslol-manager.exe"):
-                launch_cslol_manager()
+        if os.path.exists(INSTALLED_HASH_FILE):
+            if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")):
+                if not is_process_running_by_name("cslol-manager.exe"):
+                    launch_cslol_manager()
     except Exception:
-        logger.exception("Failed to auto-launch cslol-manager at startup")
+        logger.exception("Launch CSLol-Manager.exe failed during subsequent launch.")
 
     try:
         start_tray()
