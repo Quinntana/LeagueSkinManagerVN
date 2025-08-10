@@ -3,9 +3,10 @@ import sys
 import time
 import shutil
 import ctypes
+import winreg
 from ctypes import wintypes
 import psutil
-from config import DATA_DIR, INSTALL_DIR, PROJECT_ROOT
+from config import DATA_DIR, INSTALL_DIR, PROJECT_ROOT, APP_NAME
 
 def is_admin():
     try:
@@ -33,6 +34,20 @@ def any_running(names):
 
 def message_box(text, title="LeagueSkinManagerVN"):
     ctypes.windll.user32.MessageBoxW(None, text, title, 0)
+
+def remove_from_startup():
+    """Remove the startup registry entry if it exists."""
+    try:
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+        try:
+            winreg.DeleteValue(key, APP_NAME)
+            print(f"Removed startup registry entry for {APP_NAME}")
+        except FileNotFoundError:
+            print(f"No startup registry entry found for {APP_NAME}")
+        winreg.CloseKey(key)
+    except Exception as e:
+        print(f"Failed to remove startup registry entry: {e}")
 
 def main():
     if sys.platform != 'win32':
@@ -65,6 +80,7 @@ def main():
             return
 
     try:
+        remove_from_startup()
         shutil.rmtree(DATA_DIR, ignore_errors=True)
         message_box(f"Successfully removed {DATA_DIR}", "Uninstall complete")
     except Exception as e:

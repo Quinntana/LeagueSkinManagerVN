@@ -7,6 +7,7 @@ import ctypes
 from ctypes import wintypes
 import zlib
 import logging
+import winreg
 
 import psutil
 from logger import setup_logger
@@ -16,7 +17,7 @@ from skin_installer import install_skins
 from update_checker import check_and_update, get_installed_version, get_latest_manager_version
 from config import (
     PROJECT_ROOT, DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, DATA_DIR,
-    INSTALLED_DIR, LOL_VERSION_FILE, VERSION_FILE, INSTALLED_HASH_FILE
+    INSTALLED_DIR, LOL_VERSION_FILE, VERSION_FILE, INSTALLED_HASH_FILE, APP_NAME
 )
 
 import pystray
@@ -27,6 +28,26 @@ APP_MUTEX_NAME = "LeagueSkinManagerVN_Mutex_v1"
 logger = setup_logger(__name__)
 
 # ---------- Utilities ----------
+def add_to_startup():
+    """Add the executable to Windows startup registry if not already present."""
+    try:
+        exe_path = sys.executable 
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+        
+        try:
+            value, _ = winreg.QueryValueEx(key, APP_NAME)
+            if value == exe_path:
+                logger.info("Already added to startup.")
+                return
+        except FileNotFoundError:
+            pass 
+        
+        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
+        winreg.CloseKey(key)
+        logger.info("Added to Windows startup: %s", exe_path)
+    except Exception as e:
+        logger.error("Failed to add to startup: %s", e)
 
 def ensure_windows():
     if sys.platform != "win32":
@@ -247,6 +268,7 @@ def main():
     ensure_windows()
     mutex = exit_if_already_running()
     ensure_paths()
+    add_to_startup()
 
     logger.info("Checking for updates")
     try:

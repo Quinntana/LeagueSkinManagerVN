@@ -16,6 +16,8 @@ poetry.lock
 
 # PyInstaller build/dist
 build/
+build_uninstall/
+build_main/
 dist/
 *.spec
 
@@ -38,4 +40,5 @@ Thumbs.db
 
 # Concat
 concat_ignore_this.py
+concat.py
 project_combined.txt
