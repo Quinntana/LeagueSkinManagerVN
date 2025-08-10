@@ -58,7 +58,7 @@ def main():
             print("Failed to remove:", e)
         return
 
-    running, proc_name = any_running(["LeagueSkinManagerVN.exe", "cslol-manager.exe", "LeagueSkinManagerVNUninstall.exe"])
+    running, proc_name = any_running(["LeagueSkinManagerVN.exe", "cslol-manager.exe"])
     if running:
         message_box(f"Please close {proc_name} before uninstalling.", "Uninstall aborted")
         print("Found running process:", proc_name)
