@@ -8,6 +8,7 @@ else:
 
 APPDATA = os.environ.get('APPDATA') if sys.platform == 'win32' else os.path.join(PROJECT_ROOT, 'data')
 APP_NAME = "LeagueSkinManagerVN"
+UNINSTALL_APP_NAME = "LeagueSkinManagerVNUninstall"
 DATA_DIR = os.path.join(APPDATA, APP_NAME)
 
 DOWNLOAD_DIR = os.path.join(DATA_DIR, "skins")

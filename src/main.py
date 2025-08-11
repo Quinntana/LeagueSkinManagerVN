@@ -17,7 +17,7 @@ from skin_downloader import download_repo
 from skin_installer import install_skins
 from update_checker import check_and_update, get_installed_version, get_latest_manager_version
 from config import (
-    PROJECT_ROOT, DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, DATA_DIR,
+    PROJECT_ROOT, DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, DATA_DIR, UNINSTALL_APP_NAME,
     INSTALLED_DIR, LOL_VERSION_FILE, VERSION_FILE, INSTALLED_HASH_FILE, APP_NAME
 )
 
@@ -80,7 +80,6 @@ def ensure_searchable_in_startmenu():
             shortcut.TargetPath = exe_path
             shortcut.WorkingDirectory = work_dir
             shortcut.IconLocation = icon_path
-            # optional: add arguments, description, etc.
             shortcut.Description = "LeagueSkinManagerVN"
             shortcut.Save()
             logger.info("Created Start Menu shortcut: %s", shortcut_path)
