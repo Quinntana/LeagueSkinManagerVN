@@ -7,6 +7,7 @@ import ctypes
 from ctypes import wintypes
 import zlib
 import logging
+import shutil
 import winreg
 
 import psutil
@@ -31,23 +32,65 @@ logger = setup_logger(__name__)
 def add_to_startup():
     """Add the executable to Windows startup registry if not already present."""
     try:
-        exe_path = sys.executable 
+        exe_path = sys.executable
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-        
+
         try:
             value, _ = winreg.QueryValueEx(key, APP_NAME)
             if value == exe_path:
                 logger.info("Already added to startup.")
                 return
         except FileNotFoundError:
-            pass 
-        
+            pass
+
         winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
         winreg.CloseKey(key)
         logger.info("Added to Windows startup: %s", exe_path)
     except Exception as e:
         logger.error("Failed to add to startup: %s", e)
+
+def ensure_searchable_in_startmenu():
+    """
+    Create a per-user Start Menu shortcut for the running executable so Windows Search
+    and the Start menu can find the app.
+    """
+    try:
+        start_menu = os.path.join(os.environ.get('APPDATA', ''), r"Microsoft\Windows\Start Menu\Programs")
+        if not start_menu:
+            logger.warning("APPDATA not set; cannot create Start Menu shortcut.")
+            return False
+
+        shortcut_dir = os.path.join(start_menu, APP_NAME)
+        os.makedirs(shortcut_dir, exist_ok=True)
+        shortcut_path = os.path.join(shortcut_dir, f"{APP_NAME}.lnk")
+
+        if os.path.exists(shortcut_path):
+            logger.info("Start Menu shortcut already exists: %s", shortcut_path)
+            return True
+
+        exe_path = sys.executable
+        work_dir = os.path.dirname(exe_path)
+        icon_path = os.path.join(work_dir, "icon.ico") if os.path.exists(os.path.join(work_dir, "icon.ico")) else exe_path
+
+        try:
+            from win32com.client import Dispatch
+            shell = Dispatch('WScript.Shell')
+            shortcut = shell.CreateShortcut(shortcut_path)
+            shortcut.TargetPath = exe_path
+            shortcut.WorkingDirectory = work_dir
+            shortcut.IconLocation = icon_path
+            # optional: add arguments, description, etc.
+            shortcut.Description = "LeagueSkinManagerVN"
+            shortcut.Save()
+            logger.info("Created Start Menu shortcut: %s", shortcut_path)
+            return True
+        except Exception as e:
+            logger.warning("Failed to create .lnk via pywin32: %s.", e)
+
+    except Exception:
+        logger.exception("Failed to ensure Start Menu shortcut")
+        return False
 
 def ensure_windows():
     if sys.platform != "win32":
@@ -269,6 +312,7 @@ def main():
     mutex = exit_if_already_running()
     ensure_paths()
     add_to_startup()
+    ensure_searchable_in_startmenu()
 
     logger.info("Checking for updates")
     try:

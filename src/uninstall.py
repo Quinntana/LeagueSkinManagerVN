@@ -49,6 +49,47 @@ def remove_from_startup():
     except Exception as e:
         print(f"Failed to remove startup registry entry: {e}")
 
+def remove_start_menu_shortcut():
+    """
+    Remove per-user Start Menu Programs shortcut/folder that main() creates:
+    %APPDATA%\Microsoft\Windows\Start Menu\Programs\<APP_NAME>\*
+    This will delete the .lnk (if created).
+    """
+    try:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            print("APPDATA not set; skipping Start Menu cleanup.")
+            return
+
+        start_menu = os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs")
+        shortcut_dir = os.path.join(start_menu, APP_NAME)
+
+        if not os.path.exists(shortcut_dir):
+            print("No Start Menu shortcut folder found:", shortcut_dir)
+            return
+
+        # Remove files in the folder (lnk, exe copy, etc.)
+        for entry in os.listdir(shortcut_dir):
+            path = os.path.join(shortcut_dir, entry)
+            try:
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.remove(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+            except Exception as e:
+                print(f"Failed to remove {path}: {e}")
+
+        # Try to remove the now-empty folder; if not empty, remove tree as fallback
+        try:
+            os.rmdir(shortcut_dir)
+            print("Removed Start Menu folder:", shortcut_dir)
+        except Exception:
+            shutil.rmtree(shortcut_dir, ignore_errors=True)
+            print("Force-removed Start Menu folder:", shortcut_dir)
+
+    except Exception as e:
+        print("remove_start_menu_shortcut failed:", e)
+
 def main():
     if sys.platform != 'win32':
         try:
@@ -81,6 +122,7 @@ def main():
 
     try:
         remove_from_startup()
+        remove_start_menu_shortcut()
         shutil.rmtree(DATA_DIR, ignore_errors=True)
         message_box(f"Successfully removed {DATA_DIR}", "Uninstall complete")
     except Exception as e:
