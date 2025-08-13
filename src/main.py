@@ -9,6 +9,7 @@ import zlib
 import logging
 import shutil
 import winreg
+import requests
 
 import psutil
 from logger import setup_logger
@@ -29,6 +30,61 @@ APP_MUTEX_NAME = "LeagueSkinManagerVN_Mutex_v1"
 logger = setup_logger(__name__)
 
 # ---------- Utilities ----------
+def check_internet_connection(timeout=5.0):
+    """Check internet connection using multiple endpoints."""
+    test_urls = [
+        "https://api.github.com",
+        "https://ddragon.leagueoflegends.com",
+        "https://www.google.com/generate_204"
+    ]
+
+    for url in test_urls:
+        try:
+            response = requests.head(url, timeout=timeout, allow_redirects=True)
+            if response.status_code in (200, 204, 302, 405):
+                return True, None
+        except requests.exceptions.RequestException:
+            continue
+
+    if not is_connected_to_network():
+        return False, "No network connection. Check Wi-Fi/Ethernet."
+    if is_connected_to_network() and not is_dns_working():
+        return False, "DNS resolution failed. Check DNS/router settings."
+    return False, "Unable to connect. Check internet/firewall."
+
+def is_connected_to_network():
+    """Check for network connection."""
+    try:
+        return any(
+            interface_addresses for interface, interface_addresses in psutil.net_if_addrs().items()
+            if '127.0.0.1' not in [addr.address for addr in interface_addresses]
+        )
+    except:
+        return False
+
+def is_dns_working():
+    """Check if DNS resolution works."""
+    try:
+        socket.gethostbyname("google.com")
+        return True
+    except:
+        return False
+
+def handle_internet_check():
+    """Handle internet connection check with user feedback."""
+    logger.info("Checking internet connectivity...")
+    is_connected, error_message = check_internet_connection()
+
+    if not is_connected:
+        logger.error(f"Internet check failed: {error_message}")
+        message = f"Internet required.\n\nError: {error_message}\n\nPlease check connection and retry."
+        ctypes.windll.user32.MessageBoxW(None, message, "Internet Required", 0x10)
+        logger.info("Exiting due to no internet")
+        sys.exit(1)
+
+    logger.info("Internet verified")
+    return True
+
 def add_to_startup():
     """Add the executable to Windows startup registry if not already present."""
     try:
@@ -308,6 +364,9 @@ def start_tray():
 
 def main():
     ensure_windows()
+    if not handle_internet_check():
+        return
+
     mutex = exit_if_already_running()
     ensure_paths()
     add_to_startup()
