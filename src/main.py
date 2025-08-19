@@ -10,8 +10,8 @@ import logging
 import shutil
 import winreg
 import requests
-
 import psutil
+
 from logger import setup_logger
 from champions import get_champion_names
 from skin_downloader import download_repo
@@ -26,6 +26,16 @@ import pystray
 from PIL import Image, ImageDraw
 
 APP_MUTEX_NAME = "LeagueSkinManagerVN_Mutex_v1"
+
+STATUS_WAITING = "Waiting for League Client"
+STATUS_INSTALLING = "Installing skins"
+STATUS_FOUND = "League Client detected"
+
+COLOR_BLUE = (30, 144, 255)
+COLOR_YELLOW = (255, 200, 0)
+COLOR_GREEN = (50, 205, 50)
+
+current_status = STATUS_WAITING
 
 logger = setup_logger(__name__)
 
@@ -263,6 +273,7 @@ def install_all_skins(skip_chromas=True):
         return
     _install_in_progress.set()
     try:
+        set_status(STATUS_INSTALLING)
         logger.info("Starting auto-install of all champion skins (skip chromas=%s)", skip_chromas)
         if not download_repo():
             logger.error("Failed to download skins repository.")
@@ -286,17 +297,16 @@ def install_all_skins(skip_chromas=True):
         _install_successful.set()
         logger.info("Auto-install finished. Total installed skins (approx): %d", total_installed)
 
-        try:
-            if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")):
-                if not is_process_running_by_name("cslol-manager.exe"):
-                    launch_cslol_manager()
-        except Exception:
-            logger.exception("Failed to auto-launch cslol-manager after skin installation")
-
     except Exception:
         logger.exception("Auto-install encountered an error")
     finally:
         _install_in_progress.clear()
+        if is_process_running_by_name("LeagueClient.exe"):
+            set_status(STATUS_FOUND)
+            if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")) and not is_process_running_by_name("cslol-manager.exe"):
+                launch_cslol_manager()
+        else:
+            set_status(STATUS_WAITING)
 
 # ---------- Tray / Polling ----------
 
@@ -304,12 +314,20 @@ tray_icon = None
 tray_thread = None
 polling_thread = None
 _stop_threads = threading.Event()
+_tray_lock = threading.Lock()
 
-def make_default_icon():
-    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+def make_colored_icon(rgb, size=64):
+    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((8, 8, 56, 56), fill=(30, 144, 255))
+    d.ellipse((8, 8, size - 8, size - 8), fill=rgb)
     return img
+
+def _build_menu():
+    return pystray.Menu(
+        pystray.MenuItem(lambda *args: f"Status: {current_status}", None, enabled=False),
+        pystray.MenuItem('Start CSLOL Manager', on_start_manager, default=True),
+        pystray.MenuItem('Exit', on_exit)
+    )
 
 def on_start_manager(icon, item):
     launch_cslol_manager()
@@ -324,17 +342,47 @@ def on_exit(icon, item):
     time.sleep(0.5)
     sys.exit(0)
 
+def set_status(new_status):
+    """Thread-safe update of tray icon image and menu text."""
+    global current_status, tray_icon
+    with _tray_lock:
+        current_status = new_status
+        if tray_icon:
+            if new_status == STATUS_INSTALLING:
+                icon_img = make_colored_icon(COLOR_YELLOW)
+            elif new_status == STATUS_FOUND:
+                icon_img = make_colored_icon(COLOR_GREEN)
+            else:
+                icon_img = make_colored_icon(COLOR_BLUE)
+            try:
+                tray_icon.icon = icon_img
+                tray_icon.menu = _build_menu()
+            except Exception:
+                logger.debug("Failed to set tray icon/menu (maybe not initialized yet)")
+
+last_launch_league_pid = None
+
 def polling_loop():
-    logger.info("Polling thread started (looking for LeagueClient.exe every 5s)")
+    global last_launch_league_pid
     while not _stop_threads.is_set():
-        try:
-            if is_process_running_by_name("LeagueClient.exe"):
-                logger.debug("LeagueClient.exe detected")
-                if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")) and not is_process_running_by_name("cslol-manager.exe"):
-                    logger.info("Launching CSLOL Manager because LeagueClient.exe is active")
+        league_proc = None
+        for p in psutil.process_iter(["pid", "name"]):
+            if p.info["name"] and p.info["name"].lower() == "leagueclient.exe":
+                league_proc = p
+                break
+
+        if _install_in_progress.is_set():
+            set_status(STATUS_INSTALLING)
+        else:
+            if league_proc:
+                set_status(STATUS_FOUND)
+                if (last_launch_league_pid != league_proc.pid
+                    and not is_process_running_by_name("cslol-manager.exe")):
                     launch_cslol_manager()
-        except Exception:
-            logger.exception("Polling loop error")
+                    last_launch_league_pid = league_proc.pid
+            else:
+                set_status(STATUS_WAITING)
+                last_launch_league_pid = None
         _stop_threads.wait(5)
 
 def start_tray():
@@ -347,13 +395,11 @@ def start_tray():
         except Exception:
             icon_image = None
     if icon_image is None:
-        icon_image = make_default_icon()
+        icon_image = make_colored_icon(COLOR_BLUE)
 
-    menu = pystray.Menu(
-        pystray.MenuItem('Start CSLOL Manager', on_start_manager),
-        pystray.MenuItem('Exit', on_exit)
-    )
-    tray_icon = pystray.Icon("LeagueSkinManagerVN", icon_image, "LeagueSkinManagerVN", menu)
+    tray_icon = pystray.Icon("LeagueSkinManagerVN", icon_image, "LeagueSkinManagerVN", _build_menu())
+
+    set_status(current_status)
 
     polling_thread = threading.Thread(target=polling_loop, daemon=True)
     polling_thread.start()
@@ -392,6 +438,7 @@ def main():
 
     logger.info("Installed hash (file)=%s computed=%s needs_install=%s", current_hash, new_hash, needs_install)
 
+    installer_thread = None 
     if needs_install:
         installer_thread = threading.Thread(target=install_all_skins, kwargs={'skip_chromas': True}, daemon=True)
         installer_thread.start()
@@ -400,19 +447,11 @@ def main():
         _install_successful.set()
 
     try:
-        if os.path.exists(INSTALLED_HASH_FILE):
-            if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")):
-                if not is_process_running_by_name("cslol-manager.exe"):
-                    launch_cslol_manager()
-    except Exception:
-        logger.exception("Launch CSLol-Manager.exe failed during subsequent launch.")
-
-    try:
         start_tray()
     except Exception:
         logger.exception("Tray failed to start")
-        while installer_thread.is_alive():
-            time.sleep(1)
+        if installer_thread is not None and installer_thread.is_alive():
+            installer_thread.join()
         sys.exit(0)
 
 if __name__ == "__main__":
