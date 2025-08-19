@@ -105,12 +105,6 @@ def check_and_update():
             else:
                 logger.warning("No zip asset found in latest release (%s).", latest_mgr)
 
-            # Delete cslol-diag.exe
-            diag_path = os.path.join(INSTALL_DIR, "cslol-tools", "cslol-diag.exe")
-            if os.path.exists(diag_path):
-                os.remove(diag_path)
-                logger.info(f"Deleted {diag_path}")
-
         except Exception as e:
             logger.exception("Manager update process failed: %s", e)
 
