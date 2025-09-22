@@ -21,11 +21,12 @@ def download_repo():
         except Exception as e:
             logger.error(f"Repository download failed: {e}")
             max_retries = 3
+            delay = 5 
             attempt = 0
             if attempt < max_retries - 1:
                 logger.warning(f"Download failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {delay} seconds...")
                 time.sleep(delay)
-                delay = min(delay * 2, 30)  # Exponential backoff
+                delay = min(delay * 2, 30) 
             else:
                 logger.error("Max retries exceeded for download")
 

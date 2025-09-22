@@ -8,18 +8,21 @@ from ctypes import wintypes
 import zlib
 import logging
 import shutil
+import pythoncom
 import winreg
 import requests
 import psutil
+import socket
+import wmi
 
 from logger import setup_logger
 from champions import get_champion_names
 from skin_downloader import download_repo
 from skin_installer import install_skins
-from update_checker import check_and_update, get_installed_version, get_latest_manager_version
+from update_checker import check_and_update, get_installed_version, get_latest_manager_version, get_latest_lol_version, get_latest_repo_commit
 from config import (
     PROJECT_ROOT, DOWNLOAD_DIR, INSTALL_DIR, LOG_DIR, DATA_DIR, UNINSTALL_APP_NAME,
-    INSTALLED_DIR, LOL_VERSION_FILE, VERSION_FILE, INSTALLED_HASH_FILE, APP_NAME
+    INSTALLED_DIR, LOL_VERSION_FILE, VERSION_FILE, INSTALLED_HASH_FILE, APP_NAME, SKIN_REPO_COMMIT_FILE
 )
 
 import pystray
@@ -294,6 +297,22 @@ def install_all_skins(skip_chromas=True):
         if h:
             write_hash(h)
             logger.info("Wrote installed hash %s", h)
+
+        try:
+                latest_lol = get_latest_lol_version()
+                if latest_lol:
+                    with open(LOL_VERSION_FILE, 'w', encoding='utf-8') as f:
+                        f.write(latest_lol)
+                    logger.info("Wrote current LoL version after install: %s", latest_lol)
+
+                latest_commit = get_latest_repo_commit()
+                if latest_commit:
+                    with open(SKIN_REPO_COMMIT_FILE, 'w', encoding='utf-8') as f:
+                        f.write(latest_commit)
+                    logger.info("Wrote current repo commit after install: %s", latest_commit)
+        except Exception as e:
+            logger.error("Failed to write versions after install: %s", e)
+
         _install_successful.set()
         logger.info("Auto-install finished. Total installed skins (approx): %d", total_installed)
 
@@ -362,6 +381,38 @@ def set_status(new_status):
 
 last_launch_league_pid = None
 
+def event_watcher_loop():
+    """Lightweight WMI query for League Client, low-CPU, standard user permissions."""
+    global last_launch_league_pid
+    try:
+        pythoncom.CoInitialize() 
+        c = wmi.WMI() 
+        while not _stop_threads.is_set():
+            try:
+                processes = c.Win32_Process(name="LeagueClient.exe")
+                if _install_in_progress.is_set():
+                    set_status(STATUS_INSTALLING)
+                elif processes:  
+                    current_pid = processes[0].ProcessId
+                    set_status(STATUS_FOUND)
+                    if (last_launch_league_pid != current_pid and
+                        not is_process_running_by_name("cslol-manager.exe")):
+                        launch_cslol_manager()
+                        last_launch_league_pid = current_pid
+                else:
+                    set_status(STATUS_WAITING)
+                    last_launch_league_pid = None
+                time.sleep(10)
+            
+            except Exception as e:
+                logger.error("WMI query error: %s", e)
+                
+    except Exception as e:
+        logger.exception("WMI setup failed; fall back to polling")
+        polling_loop()
+    finally:
+        logger.info("Event watcher stopped")
+
 def polling_loop():
     global last_launch_league_pid
     while not _stop_threads.is_set():
@@ -386,7 +437,7 @@ def polling_loop():
         _stop_threads.wait(5)
 
 def start_tray():
-    global tray_icon, tray_thread, polling_thread
+    global tray_icon, tray_thread, watcher_thread
     icon_image = None
     exe_icon_path = os.path.join(PROJECT_ROOT, "icon.ico")
     if os.path.exists(exe_icon_path):
@@ -400,10 +451,22 @@ def start_tray():
     tray_icon = pystray.Icon("LeagueSkinManagerVN", icon_image, "LeagueSkinManagerVN", _build_menu())
 
     set_status(current_status)
-
-    polling_thread = threading.Thread(target=polling_loop, daemon=True)
-    polling_thread.start()
-
+    
+    league_proc = None
+    for p in psutil.process_iter(["pid", "name"]):
+        if p.info["name"] and p.info["name"].lower() == "leagueclient.exe":
+            league_proc = p
+            break
+    if league_proc:
+        set_status(STATUS_FOUND)
+        if not is_process_running_by_name("cslol-manager.exe"):
+            launch_cslol_manager()
+            global last_launch_league_pid
+            last_launch_league_pid = league_proc.pid
+    
+    watcher_thread = threading.Thread(target=event_watcher_loop, daemon=True)  # Renamed from polling_thread
+    watcher_thread.start()
+    
     tray_icon.run()
 
 # ---------- Startup ----------
@@ -425,6 +488,8 @@ def main():
             logger.info("CSLOL Manager updated by update checker")
         if update_results.get('lol_version_changed'):
             logger.info("LoL version changed and skins were reset by update checker")
+        if update_results.get('skin_repo_commit_changed'):
+            logger.info("Skin repo commit changed and skins were reset by update checker")
     except Exception:
         logger.exception("Update check failed")
 
