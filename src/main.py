@@ -322,8 +322,6 @@ def install_all_skins(skip_chromas=True):
         _install_in_progress.clear()
         if is_process_running_by_name("LeagueClient.exe"):
             set_status(STATUS_FOUND)
-            if os.path.exists(os.path.join(INSTALL_DIR, "cslol-manager.exe")) and not is_process_running_by_name("cslol-manager.exe"):
-                launch_cslol_manager()
         else:
             set_status(STATUS_WAITING)
 
@@ -332,6 +330,7 @@ def install_all_skins(skip_chromas=True):
 tray_icon = None
 tray_thread = None
 polling_thread = None
+last_launch_league_pid = None
 _stop_threads = threading.Event()
 _tray_lock = threading.Lock()
 
@@ -378,8 +377,6 @@ def set_status(new_status):
                 tray_icon.menu = _build_menu()
             except Exception:
                 logger.debug("Failed to set tray icon/menu (maybe not initialized yet)")
-
-last_launch_league_pid = None
 
 def event_watcher_loop():
     """Lightweight WMI query for League Client, low-CPU, standard user permissions."""
@@ -459,7 +456,7 @@ def start_tray():
             break
     if league_proc:
         set_status(STATUS_FOUND)
-        if not is_process_running_by_name("cslol-manager.exe"):
+        if not is_process_running_by_name("cslol-manager.exe") and not _install_in_progress.is_set():
             launch_cslol_manager()
             global last_launch_league_pid
             last_launch_league_pid = league_proc.pid
