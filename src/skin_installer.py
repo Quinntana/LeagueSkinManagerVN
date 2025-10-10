@@ -11,14 +11,23 @@ def install_skins(champion, skip_chromas=False):
     installed = 0
     try:
         with zipfile.ZipFile(REPO_ZIP_PATH) as repo_zip:
-            skin_files = [
-                f for f in repo_zip.namelist()
-                if f.startswith(f"lol-skins-main/skins/{champion}/")
-                and f.endswith(".zip")
-            ]
+            base_prefix = f"lol-skins-main/skins/{champion}/"
+            skin_files = []
 
-            if skip_chromas:
-                skin_files = [f for f in skin_files if 'chromas' not in f]
+            for f in repo_zip.namelist():
+                if not f.startswith(base_prefix):
+                    continue
+                if not f.endswith('.zip'):
+                    continue
+
+                relative = f[len(base_prefix):]
+                if '/' in relative:
+                    continue
+
+                if skip_chromas and 'chromas' in relative.casefold():
+                    continue
+
+                skin_files.append(f)
 
             if not skin_files:
                 logger.warning(f"No skins found for {champion}")
