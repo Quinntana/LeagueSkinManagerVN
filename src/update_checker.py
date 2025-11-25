@@ -1,4 +1,5 @@
 import os
+import subprocess
 import requests
 import shutil
 import zipfile
@@ -98,8 +99,25 @@ def install_update(temp_file, new_version):
                     except Exception as e:
                         logger.error("Failed to delete item %s during manager update: %s", item, e)
 
-        with zipfile.ZipFile(temp_file, "r") as zip_ref:
-            zip_ref.extractall(DATA_DIR)
+        if temp_file.endswith(".zip"):
+            logger.info("Extracting update via ZipFile...")
+            with zipfile.ZipFile(temp_file, "r") as zip_ref:
+                zip_ref.extractall(DATA_DIR)
+        
+        elif temp_file.endswith(".exe"):
+            logger.info("Extracting update via SFX Exe...")
+            output_flag = f"-o{os.path.abspath(DATA_DIR)}"
+            
+            process = subprocess.run(
+                [temp_file, "-y", output_flag],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW  
+            )
+            
+            if process.returncode != 0:
+                logger.error(f"SFX extraction failed. Code: {process.returncode}, Err: {process.stderr.decode()}")
+                return False
 
         with open(VERSION_FILE, "w", encoding="utf-8") as f:
             f.write(new_version)
@@ -131,18 +149,26 @@ def check_and_update():
         logger.info("Manager update detected: %s -> %s", current_mgr, latest_mgr)
         try:
             release_data = requests.get(GITHUB_RELEASES_URL, timeout=10).json()
-            asset_url = next(
-                (a["browser_download_url"] for a in release_data.get("assets", []) if a["name"].endswith(".zip")),
-                None
-            )
-            if asset_url:
+            assets = release_data.get("assets", [])
+
+            asset_obj = next((a for a in assets if a["name"].endswith(".zip")), None)
+
+            if not asset_obj:
+                asset_obj = next((a for a in assets if a["name"].endswith(".exe") and "manager" in a["name"].lower()), None)
+
+            if asset_obj:
+                asset_url = asset_obj["browser_download_url"]
+                asset_name = asset_obj["name"]
+                logger.info(f"Downloading update asset: {asset_name}")
+
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_file = download_asset(asset_url, tmp)
+                    
                     if tmp_file and install_update(tmp_file, latest_mgr):
                         results['manager_updated'] = True
                         logger.info("Manager updated to %s", latest_mgr)
             else:
-                logger.warning("No zip asset found in latest release (%s).", latest_mgr)
+                logger.warning("No suitable update asset (.zip or .exe) found for release %s", latest_mgr)
 
         except Exception as e:
             logger.exception("Manager update process failed: %s", e)
