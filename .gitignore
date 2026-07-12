@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .env/
 .venv/
+.venv-build/
 env/
 ENV/
 
@@ -20,6 +21,11 @@ build_uninstall/
 build_main/
 dist/
 *.spec
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
 
 # Logs and data
 data/
