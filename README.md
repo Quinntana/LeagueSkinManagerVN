@@ -45,6 +45,11 @@ If the network or source is unavailable, a valid existing manager/mod installati
 remains usable and the tray reports `Ready offline`. A first run with nothing cached
 reports an actionable error instead of destroying or partially installing content.
 
+CSLOL Manager's maintainers now describe it as being in maintenance/deprecation mode
+while development moves to LTK Manager. The current audited CSLOL release remains the
+supported backend here; manager update and launch code is isolated so a future LTK
+adapter does not require another skin-sync rewrite.
+
 ## Tray controls
 
 - `Status`: current lifecycle/synchronization state.
