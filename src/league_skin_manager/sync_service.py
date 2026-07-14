@@ -65,6 +65,10 @@ class TransactionError(SyncError):
     """A live commit or rollback failed."""
 
 
+class SyncMutationBlocked(SyncError):
+    """Live managed content cannot be changed while process state is unsafe."""
+
+
 class CancelSignal(Protocol):
     def is_set(self) -> bool:
         """Return whether cancellation was requested."""
@@ -307,6 +311,7 @@ class SkinSyncService:
         max_total_uncompressed_bytes: int = DEFAULT_MAX_TOTAL_UNCOMPRESSED_BYTES,
         free_space_reserve_bytes: int = DEFAULT_FREE_SPACE_RESERVE_BYTES,
         disk_usage: DiskUsageGetter = _DEFAULT_DISK_USAGE,
+        manager_is_running: Callable[[], bool] | None = None,
     ) -> None:
         if not 1 <= max_workers <= MAX_WORKERS:
             raise ValueError(f"max_workers must be between 1 and {MAX_WORKERS}")
@@ -336,6 +341,7 @@ class SkinSyncService:
         self.max_total_uncompressed_bytes = max_total_uncompressed_bytes
         self.free_space_reserve_bytes = free_space_reserve_bytes
         self.disk_usage = disk_usage
+        self.manager_is_running = manager_is_running or (lambda: False)
         self.journal_path = self.state_path.parent / f".{self.state_path.name}.transaction.json"
         self._lock = threading.Lock()
 
@@ -385,6 +391,7 @@ class SkinSyncService:
         cancel_event: CancelSignal | None,
         progress: ProgressCallback | None,
     ) -> SyncResult:
+        self._ensure_manager_stopped()
         self.installed_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -732,6 +739,9 @@ class SkinSyncService:
             desired_directories=desired_directories,
             existing_before=existing_before,
         )
+        # Staging may run for minutes. Recheck immediately before creating the
+        # recovery journal and moving any live CSLOL directories.
+        self._ensure_manager_stopped()
         atomic_write_json(self.journal_path, journal.to_json())
 
         backup_root = transaction_root / "backup"
@@ -767,6 +777,7 @@ class SkinSyncService:
     def _recover_interrupted_transaction(self) -> bool:
         if not self.journal_path.exists():
             return False
+        self._ensure_manager_stopped()
         journal = self._load_journal()
         current_transaction_id = self._current_transaction_id()
         if current_transaction_id == journal.transaction_id:
@@ -774,6 +785,18 @@ class SkinSyncService:
             return True
         self._rollback(journal)
         return True
+
+    def _ensure_manager_stopped(self) -> None:
+        try:
+            running = self.manager_is_running()
+        except Exception as error:
+            raise SyncMutationBlocked(
+                "Could not safely verify that CSLOL Manager is stopped"
+            ) from error
+        if running:
+            raise SyncMutationBlocked(
+                "CSLOL Manager is running; live managed skins were not changed"
+            )
 
     def _rollback(self, journal: _Journal) -> None:
         backup_root = journal.transaction_root / "backup"

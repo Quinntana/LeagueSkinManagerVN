@@ -38,9 +38,13 @@ class FakeIcon:
         self.notifications: list[tuple[str | None, str]] = []
 
     def run(self, setup: Callable[[FakeIcon], None] | None = None) -> None:
-        self.visible = True
-        if setup is not None:
+        if setup is None:
+            self.visible = True
+        else:
             setup(self)
+
+    def run_detached(self, setup: Callable[[FakeIcon], None] | None = None) -> None:
+        self.run(setup=setup)
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -87,6 +91,7 @@ def make_tray(
 ) -> TrayApplication:
     callbacks: dict[str, Any] = {
         "on_start": lambda: None,
+        "on_show": lambda: None,
         "on_sync": lambda: None,
         "on_start_manager": lambda: None,
         "startup_enabled": lambda: False,
@@ -136,14 +141,15 @@ def test_tray_is_visible_before_startup_callback_runs() -> None:
     assert fake_icon(tray).visible is True
     items = menu_items(tray)
     assert [item.text for item in items] == [
+        "Open LeagueSkinManagerVN",
         "Status: Starting",
         "Sync now",
         "Start manager",
         "Start with Windows",
         "Exit",
     ]
-    assert items[0].options["enabled"] is False
-    assert items[2].options["default"] is True
+    assert items[0].options["default"] is True
+    assert items[1].options["enabled"] is False
 
 
 def test_status_sink_updates_title_icon_and_menu() -> None:
@@ -156,7 +162,7 @@ def test_status_sink_updates_title_icon_and_menu() -> None:
     assert tray.detail == "Downloading 4 of 20"
     assert tray.native_icon.title == "Test Skin Manager - Downloading 4 of 20"
     assert tray.native_icon.icon == "image:SYNCING"
-    assert menu_items(tray)[0].text == "Status: Downloading 4 of 20"
+    assert menu_items(tray)[1].text == "Status: Downloading 4 of 20"
     assert fake_icon(tray).menu_updates == 1
 
 
@@ -172,6 +178,7 @@ def test_menu_actions_toggle_startup_and_exit_only_once() -> None:
 
     tray = make_tray(
         backend,
+        on_show=lambda: calls.append("show"),
         on_sync=lambda: calls.append("sync"),
         on_start_manager=lambda: calls.append("manager"),
         startup_enabled=lambda: startup["enabled"],
@@ -180,17 +187,18 @@ def test_menu_actions_toggle_startup_and_exit_only_once() -> None:
     )
     items = menu_items(tray)
 
-    click(tray, items[1])
+    click(tray, items[0])
     click(tray, items[2])
     click(tray, items[3])
-    refreshed_startup = menu_items(tray)[3]
+    click(tray, items[4])
+    refreshed_startup = menu_items(tray)[4]
     checked = refreshed_startup.options["checked"]
     assert callable(checked)
     assert checked(refreshed_startup) is True
-    click(tray, items[4])
-    click(tray, items[4])
+    click(tray, items[5])
+    click(tray, items[5])
 
-    assert calls == ["sync", "manager", "startup:True", "exit"]
+    assert calls == ["show", "sync", "manager", "startup:True", "exit"]
     assert fake_icon(tray).stop_calls == 1
 
 
@@ -202,7 +210,7 @@ def test_callback_errors_are_not_raised_from_tray_handlers() -> None:
 
     tray = make_tray(backend, on_sync=fail)
 
-    click(tray, menu_items(tray)[1])
+    click(tray, menu_items(tray)[2])
 
     assert fake_icon(tray).notifications == [
         (
@@ -220,7 +228,7 @@ def test_failed_startup_toggle_keeps_existing_state_and_notifies() -> None:
         set_startup_enabled=lambda _enabled: False,
     )
 
-    click(tray, menu_items(tray)[3])
+    click(tray, menu_items(tray)[4])
 
     assert fake_icon(tray).notifications == [
         ("Start with Windows", "The startup setting could not be updated.")
@@ -238,7 +246,7 @@ def test_timed_out_shutdown_keeps_tray_active_and_allows_retry() -> None:
         return next(outcomes)
 
     tray = make_tray(backend, on_exit=exit_app)
-    exit_item = menu_items(tray)[4]
+    exit_item = menu_items(tray)[5]
 
     click(tray, exit_item)
     assert exit_calls == 1
@@ -261,7 +269,7 @@ def test_shutdown_callback_error_does_not_stop_tray() -> None:
 
     tray = make_tray(backend, on_exit=fail_exit)
 
-    click(tray, menu_items(tray)[4])
+    click(tray, menu_items(tray)[5])
 
     assert fake_icon(tray).stop_calls == 0
     assert fake_icon(tray).notifications[-1] == (

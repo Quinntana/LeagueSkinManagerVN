@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 from typing import Protocol
@@ -10,7 +11,7 @@ from typing import Protocol
 from .controller import AppState, SyncOutcome
 from .manager_update import ManagerUpdateStatus, UntrustedReleaseError
 from .skin_source import SkinManifest, SkinSourceError
-from .sync_service import SkinSource, SyncProgress, SyncResult
+from .sync_service import SkinSource, SyncMutationBlocked, SyncProgress, SyncResult
 
 
 class ManifestSource(SkinSource, Protocol):
@@ -42,6 +43,7 @@ class SynchronizationWorkflow:
         manager_executable: Path,
         installed_dir: Path,
         logger: logging.Logger,
+        manager_is_running: Callable[[], bool] | None = None,
     ) -> None:
         self.source = source
         self.sync_service = sync_service
@@ -49,8 +51,14 @@ class SynchronizationWorkflow:
         self.manager_executable = manager_executable
         self.installed_dir = installed_dir
         self.logger = logger
+        self.manager_is_running = manager_is_running or (lambda: False)
 
     def __call__(self, cancel_event: Event) -> SyncOutcome:
+        if self._manager_is_running():
+            return SyncOutcome(
+                AppState.OFFLINE_READY,
+                "Sync paused - close CSLOL Manager and try again",
+            )
         manager_status: ManagerUpdateStatus | None = None
         manager_error: Exception | None = None
         try:
@@ -62,13 +70,30 @@ class SynchronizationWorkflow:
         if cancel_event.is_set():
             return SyncOutcome(AppState.OFFLINE_READY, "Stopping sync")
 
+        if self._manager_is_running():
+            return SyncOutcome(
+                AppState.OFFLINE_READY,
+                "Sync paused - close CSLOL Manager and try again",
+            )
+
         try:
             manifest = self.source.fetch_manifest()
+            if self._manager_is_running():
+                return SyncOutcome(
+                    AppState.OFFLINE_READY,
+                    "Sync paused - close CSLOL Manager and try again",
+                )
             result = self.sync_service.sync(
                 self.source,
                 manifest,
                 cancel_event=cancel_event,
                 progress=self._progress,
+            )
+        except SyncMutationBlocked as exc:
+            self.logger.info("Skin sync deferred because manager state is unsafe: %s", exc)
+            return SyncOutcome(
+                AppState.OFFLINE_READY,
+                "Sync paused - close CSLOL Manager and try again",
             )
         except SkinSourceError as exc:
             if self._has_usable_install():
@@ -94,6 +119,13 @@ class SynchronizationWorkflow:
         elif manager_status is ManagerUpdateStatus.DEFERRED_RUNNING:
             detail += "; manager update deferred"
         return SyncOutcome(AppState.READY, detail)
+
+    def _manager_is_running(self) -> bool:
+        try:
+            return self.manager_is_running()
+        except Exception:
+            self.logger.exception("Could not verify whether CSLOL Manager is running; pausing sync")
+            return True
 
     def _has_usable_install(self) -> bool:
         if not self.manager_executable.is_file() or not self.installed_dir.is_dir():

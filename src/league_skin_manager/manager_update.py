@@ -75,6 +75,10 @@ class ManagerTransactionError(ManagerUpdateError):
     """A manager update transaction or recovery could not complete safely."""
 
 
+class ManagerMutationBlockedError(ManagerUpdateError):
+    """Live manager files cannot be changed while process state is unsafe."""
+
+
 @dataclass(frozen=True, slots=True)
 class ReleaseAsset:
     name: str
@@ -332,13 +336,22 @@ class ManagerUpdater:
             return None
 
     def update(self, cancel_event: Event) -> ManagerUpdateStatus:
+        try:
+            self._ensure_manager_stopped()
+        except ManagerMutationBlockedError:
+            return ManagerUpdateStatus.DEFERRED_RUNNING
         self.manager_dir.mkdir(parents=True, exist_ok=True)
-        self.recover()
+        try:
+            self.recover()
+        except ManagerMutationBlockedError:
+            return ManagerUpdateStatus.DEFERRED_RUNNING
         release = self.client.latest()
         manager_exe = self.manager_dir / "cslol-manager.exe"
         if self._installed_version() == release.version and manager_exe.is_file():
             return ManagerUpdateStatus.CURRENT
-        if self.is_manager_running():
+        try:
+            self._ensure_manager_stopped()
+        except ManagerMutationBlockedError:
             return ManagerUpdateStatus.DEFERRED_RUNNING
         if cancel_event.is_set():
             return ManagerUpdateStatus.CANCELLED
@@ -378,7 +391,11 @@ class ManagerUpdater:
             if len(executables) != 1:
                 raise ValueError("Staged CSLOL update did not contain one manager executable")
             source_root = executables[0].parent
-            self._commit(source_root, transaction_root, release.version)
+            try:
+                self._ensure_manager_stopped()
+                self._commit(source_root, transaction_root, release.version)
+            except ManagerMutationBlockedError:
+                return ManagerUpdateStatus.DEFERRED_RUNNING
             self.logger.info("CSLOL Manager updated to %s", release.version)
             return ManagerUpdateStatus.UPDATED
         finally:
@@ -390,6 +407,7 @@ class ManagerUpdater:
 
         if not self.journal_path.exists():
             return False
+        self._ensure_manager_stopped()
         journal = self._load_journal()
         if (
             self._installed_version() == journal.version
@@ -457,6 +475,11 @@ class ManagerUpdater:
         if not any(entry.name.casefold() == "cslol-manager.exe" for entry in new_entries):
             raise ManagerTransactionError("Staged manager root has no cslol-manager.exe")
 
+        # Process detection is repeated here, immediately before the recovery
+        # journal and live moves. Downloads and extraction can take long enough
+        # for CSLOL Manager to have started after update()'s initial check.
+        self._ensure_manager_stopped()
+
         journal = _UpdateJournal(
             transaction_id=os.urandom(16).hex(),
             transaction_root=transaction_root,
@@ -487,6 +510,21 @@ class ManagerUpdater:
         finally:
             if state_committed:
                 self._cleanup_transaction(journal)
+
+    def _ensure_manager_stopped(self) -> None:
+        try:
+            running = self.is_manager_running()
+        except Exception as error:
+            self.logger.exception(
+                "Could not verify whether CSLOL Manager is running; deferring mutation"
+            )
+            raise ManagerMutationBlockedError(
+                "Could not safely verify that CSLOL Manager is stopped"
+            ) from error
+        if running:
+            raise ManagerMutationBlockedError(
+                "CSLOL Manager is running; live manager files were not changed"
+            )
 
     def _rollback(self, journal: _UpdateJournal) -> None:
         backup = journal.transaction_root / "backup"

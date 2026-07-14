@@ -14,10 +14,12 @@ PACKAGE_DIR = SRC_DIR / "league_skin_manager"
 DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build_main"
 BUILD_DIR_UNINSTALL = PROJECT_ROOT / "build_uninstall"
+BUILD_DIR_INSTALLER = PROJECT_ROOT / "build_installer"
 
 MAIN_NAME = "LeagueSkinManagerVN"
 UNINSTALL_NAME = "LeagueSkinManagerVNUninstall"
-_ALLOWED_OUTPUT_NAMES = frozenset({"build_main", "build_uninstall", "dist"})
+INSTALLER_NAME = "LeagueSkinManagerVNSetup"
+_ALLOWED_OUTPUT_NAMES = frozenset({"build_main", "build_uninstall", "build_installer", "dist"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,15 +27,32 @@ class BuildTarget:
     name: str
     entrypoint: Path
     work_dir: Path
+    hidden_imports: tuple[str, ...] = ()
+    data_files: tuple[Path, ...] = ()
+    data_destination: str = "payload"
 
 
-MAIN_TARGET = BuildTarget(MAIN_NAME, PACKAGE_DIR / "__main__.py", BUILD_DIR)
+MAIN_TARGET = BuildTarget(
+    MAIN_NAME,
+    PACKAGE_DIR / "__main__.py",
+    BUILD_DIR,
+    hidden_imports=("tkinter", "tkinter.ttk", "pystray", "pystray._win32"),
+)
 UNINSTALL_TARGET = BuildTarget(
     UNINSTALL_NAME,
     PACKAGE_DIR / "uninstall.py",
     BUILD_DIR_UNINSTALL,
 )
-BUILD_TARGETS = (MAIN_TARGET, UNINSTALL_TARGET)
+INSTALLER_TARGET = BuildTarget(
+    INSTALLER_NAME,
+    PACKAGE_DIR / "installer.py",
+    BUILD_DIR_INSTALLER,
+    data_files=(
+        DIST_DIR / f"{MAIN_NAME}.exe",
+        DIST_DIR / f"{UNINSTALL_NAME}.exe",
+    ),
+)
+BUILD_TARGETS = (MAIN_TARGET, UNINSTALL_TARGET, INSTALLER_TARGET)
 
 BuildRunner = Callable[[list[str]], None]
 
@@ -60,7 +79,11 @@ def clean_outputs(
     project_root: Path = PROJECT_ROOT,
     outputs: Iterable[Path] | None = None,
 ) -> None:
-    selected = tuple(outputs) if outputs is not None else (BUILD_DIR, BUILD_DIR_UNINSTALL, DIST_DIR)
+    selected = (
+        tuple(outputs)
+        if outputs is not None
+        else (BUILD_DIR, BUILD_DIR_UNINSTALL, BUILD_DIR_INSTALLER, DIST_DIR)
+    )
     for output in selected:
         verified = _verified_output_path(project_root, output)
         if verified.exists():
@@ -87,7 +110,7 @@ def build_arguments(
 
     work_dir = _verified_output_path(root, target.work_dir)
     verified_dist = _verified_output_path(root, dist_dir)
-    return [
+    arguments = [
         "--onefile",
         "--noconfirm",
         "--clean",
@@ -102,14 +125,18 @@ def build_arguments(
         str(work_dir),
         "--paths",
         str(source_dir),
-        "--collect-submodules",
-        "league_skin_manager",
-        "--hidden-import",
-        "pystray",
-        "--hidden-import",
-        "pystray._win32",
-        str(entrypoint),
     ]
+    for hidden_import in target.hidden_imports:
+        arguments.extend(("--hidden-import", hidden_import))
+    for data_file in target.data_files:
+        arguments.extend(
+            (
+                "--add-data",
+                f"{data_file.resolve()}{os.pathsep}{target.data_destination}",
+            )
+        )
+    arguments.append(str(entrypoint))
+    return arguments
 
 
 def _run_pyinstaller(arguments: list[str]) -> None:
@@ -141,7 +168,8 @@ def main() -> None:
     for target in BUILD_TARGETS:
         build_arguments(target)
     clean_outputs()
-    built = [build_target(target) for target in BUILD_TARGETS]
+    built = [build_target(target) for target in (MAIN_TARGET, UNINSTALL_TARGET)]
+    built.append(build_target(INSTALLER_TARGET))
     print("Builds complete:", flush=True)
     for executable in built:
         print(f"  {executable}", flush=True)
@@ -153,6 +181,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "BUILD_TARGETS",
+    "INSTALLER_TARGET",
     "BuildTarget",
     "build_arguments",
     "build_target",

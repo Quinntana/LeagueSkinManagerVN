@@ -19,6 +19,7 @@ poetry.lock
 build/
 build_uninstall/
 build_main/
+build_installer/
 dist/
 *.spec
 .coverage

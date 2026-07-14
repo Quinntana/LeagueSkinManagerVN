@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+from collections.abc import Collection
 from contextlib import suppress
 from ctypes import wintypes
 from pathlib import Path
@@ -14,12 +15,15 @@ from typing import Any
 
 import psutil
 
-from .config import APP_NAME
+from .config import APP_NAME, MANAGER_PROCESS_NAMES
 
 ERROR_ALREADY_EXISTS = 183
 LEGACY_MUTEX_NAME = "LeagueSkinManagerVN_Mutex_v1"
 MUTEX_NAME = "Local\\LeagueSkinManagerVN_Mutex_v2"
 MUTEX_NAMES = (LEGACY_MUTEX_NAME, MUTEX_NAME)
+ACTIVATION_EVENT_NAME = "Local\\LeagueSkinManagerVN_Activate_v1"
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
 
 
 class SingleInstanceMutex:
@@ -73,15 +77,107 @@ class SingleInstanceMutex:
         self.release()
 
 
+class InstanceActivationEvent:
+    """Auto-reset event used to ask the owning instance to show its window."""
+
+    def __init__(self, name: str = ACTIVATION_EVENT_NAME, kernel32: Any | None = None) -> None:
+        self.name = name
+        self.kernel32 = kernel32
+        self.handle: int | None = None
+        if self.kernel32 is None and os.name == "nt":
+            self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def create(self) -> bool:
+        """Create or open the named event and retain its native handle."""
+
+        if self.handle is not None:
+            return True
+        if self.kernel32 is None:
+            return False
+        create_event = self.kernel32.CreateEventW
+        create_event.argtypes = [
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        create_event.restype = wintypes.HANDLE
+        handle = create_event(None, False, False, self.name)
+        if not handle:
+            error = ctypes.get_last_error()
+            raise OSError(error, "Could not create the application activation event")
+        self.handle = int(handle)
+        return True
+
+    def signal(self) -> bool:
+        """Wake the primary instance, retaining a signal until it begins waiting."""
+
+        if not self.create() or self.kernel32 is None or self.handle is None:
+            return False
+        set_event = self.kernel32.SetEvent
+        set_event.argtypes = [wintypes.HANDLE]
+        set_event.restype = wintypes.BOOL
+        if not set_event(wintypes.HANDLE(self.handle)):
+            error = ctypes.get_last_error()
+            raise OSError(error, "Could not signal the application activation event")
+        return True
+
+    def wait(self, timeout_milliseconds: int) -> bool:
+        """Wait for activation, returning ``False`` when the timeout expires."""
+
+        if timeout_milliseconds < 0:
+            raise ValueError("timeout_milliseconds cannot be negative")
+        if not self.create() or self.kernel32 is None or self.handle is None:
+            return False
+        wait_for_single = self.kernel32.WaitForSingleObject
+        wait_for_single.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_single.restype = wintypes.DWORD
+        result = int(
+            wait_for_single(
+                wintypes.HANDLE(self.handle),
+                wintypes.DWORD(timeout_milliseconds),
+            )
+        )
+        if result == WAIT_OBJECT_0:
+            return True
+        if result == WAIT_TIMEOUT:
+            return False
+        error = ctypes.get_last_error()
+        raise OSError(error, "Could not wait for the application activation event")
+
+    def close(self) -> None:
+        """Release the native event handle; safe to call more than once."""
+
+        handle = self.handle
+        self.handle = None
+        if handle is None or self.kernel32 is None:
+            return
+        with suppress(Exception):
+            self.kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+    def __enter__(self) -> InstanceActivationEvent:
+        self.create()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 class StartupRegistration:
     KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-    def __init__(self, app_name: str = APP_NAME) -> None:
+    def __init__(
+        self,
+        app_name: str = APP_NAME,
+        arguments: tuple[str, ...] = ("--background",),
+    ) -> None:
         self.app_name = app_name
+        self.arguments = arguments
 
     @staticmethod
-    def _command(executable: Path) -> str:
-        return f'"{executable.resolve()}"'
+    def _command(executable: Path, arguments: tuple[str, ...] = ("--background",)) -> str:
+        suffix = "" if not arguments else " " + " ".join(arguments)
+        return f'"{executable.resolve()}"{suffix}'
 
     def is_enabled(self, executable: Path) -> bool:
         if os.name != "nt":
@@ -91,7 +187,7 @@ class StartupRegistration:
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY_PATH) as key:
                 value, _kind = winreg.QueryValueEx(key, self.app_name)
-            return str(value) == self._command(executable)
+            return str(value) == self._command(executable, self.arguments)
         except (FileNotFoundError, OSError):
             return False
 
@@ -113,7 +209,7 @@ class StartupRegistration:
                     self.app_name,
                     0,
                     winreg.REG_SZ,
-                    self._command(executable),
+                    self._command(executable, self.arguments),
                 )
             else:
                 with suppress(FileNotFoundError):
@@ -134,6 +230,36 @@ class ProcessLauncher:
                     return True
             except (psutil.Error, OSError):
                 continue
+        return False
+
+    @staticmethod
+    def is_running_under(
+        directory: Path,
+        known_executable_names: Collection[str] = MANAGER_PROCESS_NAMES,
+    ) -> bool:
+        """Return whether any process executable is inside an owned directory."""
+
+        root = directory.resolve()
+        expected_names = {name.casefold() for name in known_executable_names}
+        for process in psutil.process_iter(["name", "exe"]):
+            try:
+                name = process.info.get("name")
+                executable = process.info.get("exe")
+            except (psutil.Error, OSError):
+                continue
+            known_name = isinstance(name, str) and name.casefold() in expected_names
+            if not isinstance(executable, str) or not executable:
+                if known_name:
+                    return True
+                continue
+            try:
+                resolved = Path(executable).resolve()
+            except (OSError, ValueError):
+                if known_name:
+                    return True
+                continue
+            if resolved == root or resolved.is_relative_to(root):
+                return True
         return False
 
     def launch(self, executable: Path) -> bool:
@@ -157,3 +283,11 @@ class ProcessLauncher:
 
 def running_executable() -> Path:
     return Path(sys.executable).resolve()
+
+
+def open_path(path: Path) -> None:
+    """Open a local file or directory with the user's Windows shell."""
+
+    if os.name != "nt":
+        raise OSError("Opening paths is supported only on Windows")
+    os.startfile(str(path.resolve()))

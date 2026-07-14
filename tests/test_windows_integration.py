@@ -5,13 +5,20 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from league_skin_manager.windows_integration import (
+    ACTIVATION_EVENT_NAME,
     ERROR_ALREADY_EXISTS,
     LEGACY_MUTEX_NAME,
     MUTEX_NAME,
+    WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+    InstanceActivationEvent,
     ProcessLauncher,
     SingleInstanceMutex,
     StartupRegistration,
+    open_path,
 )
 
 
@@ -30,6 +37,14 @@ class Function:
 class Kernel32:
     def __init__(self, handle: int = 123) -> None:
         self.CreateMutexW = Function(handle)
+        self.CloseHandle = Function(1)
+
+
+class ActivationKernel32:
+    def __init__(self) -> None:
+        self.CreateEventW = Function(456)
+        self.SetEvent = Function(1)
+        self.WaitForSingleObject = Function(WAIT_OBJECT_0)
         self.CloseHandle = Function(1)
 
 
@@ -80,9 +95,87 @@ def test_mutex_without_native_backend_is_a_safe_noop() -> None:
     mutex.release()
 
 
+def test_activation_event_retains_signals_waits_and_closes() -> None:
+    kernel32 = ActivationKernel32()
+    activation = InstanceActivationEvent(kernel32=kernel32)
+
+    assert activation.create()
+    assert activation.signal()
+    assert activation.wait(250)
+    kernel32.WaitForSingleObject.result = WAIT_TIMEOUT
+    assert not activation.wait(0)
+    activation.close()
+    activation.close()
+
+    assert len(kernel32.CreateEventW.calls) == 1
+    assert kernel32.CreateEventW.calls[0][3] == ACTIVATION_EVENT_NAME
+    assert len(kernel32.SetEvent.calls) == 1
+    assert len(kernel32.WaitForSingleObject.calls) == 2
+    assert len(kernel32.CloseHandle.calls) == 1
+
+
+def test_activation_event_without_native_backend_is_a_safe_noop() -> None:
+    activation = InstanceActivationEvent(kernel32=None)
+    activation.kernel32 = None
+
+    assert not activation.create()
+    assert not activation.signal()
+    assert not activation.wait(0)
+    activation.close()
+
+
+def test_activation_event_surfaces_native_failures(monkeypatch: Any) -> None:
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    create_failure = ActivationKernel32()
+    create_failure.CreateEventW.result = 0
+    with pytest.raises(OSError, match="create"):
+        InstanceActivationEvent(kernel32=create_failure).create()
+
+    signal_failure = ActivationKernel32()
+    signal_failure.SetEvent.result = 0
+    activation = InstanceActivationEvent(kernel32=signal_failure)
+    with pytest.raises(OSError, match="signal"):
+        activation.signal()
+    activation.close()
+
+    wait_failure = ActivationKernel32()
+    wait_failure.WaitForSingleObject.result = 0xFFFFFFFF
+    activation = InstanceActivationEvent(kernel32=wait_failure)
+    with pytest.raises(ValueError, match="negative"):
+        activation.wait(-1)
+    with pytest.raises(OSError, match="wait"):
+        activation.wait(1)
+    activation.close()
+
+
+def test_activation_event_context_manager_closes_handle() -> None:
+    kernel32 = ActivationKernel32()
+
+    with InstanceActivationEvent(kernel32=kernel32) as activation:
+        assert activation.handle == 456
+
+    assert activation.handle is None
+    assert len(kernel32.CloseHandle.calls) == 1
+
+
 def test_startup_command_quotes_absolute_executable(tmp_path: Path) -> None:
     executable = tmp_path / "folder with spaces" / "app.exe"
-    assert StartupRegistration._command(executable) == f'"{executable.resolve()}"'
+    assert StartupRegistration._command(executable) == f'"{executable.resolve()}" --background'
+    assert StartupRegistration._command(executable, ()) == f'"{executable.resolve()}"'
+
+
+def test_open_path_uses_windows_shell(monkeypatch: Any, tmp_path: Path) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr("league_skin_manager.windows_integration.os.name", "nt")
+    monkeypatch.setattr(
+        "league_skin_manager.windows_integration.os.startfile",
+        lambda value: opened.append(value),
+    )
+
+    open_path(tmp_path)
+
+    assert opened == [str(tmp_path.resolve())]
 
 
 class Process:
@@ -116,3 +209,55 @@ def test_launcher_rejects_missing_file_and_starts_existing(
     assert launcher.launch(executable)
     assert calls[0][0] == [str(executable)]
     assert calls[0][1]["cwd"] == str(tmp_path)
+
+
+def test_running_under_matches_exact_owned_process_paths(monkeypatch: Any, tmp_path: Path) -> None:
+    class OwnedProcess:
+        def __init__(self, executable: Path | None) -> None:
+            self.info = {"exe": str(executable) if executable is not None else None}
+
+    manager_dir = tmp_path / "manager"
+    owned = manager_dir / "tools" / "mod-tools.exe"
+    unrelated = tmp_path / "elsewhere" / "mod-tools.exe"
+    monkeypatch.setattr(
+        "league_skin_manager.windows_integration.psutil.process_iter",
+        lambda _fields: [OwnedProcess(unrelated), OwnedProcess(owned), OwnedProcess(None)],
+    )
+
+    assert ProcessLauncher.is_running_under(manager_dir)
+    assert not ProcessLauncher.is_running_under(tmp_path / "different")
+
+
+def test_running_under_blocks_known_owned_names_when_executable_is_inaccessible(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    class Process:
+        def __init__(self, name: str | None, executable: str | None) -> None:
+            self.info = {"name": name, "exe": executable}
+
+    processes = [
+        Process("unrelated.exe", None),
+        Process("MOD-TOOLS.EXE", None),
+    ]
+    monkeypatch.setattr(
+        "league_skin_manager.windows_integration.psutil.process_iter",
+        lambda _fields: processes,
+    )
+
+    assert ProcessLauncher.is_running_under(tmp_path / "manager")
+
+
+def test_running_under_does_not_block_same_known_name_at_accessible_unowned_path(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    class Process:
+        info = {"name": "mod-tools.exe", "exe": str(tmp_path / "other" / "mod-tools.exe")}
+
+    monkeypatch.setattr(
+        "league_skin_manager.windows_integration.psutil.process_iter",
+        lambda _fields: [Process()],
+    )
+
+    assert not ProcessLauncher.is_running_under(tmp_path / "manager")

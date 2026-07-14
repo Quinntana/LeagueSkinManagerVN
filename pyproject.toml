@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "LeagueSkinManagerVN"
-version = "0.1.0"
+version = "0.2.0"
 description = "A tool for managing League of Legends custom skins"
 authors = ["Quinntana <archimedesstar@gmail.com>"]
 license = "GPL-3.0"
@@ -10,6 +10,7 @@ packages = [{ include = "league_skin_manager", from = "src" }]
 [tool.poetry.scripts]
 league-skin-manager = "league_skin_manager.__main__:main"
 league-skin-manager-uninstall = "league_skin_manager.uninstall:main"
+league-skin-manager-setup = "league_skin_manager.installer:main"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.15"

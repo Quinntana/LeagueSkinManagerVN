@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 
@@ -39,8 +40,10 @@ class Syncer:
 class Updater:
     def __init__(self, result: ManagerUpdateStatus | Exception) -> None:
         self.result = result
+        self.calls = 0
 
     def update(self, _cancel: Event) -> ManagerUpdateStatus:
+        self.calls += 1
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -51,6 +54,7 @@ def workflow(
     source: Source,
     syncer: Syncer,
     updater: Updater,
+    manager_is_running: Callable[[], bool] | None = None,
 ) -> SynchronizationWorkflow:
     return SynchronizationWorkflow(
         source=source,  # type: ignore[arg-type]
@@ -59,6 +63,7 @@ def workflow(
         manager_executable=tmp_path / "manager" / "cslol-manager.exe",
         installed_dir=tmp_path / "manager" / "installed",
         logger=logging.getLogger("test"),
+        manager_is_running=manager_is_running,
     )
 
 
@@ -117,3 +122,39 @@ def test_untrusted_manager_release_is_actionable_without_discarding_skin_sync(
     assert value.state is AppState.OFFLINE_READY
     assert value.detail == ("Skins ready (16.13.1); install CSLOL Manager manually - see log")
     assert syncer.calls == 1
+
+
+def test_running_manager_pauses_before_update_or_skin_mutation(tmp_path: Path) -> None:
+    manifest = SkinManifest("a" * 40, "16.13.1", ())
+    syncer = Syncer(SyncResult("a" * 40, "16.13.1", 1920, 0, 1920, 0))
+    updater = Updater(ManagerUpdateStatus.CURRENT)
+
+    value = workflow(
+        tmp_path,
+        Source(manifest),
+        syncer,
+        updater,
+        manager_is_running=lambda: True,
+    )(Event())
+
+    assert value.state is AppState.OFFLINE_READY
+    assert value.detail == "Sync paused - close CSLOL Manager and try again"
+    assert updater.calls == 0
+    assert syncer.calls == 0
+
+
+def test_manager_starting_during_manifest_fetch_prevents_sync(tmp_path: Path) -> None:
+    manifest = SkinManifest("a" * 40, "16.13.1", ())
+    syncer = Syncer(SyncResult("a" * 40, "16.13.1", 1920, 0, 1920, 0))
+    states = iter((False, False, True))
+
+    value = workflow(
+        tmp_path,
+        Source(manifest),
+        syncer,
+        Updater(ManagerUpdateStatus.CURRENT),
+        manager_is_running=lambda: next(states),
+    )(Event())
+
+    assert value.state is AppState.OFFLINE_READY
+    assert syncer.calls == 0

@@ -6,6 +6,7 @@ import logging
 import shutil
 import stat
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -15,6 +16,7 @@ import pytest
 from league_skin_manager import manager_update as update_module
 from league_skin_manager.manager_update import (
     TRUSTED_RELEASE_ASSETS,
+    ManagerMutationBlockedError,
     ManagerRelease,
     ManagerReleaseClient,
     ManagerTransactionError,
@@ -126,6 +128,7 @@ class FakeReleaseClient:
         self.asset_name = asset_name
         self.reported_size = reported_size
         self.downloads = 0
+        self.on_download: Callable[[], None] | None = None
 
     def latest(self) -> ManagerRelease:
         return ManagerRelease(
@@ -139,6 +142,8 @@ class FakeReleaseClient:
 
     def download(self, _asset: ReleaseAsset, destination: Path, _cancel: Event) -> Path:
         self.downloads += 1
+        if self.on_download is not None:
+            self.on_download()
         shutil.copyfile(self.archive, destination)
         return destination
 
@@ -166,13 +171,14 @@ def make_updater(
     manager_dir: Path,
     *,
     trusted_assets: dict[tuple[str, str, int], str] | None = None,
-    running: bool = False,
+    running: bool | Callable[[], bool] = False,
 ) -> ManagerUpdater:
+    is_running = running if callable(running) else lambda: running
     return ManagerUpdater(
         client,  # type: ignore[arg-type]
         manager_dir,
         manager_dir / "version.txt",
-        lambda: running,
+        is_running,
         logging.getLogger("test"),
         trusted_assets=trusted_assets or {},
     )
@@ -239,6 +245,50 @@ def test_manager_update_skips_current_running_and_cancelled(tmp_path: Path) -> N
     cancelled = Event()
     cancelled.set()
     assert updater.update(cancelled) is ManagerUpdateStatus.CANCELLED
+
+
+def test_manager_starting_during_download_defers_before_live_commit(tmp_path: Path) -> None:
+    archive = tmp_path / "manager.zip"
+    manager_archive(archive)
+    manager_dir = tmp_path / "live"
+    manager_dir.mkdir()
+    manager = manager_dir / "cslol-manager.exe"
+    manager.write_bytes(b"old manager")
+    version_file = manager_dir / "version.txt"
+    version_file.write_text("old", encoding="utf-8")
+    running = False
+    client = FakeReleaseClient(archive)
+
+    def start_manager() -> None:
+        nonlocal running
+        running = True
+
+    client.on_download = start_manager
+    updater = make_updater(
+        client,
+        manager_dir,
+        trusted_assets=trusted_archive(archive),
+        running=lambda: running,
+    )
+
+    assert updater.update(Event()) is ManagerUpdateStatus.DEFERRED_RUNNING
+    assert manager.read_bytes() == b"old manager"
+    assert version_file.read_text(encoding="utf-8") == "old"
+    assert not updater.journal_path.exists()
+
+
+def test_manager_process_lookup_failure_defers_without_touching_disk(tmp_path: Path) -> None:
+    archive = tmp_path / "manager.zip"
+    manager_archive(archive)
+    manager_dir = tmp_path / "live"
+
+    def fail_lookup() -> bool:
+        raise OSError("snapshot unavailable")
+
+    updater = make_updater(FakeReleaseClient(archive), manager_dir, running=fail_lookup)
+
+    assert updater.update(Event()) is ManagerUpdateStatus.DEFERRED_RUNNING
+    assert not manager_dir.exists()
 
 
 def test_unreviewed_release_fails_before_download_and_preserves_live_manager(
@@ -456,6 +506,17 @@ def test_restart_recovers_interrupted_manager_rollback(
     assert updater.journal_path.exists()
     assert old_manager.read_bytes() == b"new manager"
     monkeypatch.undo()
+
+    blocked = make_updater(
+        FakeReleaseClient(archive),
+        manager_dir,
+        trusted_assets=trusted_archive(archive),
+        running=True,
+    )
+    with pytest.raises(ManagerMutationBlockedError, match="running"):
+        blocked.recover()
+    assert updater.journal_path.exists()
+    assert old_manager.read_bytes() == b"new manager"
 
     restarted = make_updater(
         FakeReleaseClient(archive),

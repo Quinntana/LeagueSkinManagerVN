@@ -8,8 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "LeagueSkinManagerVN"
+APP_DISPLAY_NAME = "League Skin Manager VN"
+APP_VERSION = "0.2.0"
+APP_PUBLISHER = "Quinntana"
+APP_INFO_URL = "https://github.com/Quinntana/LeagueSkinManagerVN"
 UNINSTALL_APP_NAME = "LeagueSkinManagerVNUninstall"
+SETUP_APP_NAME = "LeagueSkinManagerVNSetup"
 MANAGER_PROCESS_NAME = "cslol-manager.exe"
+MANAGER_PROCESS_NAMES = (MANAGER_PROCESS_NAME, "mod-tools.exe")
 LEAGUE_PROCESS_NAME = "LeagueClient.exe"
 
 CSLOL_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/cslol-manager/releases/latest"

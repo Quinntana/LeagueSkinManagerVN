@@ -1,8 +1,22 @@
 # LeagueSkinManagerVN
 
-A Windows tray application that keeps a CSLOL Manager installation and an
-application-owned set of League skin mods synchronized without overwriting the
-user's own mods or profiles.
+A native Windows desktop and tray application that keeps a CSLOL Manager
+installation and an application-owned set of League skin mods synchronized
+without overwriting the user's own mods or profiles.
+
+## Desktop library
+
+Normal launches open a desktop library backed by the validated offline manifest:
+
+- Instant accent- and punctuation-tolerant search across champion and skin names.
+- Champion filtering and sortable Champion, Skin, and Package size columns.
+- Installed skin, champion, patch, and source-commit statistics.
+- Selected-mod details plus shortcuts for the installed folder, AppData, and logs.
+- `Sync now`, `Start CSLOL Manager`, background startup, refresh, and clean exit controls.
+
+Closing the window keeps the service available in the tray. Windows startup uses
+`--background`, so login remains unobtrusive. The tray's default action reopens the
+desktop window.
 
 ## Important notice
 
@@ -37,9 +51,11 @@ Riot's current terms before running or distributing a build.
    corruption, same-size tampering, symlinks, or junctions force a rebuild from the
    verified package cache. Per-file, aggregate, and free-space limits fail before a
    source can exhaust the machine during normal staging.
-8. A cooperative process monitor starts CSLOL Manager once for each League Client
-   process. If League starts during synchronization, launch is deferred until the
-   transaction finishes.
+8. A low-overhead native Windows process monitor starts CSLOL Manager once for each
+   League Client process. If League starts during synchronization, launch is deferred
+   until the transaction finishes.
+9. Synchronization is paused while CSLOL Manager or any helper executable inside its
+   owned directory is running, avoiding live mod-directory mutation.
 
 If the network or source is unavailable, a valid existing manager/mod installation
 remains usable and the tray reports `Ready offline`. A first run with nothing cached
@@ -68,8 +84,17 @@ All mutable data is under `%APPDATA%\LeagueSkinManagerVN`:
 - `managed_skins.json`: app-owned install manifest and transaction identity.
 - `logs/LeagueSkinManagerVN.log`: rotating diagnostics.
 
-The uninstaller is per-user, requests no elevation, refuses to run while the service
-or manager is active, and validates the exact AppData target before deletion.
+The per-user setup installs program files under
+`%LOCALAPPDATA%\Programs\LeagueSkinManagerVN` and registers **League Skin Manager VN**
+in Windows Apps & Features. Its uninstall command points to the installed
+`LeagueSkinManagerVNUninstall.exe`.
+
+The uninstaller requests no elevation, participates in the application mutex,
+refuses to run while the service, manager, or an owned helper process is active,
+and validates the exact AppData and install targets before deletion. A full uninstall
+removes the startup value, Apps & Features entry, downloaded skins, cache, logs,
+CSLOL profiles, other application data, and installed program files. Portable
+executables outside the fixed per-user install directory are never deleted.
 
 ## Development
 
@@ -91,14 +116,16 @@ python -m venv .venv
 .\.venv\Scripts\python -m pytest
 ```
 
-Build both one-file Windows executables:
+Build the main app, uninstaller, and self-contained per-user setup executable:
 
 ```powershell
 .\.venv\Scripts\python build.py
 ```
 
-`build.py` validates both package entrypoints before cleaning old outputs and limits
-all cleanup to the repository's known build directories.
+`build.py` validates all package entrypoints before cleaning old outputs and limits
+all cleanup to the repository's known build directories. Run
+`dist\LeagueSkinManagerVNSetup.exe` to install or update the per-user copy and create
+the Windows Apps & Features entry.
 
 For a packaged startup check that does not contact the skin source, run
 `LeagueSkinManagerVN.exe --no-sync`.

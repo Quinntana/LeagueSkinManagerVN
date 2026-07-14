@@ -16,8 +16,11 @@ class TrayIcon(Protocol):
     icon: object
     title: str
     menu: object
+    visible: bool
 
     def run(self, setup: Callable[[TrayIcon], None] | None = None) -> None: ...
+
+    def run_detached(self, setup: Callable[[TrayIcon], None] | None = None) -> None: ...
 
     def stop(self) -> None: ...
 
@@ -79,6 +82,7 @@ class TrayApplication:
         self,
         *,
         on_start: Action,
+        on_show: Action,
         on_sync: Action,
         on_start_manager: Action,
         startup_enabled: StartupGetter,
@@ -90,6 +94,7 @@ class TrayApplication:
         logger: logging.Logger | None = None,
     ) -> None:
         self._on_start = on_start
+        self._on_show = on_show
         self._on_sync = on_sync
         self._on_start_manager = on_start_manager
         self._startup_enabled = startup_enabled
@@ -131,6 +136,11 @@ class TrayApplication:
 
         self._icon.run(setup=self._setup)
 
+    def run_detached(self) -> None:
+        """Start the platform tray loop beside another GUI main loop."""
+
+        self._icon.run_detached(setup=self._setup)
+
     def stop(self) -> None:
         """Stop the platform tray loop; safe to call more than once."""
 
@@ -166,13 +176,19 @@ class TrayApplication:
         except Exception:
             self._logger.exception("Unable to display tray notification")
 
-    def _setup(self, _icon: TrayIcon) -> None:
+    def _setup(self, icon: TrayIcon) -> None:
+        icon.visible = True
         self._invoke("application startup", self._on_start)
 
     def _build_menu(self) -> object:
         with self._lock:
             detail = self._detail
         return self._backend.Menu(
+            self._backend.MenuItem(
+                "Open LeagueSkinManagerVN",
+                self._show_clicked,
+                default=True,
+            ),
             self._backend.MenuItem(
                 f"Status: {detail}",
                 None,
@@ -182,7 +198,6 @@ class TrayApplication:
             self._backend.MenuItem(
                 "Start manager",
                 self._start_manager_clicked,
-                default=True,
             ),
             self._backend.MenuItem(
                 "Start with Windows",
@@ -205,6 +220,9 @@ class TrayApplication:
 
     def _sync_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("skin sync", self._on_sync)
+
+    def _show_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the desktop window", self._on_show)
 
     def _start_manager_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("manager launch", self._on_start_manager)

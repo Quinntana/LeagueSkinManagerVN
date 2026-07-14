@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import runpy
 from pathlib import Path
 
 import pytest
 
-from build import BuildTarget, build_arguments, build_target, clean_outputs
+from build import (
+    INSTALLER_TARGET,
+    MAIN_NAME,
+    MAIN_TARGET,
+    UNINSTALL_NAME,
+    BuildTarget,
+    build_arguments,
+    build_target,
+    clean_outputs,
+)
 
 
 def project_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -26,20 +36,24 @@ def test_build_arguments_use_package_entrypoint_without_elevation(tmp_path: Path
     assert "--noconsole" in arguments
     assert "--uac-admin" not in arguments
     assert arguments[-1] == str(entrypoint.resolve())
-    collect_index = arguments.index("--collect-submodules")
-    assert arguments[collect_index + 1] == "league_skin_manager"
+    assert "--collect-submodules" not in arguments
     hidden_imports = [
         arguments[index + 1]
         for index, argument in enumerate(arguments)
         if argument == "--hidden-import"
     ]
-    assert hidden_imports == ["pystray", "pystray._win32"]
+    assert hidden_imports == []
     assert str(root / "src") in arguments
 
 
 def test_clean_removes_only_verified_repo_output_directories(tmp_path: Path) -> None:
     root, _package, _entrypoint = project_layout(tmp_path)
-    outputs = [root / "build_main", root / "build_uninstall", root / "dist"]
+    outputs = [
+        root / "build_main",
+        root / "build_uninstall",
+        root / "build_installer",
+        root / "dist",
+    ]
     for output in outputs:
         output.mkdir()
         (output / "artifact").write_text("temporary", encoding="utf-8")
@@ -98,3 +112,34 @@ def test_build_rejects_entrypoint_outside_package(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="outside the package"):
         build_arguments(target, project_root=root, dist_dir=root / "dist")
+
+
+def test_installer_target_bundles_both_application_executables() -> None:
+    arguments = build_arguments(INSTALLER_TARGET)
+    data_values = [
+        arguments[index + 1] for index, value in enumerate(arguments) if value == "--add-data"
+    ]
+
+    assert any(f"{MAIN_NAME}.exe" in value and value.endswith(";payload") for value in data_values)
+    assert any(
+        f"{UNINSTALL_NAME}.exe" in value and value.endswith(";payload") for value in data_values
+    )
+
+
+def test_main_target_includes_only_runtime_dynamic_imports() -> None:
+    arguments = build_arguments(MAIN_TARGET)
+    hidden_imports = [
+        arguments[index + 1] for index, value in enumerate(arguments) if value == "--hidden-import"
+    ]
+
+    assert hidden_imports == ["tkinter", "tkinter.ttk", "pystray", "pystray._win32"]
+
+
+def test_setup_entrypoint_is_loadable_as_a_direct_pyinstaller_script() -> None:
+    entrypoint = (
+        Path(__file__).resolve().parents[1] / "src" / "league_skin_manager" / "installer.py"
+    )
+
+    namespace = runpy.run_path(str(entrypoint), run_name="packaging_smoke")
+
+    assert callable(namespace["main"])

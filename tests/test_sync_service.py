@@ -24,6 +24,7 @@ from league_skin_manager.sync_service import (
     SkinSyncService,
     SyncCancelled,
     SyncError,
+    SyncMutationBlocked,
     SyncProgress,
     TransactionError,
 )
@@ -325,6 +326,12 @@ def test_next_start_recovers_an_interrupted_rollback(
     assert service.state_path.read_bytes() == state_before
 
     monkeypatch.undo()
+    blocked = make_service(tmp_path, manager_is_running=lambda: True)
+    with pytest.raises(SyncMutationBlocked, match="running"):
+        blocked.recover()
+    assert service.journal_path.exists()
+    assert (live_directory / "WAD" / "Test.wad.client").read_bytes() == b"new"
+
     restarted = make_service(tmp_path)
     assert restarted.recover()
     assert (live_directory / "WAD" / "Test.wad.client").read_bytes() == b"old"
@@ -389,6 +396,51 @@ def test_cancellation_before_commit_preserves_live_state(tmp_path: Path) -> None
         )
 
     assert service.state_path.read_bytes() == state_before
+
+
+def test_manager_starting_during_staging_blocks_live_commit(tmp_path: Path) -> None:
+    old_archive = create_fantome(tmp_path / "old.fantome", "old")
+    old = make_asset(old_archive, champion="Ahri", name="Foxfire Ahri")
+    source = FakeSource({old.path: old_archive})
+    running = False
+    service = make_service(tmp_path, manager_is_running=lambda: running)
+    service.sync(source, make_manifest(old))
+    state_before = service.state_path.read_bytes()
+    live_directory = service.installed_dir / service.load_state().entries[0].directory
+
+    new_archive = create_fantome(tmp_path / "new.fantome", "new")
+    new = make_asset(new_archive, champion="Ahri", name="Foxfire Ahri")
+    source.files[new.path] = new_archive
+
+    def start_manager() -> None:
+        nonlocal running
+        running = True
+
+    source.on_download = start_manager
+    with pytest.raises(SyncMutationBlocked, match="running"):
+        service.sync(source, make_manifest(new, commit="e" * 40))
+
+    assert service.state_path.read_bytes() == state_before
+    assert (live_directory / "WAD" / "Test.wad.client").read_bytes() == b"old"
+    assert not service.journal_path.exists()
+
+
+def test_manager_lookup_failure_blocks_before_creating_sync_directories(
+    tmp_path: Path,
+) -> None:
+    archive = create_fantome(tmp_path / "skin.fantome", "v1")
+    asset = make_asset(archive, champion="Ahri", name="Foxfire Ahri")
+
+    def fail_lookup() -> bool:
+        raise OSError("snapshot unavailable")
+
+    service = make_service(tmp_path, manager_is_running=fail_lookup)
+
+    with pytest.raises(SyncMutationBlocked, match="verify"):
+        service.sync(FakeSource({asset.path: archive}), make_manifest(asset))
+
+    assert not service.installed_dir.exists()
+    assert not service.state_path.exists()
 
 
 def test_source_cancellation_is_normalized(tmp_path: Path) -> None:
