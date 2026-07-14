@@ -49,6 +49,14 @@ class FakeBox:
         self.values = values["values"]  # type: ignore[assignment]
 
 
+class FakeButton:
+    def __init__(self) -> None:
+        self.state = "disabled"
+
+    def configure(self, **values: object) -> None:
+        self.state = str(values["state"])
+
+
 class FakeTree:
     def __init__(self) -> None:
         self.items: dict[str, tuple[object, ...]] = {}
@@ -122,6 +130,10 @@ def make_desktop(tmp_path: Path, **overrides: Any) -> DesktopApplication:
         "log_file": tmp_path / "data" / "logs" / "LeagueSkinManagerVN.log",
         "on_sync": lambda: True,
         "on_start_manager": lambda: True,
+        "on_start_ltk": lambda: True,
+        "on_migrate_to_ltk": lambda _path: True,
+        "on_cancel_ltk_migration": lambda: True,
+        "on_reset_ltk_migration": lambda: True,
         "on_exit": lambda: True,
         "startup_enabled": lambda: False,
         "set_startup_enabled": lambda _enabled: True,
@@ -144,6 +156,8 @@ def attach_presenter_fakes(app: DesktopApplication) -> tuple[FakeRoot, FakeTree]
     app._stats_var = FakeVar()
     app._detail_var = FakeVar()
     app._startup_var = FakeVar(False)
+    app._ltk_status_var = FakeVar()
+    app._cancel_migration_button = FakeButton()
     app._champion_box = FakeBox()
     return root, tree
 
@@ -211,10 +225,13 @@ def test_presenter_queue_marshals_status_visibility_refresh_and_stop(tmp_path: P
     app.hide()
     app.refresh_catalog()
     app.update_status(AppState.READY, "Ready - 1,920 skins")
+    app.update_ltk_status("migrating 2/10", migration_active=True)
     app._drain_events()
 
     assert root.actions[:4] == ["show", "lift", "focus", "hide"]
     assert app._status_var.get() == "Ready - 1,920 skins"
+    assert app._ltk_status_var.get() == "LTK companion: migrating 2/10"
+    assert app._cancel_migration_button.state == "normal"
     assert len(loads) == 2
     assert root.actions[-1] == "after"
 
@@ -235,6 +252,7 @@ def test_presenter_actions_report_failures_and_preserve_startup_state(tmp_path: 
         tmp_path,
         on_sync=lambda: False,
         on_start_manager=lambda: False,
+        on_start_ltk=lambda: False,
         on_exit=lambda: calls.append("exit") or True,
         set_startup_enabled=lambda _enabled: False,
         path_opener=fail_open,
@@ -245,6 +263,8 @@ def test_presenter_actions_report_failures_and_preserve_startup_state(tmp_path: 
     assert app._status_var.get() == "Sync was not started"
     app._manager_clicked()
     assert app._status_var.get() == "CSLOL Manager could not be started"
+    app._ltk_clicked()
+    assert app._ltk_status_var.get() == "LTK companion: launch was not started"
     app._startup_var.set(True)
     app._startup_clicked()
     assert app._startup_var.get() is False
@@ -262,6 +282,67 @@ def test_presenter_actions_report_failures_and_preserve_startup_state(tmp_path: 
     finish_exit_request(app)
     assert calls == ["exit"]
     assert root.actions[-2:] == ["hide", "destroy"]
+
+
+def test_tray_migration_request_is_selected_and_confirmed_on_tk_thread(tmp_path: Path) -> None:
+    selected = tmp_path / "cslol-manager"
+    migrated: list[Path] = []
+    confirmations: list[Path] = []
+    app = make_desktop(
+        tmp_path,
+        directory_selector=lambda initial: selected if initial.name == "installed" else None,
+        migration_confirmation=lambda path: confirmations.append(path) or True,
+        on_migrate_to_ltk=lambda path: migrated.append(path) or True,
+    )
+    root, _tree = attach_presenter_fakes(app)
+
+    app.request_ltk_migration()
+    app._drain_events()
+
+    assert root.actions[:3] == ["show", "lift", "focus"]
+    assert confirmations == [selected]
+    assert migrated == [selected]
+    assert app._ltk_status_var.get() == "LTK companion: migration queued"
+    assert app._cancel_migration_button.state == "normal"
+
+
+def test_cancel_migration_reports_request_and_declined_confirmation_does_nothing(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    app = make_desktop(
+        tmp_path,
+        directory_selector=lambda _initial: tmp_path / "manager",
+        migration_confirmation=lambda _path: False,
+        on_migrate_to_ltk=lambda _path: calls.append("migrate") or True,
+        on_cancel_ltk_migration=lambda: calls.append("cancel") or True,
+    )
+    attach_presenter_fakes(app)
+
+    app._migration_clicked()
+    app._cancel_migration_clicked()
+
+    assert calls == ["cancel"]
+    assert app._ltk_status_var.get() == "LTK companion: cancelling migration safely..."
+
+
+def test_reset_history_requires_confirmation_and_reports_queue_result(tmp_path: Path) -> None:
+    resets: list[str] = []
+    confirmation = {"allowed": False}
+    app = make_desktop(
+        tmp_path,
+        history_reset_confirmation=lambda: confirmation["allowed"],
+        on_reset_ltk_migration=lambda: resets.append("reset") or True,
+    )
+    attach_presenter_fakes(app)
+
+    app._reset_migration_history_clicked()
+    assert resets == []
+
+    confirmation["allowed"] = True
+    app._reset_migration_history_clicked()
+    assert resets == ["reset"]
+    assert app._ltk_status_var.get() == "LTK companion: migration-history reset queued"
 
 
 def test_desktop_exit_keeps_ui_responsive_while_shutdown_waits(tmp_path: Path) -> None:

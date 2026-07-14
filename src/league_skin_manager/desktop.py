@@ -13,6 +13,10 @@ from .catalog import CatalogError, CatalogSnapshot, SkinRecord, load_catalog
 from .controller import AppState
 
 Action = Callable[[], object]
+MigrationAction = Callable[[Path], object]
+DirectorySelector = Callable[[Path], Path | None]
+MigrationConfirmation = Callable[[Path], bool]
+HistoryResetConfirmation = Callable[[], bool]
 StartupGetter = Callable[[], bool]
 StartupSetter = Callable[[bool], object]
 PathOpener = Callable[[Path], object]
@@ -47,11 +51,18 @@ class DesktopApplication:
         log_file: Path,
         on_sync: Action,
         on_start_manager: Action,
+        on_start_ltk: Action,
+        on_migrate_to_ltk: MigrationAction,
+        on_cancel_ltk_migration: Action,
+        on_reset_ltk_migration: Action,
         on_exit: Action,
         startup_enabled: StartupGetter,
         set_startup_enabled: StartupSetter,
         path_opener: PathOpener,
         catalog_loader: CatalogLoader = load_catalog,
+        directory_selector: DirectorySelector | None = None,
+        migration_confirmation: MigrationConfirmation | None = None,
+        history_reset_confirmation: HistoryResetConfirmation | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._catalog_path = catalog_path
@@ -60,11 +71,18 @@ class DesktopApplication:
         self._log_file = log_file
         self._on_sync = on_sync
         self._on_start_manager = on_start_manager
+        self._on_start_ltk = on_start_ltk
+        self._on_migrate_to_ltk = on_migrate_to_ltk
+        self._on_cancel_ltk_migration = on_cancel_ltk_migration
+        self._on_reset_ltk_migration = on_reset_ltk_migration
         self._on_exit = on_exit
         self._startup_enabled = startup_enabled
         self._set_startup_enabled = set_startup_enabled
         self._path_opener = path_opener
         self._catalog_loader = catalog_loader
+        self._directory_selector = directory_selector
+        self._migration_confirmation = migration_confirmation
+        self._history_reset_confirmation = history_reset_confirmation
         self._logger = logger or logging.getLogger(__name__)
 
         self._events: Queue[tuple[str, object | None]] = Queue()
@@ -78,6 +96,8 @@ class DesktopApplication:
         self._stats_var: Any | None = None
         self._detail_var: Any | None = None
         self._startup_var: Any | None = None
+        self._ltk_status_var: Any | None = None
+        self._cancel_migration_button: Any | None = None
         self._champion_box: Any | None = None
         self._filter_after_id: str | None = None
         self._rows: dict[str, SkinRecord] = {}
@@ -118,6 +138,16 @@ class DesktopApplication:
 
     def update_status(self, state: AppState, detail: str) -> None:
         self._events.put(("status", (state, detail)))
+
+    def request_ltk_migration(self) -> None:
+        """Show and run the migration chooser on Tk's owning thread."""
+
+        self._events.put(("migrate_request", None))
+
+    def update_ltk_status(self, detail: str, *, migration_active: bool = False) -> None:
+        """Publish companion progress without replacing skin-sync state."""
+
+        self._events.put(("ltk_status", (detail, migration_active)))
 
     def _build_window(self, root: Any, tk: Any, ttk: Any) -> None:
         root.title("LeagueSkinManagerVN")
@@ -242,6 +272,12 @@ class DesktopApplication:
             text="Start CSLOL Manager",
             style="Accent.TButton",
             command=self._manager_clicked,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            actions,
+            text="Open / install LTK",
+            style="Secondary.TButton",
+            command=self._ltk_clicked,
         ).pack(side="left")
 
         panel = ttk.Frame(outer, style="Panel.TFrame", padding=18)
@@ -355,6 +391,35 @@ class DesktopApplication:
             command=self._exit_clicked,
         ).pack(side="right")
 
+        companion = ttk.Frame(outer, style="App.TFrame")
+        companion.pack(fill="x", pady=(8, 0))
+        self._ltk_status_var = tk.StringVar(value="LTK companion: checking in background")
+        ttk.Label(
+            companion,
+            textvariable=self._ltk_status_var,
+            style="Subtitle.TLabel",
+        ).pack(side="left", fill="x", expand=True)
+        self._cancel_migration_button = ttk.Button(
+            companion,
+            text="Cancel migration",
+            style="Secondary.TButton",
+            command=self._cancel_migration_clicked,
+            state="disabled",
+        )
+        self._cancel_migration_button.pack(side="right")
+        ttk.Button(
+            companion,
+            text="Migrate CSLOL skins to LTK...",
+            style="Secondary.TButton",
+            command=self._migration_clicked,
+        ).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            companion,
+            text="Reset migration history...",
+            style="Secondary.TButton",
+            command=self._reset_migration_history_clicked,
+        ).pack(side="right", padx=(0, 8))
+
     def _drain_events(self) -> None:
         root = self._root
         if root is None:
@@ -379,6 +444,18 @@ class DesktopApplication:
                         self._status_var.set(detail)
                     if state in (AppState.READY, AppState.OFFLINE_READY):
                         self._load_catalog_now()
+                elif kind == "migrate_request":
+                    root.deiconify()
+                    root.lift()
+                    root.focus_force()
+                    self._migration_clicked()
+                elif kind == "ltk_status":
+                    detail, migration_active = cast(tuple[str, bool], payload)
+                    if self._ltk_status_var is not None:
+                        self._ltk_status_var.set(f"LTK companion: {detail}")
+                    if self._cancel_migration_button is not None:
+                        state_value = "normal" if migration_active else "disabled"
+                        self._cancel_migration_button.configure(state=state_value)
                 elif kind == "exit_complete":
                     self._exit_pending = False
                     self._exit_thread = None
@@ -530,6 +607,117 @@ class DesktopApplication:
             if self._status_var is not None:
                 self._status_var.set(f"Could not start manager: {exc}")
 
+    def _ltk_clicked(self) -> None:
+        try:
+            if self._on_start_ltk() is False and self._ltk_status_var is not None:
+                self._ltk_status_var.set("LTK companion: launch was not started")
+        except Exception as exc:
+            self._logger.exception("Desktop LTK Manager action failed")
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set(f"LTK companion: could not start LTK Manager: {exc}")
+
+    def _migration_clicked(self) -> None:
+        try:
+            source = self._choose_migration_source()
+            if source is None:
+                return
+            if not self._confirm_migration(source):
+                return
+            if self._on_migrate_to_ltk(source) is False:
+                if self._ltk_status_var is not None:
+                    self._ltk_status_var.set("LTK companion: migration was not queued")
+                return
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set("LTK companion: migration queued")
+            if self._cancel_migration_button is not None:
+                self._cancel_migration_button.configure(state="normal")
+        except Exception as exc:
+            self._logger.exception("Could not start CSLOL-to-LTK migration")
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set(f"LTK companion: could not start migration: {exc}")
+
+    def _choose_migration_source(self) -> Path | None:
+        if self._directory_selector is not None:
+            return self._directory_selector(self._installed_dir)
+        from tkinter import filedialog
+
+        selected = filedialog.askdirectory(
+            parent=self._root,
+            title="Choose CSLOL Manager folder or its installed folder",
+            initialdir=str(self._installed_dir),
+            mustexist=True,
+        )
+        return Path(selected) if selected else None
+
+    def _confirm_migration(self, source: Path) -> bool:
+        if self._migration_confirmation is not None:
+            return self._migration_confirmation(source)
+        from tkinter import messagebox
+
+        root = self._root
+        if root is None:
+            return False
+
+        return bool(
+            messagebox.askyesno(
+                "Migrate CSLOL skins to LTK",
+                (
+                    f"Source: {source}\n\n"
+                    "LeagueSkinManagerVN will validate and queue these mods in LTK's archive "
+                    "inbox, then open LTK Manager. CSLOL originals are left unchanged.\n\n"
+                    "Close both CSLOL Manager and LTK Manager before continuing. Existing "
+                    "and previously queued content is detected by SHA-256 and skipped. Continue?"
+                ),
+                parent=root,
+            )
+        )
+
+    def _cancel_migration_clicked(self) -> None:
+        try:
+            if self._on_cancel_ltk_migration() is False:
+                return
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set("LTK companion: cancelling migration safely...")
+        except Exception as exc:
+            self._logger.exception("Could not cancel LTK migration")
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set(f"LTK companion: cancellation failed: {exc}")
+
+    def _reset_migration_history_clicked(self) -> None:
+        try:
+            if not self._confirm_history_reset():
+                return
+            if self._on_reset_ltk_migration() is False:
+                if self._ltk_status_var is not None:
+                    self._ltk_status_var.set("LTK companion: history reset was not queued")
+                return
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set("LTK companion: migration-history reset queued")
+        except Exception as exc:
+            self._logger.exception("Could not reset LTK migration history")
+            if self._ltk_status_var is not None:
+                self._ltk_status_var.set(f"LTK companion: could not reset history: {exc}")
+
+    def _confirm_history_reset(self) -> bool:
+        if self._history_reset_confirmation is not None:
+            return self._history_reset_confirmation()
+        from tkinter import messagebox
+
+        root = self._root
+        if root is None:
+            return False
+        return bool(
+            messagebox.askyesno(
+                "Reset LTK migration history",
+                (
+                    "Reset LeagueSkinManagerVN's record of packages previously queued for LTK?\n\n"
+                    "The next migration may queue skins that are already installed in LTK. "
+                    "No CSLOL or LTK files will be deleted."
+                ),
+                parent=root,
+            )
+        )
+
     def _startup_clicked(self) -> None:
         if self._startup_var is None:
             return
@@ -581,7 +769,11 @@ class DesktopApplication:
 __all__ = [
     "Action",
     "CatalogLoader",
+    "DirectorySelector",
     "DesktopApplication",
+    "HistoryResetConfirmation",
+    "MigrationAction",
+    "MigrationConfirmation",
     "PathOpener",
     "StartupGetter",
     "StartupSetter",

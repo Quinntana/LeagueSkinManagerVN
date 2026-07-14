@@ -118,6 +118,30 @@ def test_success_holds_both_gates_and_removes_registration_after_install_files(
     ]
 
 
+def test_uninstall_removes_ltk_cache_and_history_but_preserves_external_ltk_data(
+    tmp_path: Path,
+) -> None:
+    appdata, data_dir = app_paths(tmp_path)
+    (data_dir / "cache" / "ltk").mkdir(parents=True)
+    (data_dir / "cache" / "ltk" / "installer.exe").write_bytes(b"cache")
+    (data_dir / "ltk_migration_state.json").write_text("{}", encoding="utf-8")
+    external_ltk = appdata / "dev.leaguetoolkit.manager"
+    external_ltk.mkdir()
+    sentinel = external_ltk / "library.json"
+    sentinel.write_text("external", encoding="utf-8")
+
+    result = Uninstaller(
+        appdata_root=appdata,
+        data_dir=data_dir,
+        process_finder=lambda _names: None,
+        startup_remover=lambda: RemovalState.NOT_FOUND,
+    ).run()
+
+    assert result.ok
+    assert not data_dir.exists()
+    assert sentinel.read_text(encoding="utf-8") == "external"
+
+
 def test_install_file_failure_preserves_apps_registration_for_retry(tmp_path: Path) -> None:
     appdata, data_dir = app_paths(tmp_path)
     registration_calls: list[str] = []

@@ -396,7 +396,8 @@ def main(
     if not confirmer(
         f"Uninstall {APP_NAME}",
         "Remove LeagueSkinManagerVN, downloaded skins, cache, logs, CSLOL profiles, "
-        "and all other application data?",
+        "migration history, and all other LeagueSkinManagerVN application data? "
+        "The separately installed official LTK Manager and its library will be kept.",
     ):
         notifier("Uninstall cancelled", "Nothing was removed.", False)
         return 0

@@ -12,6 +12,7 @@ from threading import Event, Thread
 from .config import (
     CSLOL_RELEASES_URL,
     LEAGUE_PROCESS_NAME,
+    LTK_PROCESS_NAMES,
     MANAGER_PROCESS_NAME,
     AppPaths,
     RuntimeConfig,
@@ -19,7 +20,16 @@ from .config import (
 from .controller import AppController, AppState
 from .desktop import DesktopApplication
 from .logging_setup import configure_logging
+from .ltk_companion import (
+    LtkCompanion,
+    LtkInstallLocator,
+    LtkReleaseClient,
+    PowerShellAuthenticodeVerifier,
+)
+from .ltk_migration import LtkMigrationService
+from .ltk_tasks import LtkTaskCoordinator, wait_for_ltk_tasks
 from .manager_update import ManagerReleaseClient, ManagerUpdater
+from .operation_gate import OperationGate
 from .process_monitor import LeagueProcessMonitor, WindowsProcessLookup
 from .skin_source import GitHubSkinSource
 from .sync_service import SkinSyncService
@@ -97,6 +107,9 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
 
     source: GitHubSkinSource | None = None
     release_client: ManagerReleaseClient | None = None
+    ltk_release_client: LtkReleaseClient | None = None
+    ltk_companion: LtkCompanion | None = None
+    ltk_tasks: LtkTaskCoordinator | None = None
     controller: AppController | None = None
     desktop: DesktopApplication | None = None
     tray: TrayApplication | None = None
@@ -109,6 +122,7 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
         logger = configure_logging(paths.log_dir)
         launcher = ProcessLauncher(logger.getChild("launcher"))
         manager_executable = paths.manager_dir / MANAGER_PROCESS_NAME
+        operation_gate = OperationGate()
         source = GitHubSkinSource(
             attempts=runtime.download_attempts,
             logger=logger.getChild("skin_source"),
@@ -154,6 +168,9 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
                 return True
             return launcher.launch(manager_executable)
 
+        def ltk_is_running() -> bool:
+            return launcher.is_any_running(LTK_PROCESS_NAMES)
+
         def startup_enabled() -> bool:
             return startup.is_enabled(executable)
 
@@ -166,17 +183,30 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
                 raise RuntimeError("Application controller is not initialized")
             return controller
 
-        def shutdown_controller() -> bool:
-            return active_controller().shutdown(runtime.shutdown_timeout_seconds)
+        def active_ltk_tasks() -> LtkTaskCoordinator:
+            if ltk_tasks is None:
+                raise RuntimeError("LTK companion is not initialized")
+            return ltk_tasks
+
+        def start_services() -> bool:
+            controller_started = active_controller().start()
+            if not active_ltk_tasks().start():
+                logger.error("LTK companion background worker could not be started")
+            return controller_started
+
+        def shutdown_services() -> bool:
+            controller_stopped = active_controller().shutdown(runtime.shutdown_timeout_seconds)
+            ltk_stopped = active_ltk_tasks().shutdown(runtime.shutdown_timeout_seconds)
+            return ltk_stopped and controller_stopped
 
         def exit_from_tray() -> bool:
-            result = shutdown_controller()
+            result = shutdown_services()
             if result and desktop is not None:
                 desktop.stop()
             return result
 
         def exit_from_desktop() -> bool:
-            result = shutdown_controller()
+            result = shutdown_services()
             if result and tray is not None:
                 tray.stop()
             return result
@@ -188,6 +218,10 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
             log_file=paths.log_dir / "LeagueSkinManagerVN.log",
             on_sync=lambda: active_controller().request_sync(),
             on_start_manager=lambda: active_controller().start_manager(),
+            on_start_ltk=lambda: active_ltk_tasks().request_start(),
+            on_migrate_to_ltk=lambda source: active_ltk_tasks().request_migration(source),
+            on_cancel_ltk_migration=lambda: active_ltk_tasks().cancel_migration(),
+            on_reset_ltk_migration=lambda: active_ltk_tasks().request_history_reset(),
             on_exit=exit_from_desktop,
             startup_enabled=startup_enabled,
             set_startup_enabled=set_startup_enabled,
@@ -195,14 +229,53 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
             logger=logger.getChild("desktop"),
         )
         tray = TrayApplication(
-            on_start=lambda: active_controller().start(),
+            on_start=start_services,
             on_show=desktop.show,
             on_sync=lambda: active_controller().request_sync(),
             on_start_manager=lambda: active_controller().start_manager(),
+            on_start_ltk=lambda: active_ltk_tasks().request_start(),
+            on_migrate_to_ltk=desktop.request_ltk_migration,
             startup_enabled=startup_enabled,
             set_startup_enabled=set_startup_enabled,
             on_exit=exit_from_tray,
             logger=logger.getChild("tray"),
+        )
+
+        ltk_release_client = LtkReleaseClient()
+        ltk_locator = LtkInstallLocator(excluded_roots=(paths.ltk_cache_dir,))
+        ltk_companion = LtkCompanion(
+            ltk_release_client,
+            ltk_locator,
+            PowerShellAuthenticodeVerifier(),
+            paths.ltk_cache_dir,
+        )
+        migration = LtkMigrationService(
+            paths.managed_manifest_file,
+            paths.package_cache_dir,
+            ltk_app_data_dir=paths.ltk_data_dir,
+            report_dir=paths.migration_report_dir,
+            migration_state_path=paths.ltk_migration_state_file,
+            cslol_is_running=lambda: launcher.is_running_under(paths.manager_dir),
+            ltk_is_running=ltk_is_running,
+        )
+
+        def update_ltk_status(detail: str, migration_active: bool) -> None:
+            if desktop is not None:
+                desktop.update_ltk_status(detail, migration_active=migration_active)
+
+        def notify_from_ltk(title: str, message: str) -> None:
+            if tray is not None:
+                tray.notify(title, message)
+
+        ltk_tasks = LtkTaskCoordinator(
+            companion=ltk_companion,
+            migration=migration,
+            operation_gate=operation_gate,
+            ltk_is_running=ltk_is_running,
+            resume_cslol_launches=lambda: active_controller().resume_pending_manager_launches(),
+            notify_sink=notify_from_ltk,
+            status_sink=update_ltk_status,
+            logger=logger.getChild("ltk_tasks"),
         )
 
         def update_status(state: AppState, detail: str) -> None:
@@ -219,6 +292,7 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
             notify_sink=tray.notify,
             sync_on_start=sync_on_start,
             shutdown_timeout_seconds=runtime.shutdown_timeout_seconds,
+            operation_gate=operation_gate,
             logger=logger.getChild("controller"),
         )
 
@@ -255,6 +329,8 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
             activation_event.close()
         if controller is not None:
             _wait_for_workers(controller, runtime.shutdown_timeout_seconds, logger)
+        if ltk_tasks is not None:
+            wait_for_ltk_tasks(ltk_tasks, runtime.shutdown_timeout_seconds, logger)
         if tray is not None:
             tray.stop()
         if desktop is not None:
@@ -269,8 +345,17 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
                 release_client.close()
         except Exception:
             logger.exception("Could not close the manager release client")
-        finally:
-            mutex.release()
+        if ltk_tasks is None and ltk_companion is not None:
+            try:
+                ltk_companion.close()
+            except Exception:
+                logger.exception("Could not close the LTK companion")
+        elif ltk_companion is None and ltk_release_client is not None:
+            try:
+                ltk_release_client.close()
+            except Exception:
+                logger.exception("Could not close the LTK release client")
+        mutex.release()
 
 
 def main() -> None:

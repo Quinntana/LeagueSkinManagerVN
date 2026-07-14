@@ -85,6 +85,8 @@ class TrayApplication:
         on_show: Action,
         on_sync: Action,
         on_start_manager: Action,
+        on_start_ltk: Action,
+        on_migrate_to_ltk: Action,
         startup_enabled: StartupGetter,
         set_startup_enabled: StartupSetter,
         on_exit: Action,
@@ -97,6 +99,8 @@ class TrayApplication:
         self._on_show = on_show
         self._on_sync = on_sync
         self._on_start_manager = on_start_manager
+        self._on_start_ltk = on_start_ltk
+        self._on_migrate_to_ltk = on_migrate_to_ltk
         self._startup_enabled = startup_enabled
         self._set_startup_enabled = set_startup_enabled
         self._on_exit = on_exit
@@ -196,8 +200,16 @@ class TrayApplication:
             ),
             self._backend.MenuItem("Sync now", self._sync_clicked),
             self._backend.MenuItem(
-                "Start manager",
+                "Open CSLOL Manager",
                 self._start_manager_clicked,
+            ),
+            self._backend.MenuItem(
+                "Open or install LTK Manager",
+                self._start_ltk_clicked,
+            ),
+            self._backend.MenuItem(
+                "Migrate CSLOL skins to LTK...",
+                self._migrate_to_ltk_clicked,
             ),
             self._backend.MenuItem(
                 "Start with Windows",
@@ -225,7 +237,13 @@ class TrayApplication:
         self._invoke("opening the desktop window", self._on_show)
 
     def _start_manager_clicked(self, _icon: TrayIcon, _item: object) -> None:
-        self._invoke("manager launch", self._on_start_manager)
+        self._invoke("CSLOL Manager launch", self._on_start_manager)
+
+    def _start_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("LTK Manager launch", self._on_start_ltk)
+
+    def _migrate_to_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the LTK migration tool", self._on_migrate_to_ltk)
 
     def _startup_checked(self, _item: object) -> bool:
         try:

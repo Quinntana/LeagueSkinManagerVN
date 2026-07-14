@@ -94,6 +94,8 @@ def make_tray(
         "on_show": lambda: None,
         "on_sync": lambda: None,
         "on_start_manager": lambda: None,
+        "on_start_ltk": lambda: None,
+        "on_migrate_to_ltk": lambda: None,
         "startup_enabled": lambda: False,
         "set_startup_enabled": lambda _enabled: None,
         "on_exit": lambda: None,
@@ -144,7 +146,9 @@ def test_tray_is_visible_before_startup_callback_runs() -> None:
         "Open LeagueSkinManagerVN",
         "Status: Starting",
         "Sync now",
-        "Start manager",
+        "Open CSLOL Manager",
+        "Open or install LTK Manager",
+        "Migrate CSLOL skins to LTK...",
         "Start with Windows",
         "Exit",
     ]
@@ -181,6 +185,8 @@ def test_menu_actions_toggle_startup_and_exit_only_once() -> None:
         on_show=lambda: calls.append("show"),
         on_sync=lambda: calls.append("sync"),
         on_start_manager=lambda: calls.append("manager"),
+        on_start_ltk=lambda: calls.append("ltk"),
+        on_migrate_to_ltk=lambda: calls.append("migrate"),
         startup_enabled=lambda: startup["enabled"],
         set_startup_enabled=set_startup,
         on_exit=lambda: calls.append("exit"),
@@ -191,14 +197,16 @@ def test_menu_actions_toggle_startup_and_exit_only_once() -> None:
     click(tray, items[2])
     click(tray, items[3])
     click(tray, items[4])
-    refreshed_startup = menu_items(tray)[4]
+    click(tray, items[5])
+    click(tray, items[6])
+    refreshed_startup = menu_items(tray)[6]
     checked = refreshed_startup.options["checked"]
     assert callable(checked)
     assert checked(refreshed_startup) is True
-    click(tray, items[5])
-    click(tray, items[5])
+    click(tray, items[7])
+    click(tray, items[7])
 
-    assert calls == ["show", "sync", "manager", "startup:True", "exit"]
+    assert calls == ["show", "sync", "manager", "ltk", "migrate", "startup:True", "exit"]
     assert fake_icon(tray).stop_calls == 1
 
 
@@ -228,7 +236,7 @@ def test_failed_startup_toggle_keeps_existing_state_and_notifies() -> None:
         set_startup_enabled=lambda _enabled: False,
     )
 
-    click(tray, menu_items(tray)[4])
+    click(tray, menu_items(tray)[6])
 
     assert fake_icon(tray).notifications == [
         ("Start with Windows", "The startup setting could not be updated.")
@@ -246,7 +254,7 @@ def test_timed_out_shutdown_keeps_tray_active_and_allows_retry() -> None:
         return next(outcomes)
 
     tray = make_tray(backend, on_exit=exit_app)
-    exit_item = menu_items(tray)[5]
+    exit_item = menu_items(tray)[7]
 
     click(tray, exit_item)
     assert exit_calls == 1
@@ -269,7 +277,7 @@ def test_shutdown_callback_error_does_not_stop_tray() -> None:
 
     tray = make_tray(backend, on_exit=fail_exit)
 
-    click(tray, menu_items(tray)[5])
+    click(tray, menu_items(tray)[7])
 
     assert fake_icon(tray).stop_calls == 0
     assert fake_icon(tray).notifications[-1] == (

@@ -8,6 +8,7 @@ from threading import Event, Lock, current_thread
 import pytest
 
 from league_skin_manager.controller import AppController, AppState, SyncOutcome
+from league_skin_manager.operation_gate import OperationGate
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -455,3 +456,264 @@ def test_shutdown_has_one_bounded_deadline_for_uncooperative_work() -> None:
 
     release.set()
     wait_until(lambda: not controller.sync_in_progress)
+
+
+def test_external_operation_rejects_sync_with_actionable_notification() -> None:
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    migration = gate.try_acquire("LTK skin migration")
+    assert migration is not None
+    notifications: list[tuple[str, str]] = []
+    sync_calls = 0
+
+    def sync(_stop_event: Event) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+
+    controller = AppController(
+        sync=sync,
+        launcher=lambda: True,
+        monitor=monitor,
+        notify_sink=lambda title, message: notifications.append((title, message)),
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+
+    assert controller.request_sync() is False
+    assert sync_calls == 0
+    assert notifications[-1][0] == "Sync not started"
+    assert "LTK skin migration" in notifications[-1][1]
+    assert "try Sync again" in notifications[-1][1]
+
+    migration.release()
+    assert controller.request_sync() is True
+    wait_until(lambda: sync_calls == 1)
+    wait_until(lambda: not controller.sync_in_progress)
+    assert controller.shutdown() is True
+
+
+def test_rejected_startup_sync_does_not_permanently_block_queued_launch() -> None:
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    migration = gate.try_acquire("LTK skin migration")
+    assert migration is not None
+    launches = 0
+
+    def launcher() -> bool:
+        nonlocal launches
+        launches += 1
+        return True
+
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=launcher,
+        monitor=monitor,
+        operation_gate=gate,
+        sync_on_start=True,
+    )
+
+    assert controller.start() is True
+    assert controller.sync_in_progress is False
+    assert controller.start_manager() is True
+    assert launches == 0
+
+    migration.release()
+    assert controller.resume_pending_manager_launches() is True
+    assert launches == 1
+    assert controller.shutdown() is True
+
+
+def test_manual_launch_queues_behind_external_operation_and_resumes() -> None:
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    migration = gate.try_acquire("LTK skin migration")
+    assert migration is not None
+    launches = 0
+    owners: list[str | None] = []
+    notifications: list[tuple[str, str]] = []
+
+    def launcher() -> bool:
+        nonlocal launches
+        launches += 1
+        owners.append(gate.current_owner)
+        return True
+
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=launcher,
+        monitor=monitor,
+        notify_sink=lambda title, message: notifications.append((title, message)),
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+
+    assert controller.start_manager() is True
+    assert launches == 0
+    assert notifications[-1] == (
+        "CSLOL Manager",
+        "Manager launch queued until LTK skin migration finishes.",
+    )
+
+    migration.release()
+    assert controller.resume_pending_manager_launches() is True
+    assert launches == 1
+    assert owners == ["CSLOL Manager launch"]
+    assert gate.current_owner is None
+    assert controller.shutdown() is True
+
+
+def test_automatic_launch_stays_pending_without_false_pid_reservation() -> None:
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    migration = gate.try_acquire("LTK skin migration")
+    assert migration is not None
+    launched: list[int] = []
+
+    def launcher() -> bool:
+        launched.append(808)
+        return True
+
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=launcher,
+        monitor=monitor,
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+    assert monitor.started.wait(1)
+
+    monitor.emit(808)
+    monitor.emit(808)
+    assert launched == []
+    assert controller.launched_for_league_pid is None
+
+    migration.release()
+    assert controller.resume_pending_manager_launches() is True
+    assert launched == [808]
+    assert controller.launched_for_league_pid == 808
+    monitor.emit(808)
+    assert launched == [808]
+    assert controller.shutdown() is True
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_sync_holds_gate_until_success_or_failure_completion(fail: bool) -> None:
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    entered = Event()
+    release = Event()
+
+    def sync(stop_event: Event) -> None:
+        assert gate.current_owner == "skin synchronization"
+        entered.set()
+        while not release.is_set() and not stop_event.is_set():
+            stop_event.wait(0.01)
+        if fail:
+            raise RuntimeError("expected failure")
+
+    controller = AppController(
+        sync=sync,
+        launcher=lambda: True,
+        monitor=monitor,
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+
+    assert controller.request_sync() is True
+    assert entered.wait(1)
+    assert gate.try_acquire("LTK skin migration") is None
+    release.set()
+    wait_until(lambda: not controller.sync_in_progress)
+    wait_until(lambda: gate.current_owner is None)
+
+    migration = gate.try_acquire("LTK skin migration")
+    assert migration is not None
+    migration.release()
+    assert controller.shutdown() is True
+
+
+def test_sync_start_failure_releases_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    import league_skin_manager.controller as controller_module
+
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=lambda: True,
+        monitor=monitor,
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+    assert monitor.started.wait(1)
+
+    class FailingThread:
+        def __init__(self, **_kwargs: object) -> None:
+            self.name = "skin-sync-worker"
+
+        def start(self) -> None:
+            raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(controller_module, "Thread", FailingThread)
+
+    assert controller.request_sync() is False
+    assert controller.state is AppState.ERROR
+    assert gate.current_owner is None
+    assert controller.shutdown() is True
+
+
+def test_sync_worker_creation_failure_releases_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    import league_skin_manager.controller as controller_module
+
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=lambda: True,
+        monitor=monitor,
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+    assert monitor.started.wait(1)
+
+    class FailingThread:
+        def __init__(self, **_kwargs: object) -> None:
+            raise RuntimeError("thread construction unavailable")
+
+    monkeypatch.setattr(controller_module, "Thread", FailingThread)
+
+    assert controller.request_sync() is False
+    assert controller.state is AppState.ERROR
+    assert gate.current_owner is None
+    assert controller.shutdown() is True
+
+
+def test_stopping_before_sync_thread_start_releases_gate() -> None:
+    monitor = FakeMonitor()
+    gate = OperationGate()
+    controller: AppController | None = None
+
+    def status_sink(state: AppState, _detail: str) -> None:
+        if state is AppState.SYNCING:
+            assert controller is not None
+            controller.shutdown(timeout_seconds=0.5)
+
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=lambda: True,
+        monitor=monitor,
+        status_sink=status_sink,
+        operation_gate=gate,
+        sync_on_start=False,
+    )
+    controller.start()
+    assert monitor.started.wait(1)
+
+    assert controller.request_sync() is False
+    assert controller.sync_in_progress is False
+    assert gate.current_owner is None

@@ -222,11 +222,19 @@ class ProcessLauncher:
 
     @staticmethod
     def is_running(executable_name: str) -> bool:
-        expected = executable_name.casefold()
+        return ProcessLauncher.is_any_running((executable_name,))
+
+    @staticmethod
+    def is_any_running(executable_names: Collection[str]) -> bool:
+        """Match several process names with one process-table snapshot."""
+
+        expected = {name.casefold() for name in executable_names if name}
+        if not expected:
+            return False
         for process in psutil.process_iter(["name"]):
             try:
                 name = process.info.get("name")
-                if isinstance(name, str) and name.casefold() == expected:
+                if isinstance(name, str) and name.casefold() in expected:
                     return True
             except (psutil.Error, OSError):
                 continue

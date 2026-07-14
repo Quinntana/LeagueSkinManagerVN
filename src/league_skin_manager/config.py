@@ -9,16 +9,23 @@ from pathlib import Path
 
 APP_NAME = "LeagueSkinManagerVN"
 APP_DISPLAY_NAME = "League Skin Manager VN"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 APP_PUBLISHER = "Quinntana"
 APP_INFO_URL = "https://github.com/Quinntana/LeagueSkinManagerVN"
 UNINSTALL_APP_NAME = "LeagueSkinManagerVNUninstall"
 SETUP_APP_NAME = "LeagueSkinManagerVNSetup"
 MANAGER_PROCESS_NAME = "cslol-manager.exe"
 MANAGER_PROCESS_NAMES = (MANAGER_PROCESS_NAME, "mod-tools.exe")
+LTK_PROCESS_NAMES = (
+    "ltk-manager.exe",
+    "LTK Manager.exe",
+    "ltk_patcher_host.exe",
+    "LeagueSkinManagerLTK.exe",
+)
 LEAGUE_PROCESS_NAME = "LeagueClient.exe"
 
 CSLOL_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/cslol-manager/releases/latest"
+LTK_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/ltk-manager/releases/latest"
 SKIN_SOURCE_OWNER = "bettie9"
 SKIN_SOURCE_REPOSITORY = "LeagueSkins"
 SKIN_SOURCE_BRANCH = "main"
@@ -33,6 +40,10 @@ class AppPaths:
     profiles_dir: Path
     cache_dir: Path
     package_cache_dir: Path
+    ltk_cache_dir: Path
+    migration_report_dir: Path
+    ltk_migration_state_file: Path
+    ltk_data_dir: Path
     log_dir: Path
     managed_manifest_file: Path
     manager_version_file: Path
@@ -64,6 +75,10 @@ class AppPaths:
             profiles_dir=manager_dir / "profiles",
             cache_dir=cache_dir,
             package_cache_dir=cache_dir / "packages",
+            ltk_cache_dir=cache_dir / "ltk",
+            migration_report_dir=data_dir / "migration-reports",
+            ltk_migration_state_file=data_dir / "ltk_migration_state.json",
+            ltk_data_dir=data_dir.parent / "dev.leaguetoolkit.manager",
             log_dir=data_dir / "logs",
             managed_manifest_file=data_dir / "managed_skins.json",
             manager_version_file=manager_dir / "version.txt",
@@ -77,6 +92,8 @@ class AppPaths:
             self.profiles_dir,
             self.cache_dir,
             self.package_cache_dir,
+            self.ltk_cache_dir,
+            self.migration_report_dir,
             self.log_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)

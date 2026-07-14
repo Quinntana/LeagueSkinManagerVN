@@ -185,12 +185,21 @@ class Process:
 
 
 def test_process_running_lookup_is_case_insensitive(monkeypatch: Any) -> None:
+    scans: list[tuple[str, ...]] = []
+
+    def processes(fields: list[str]) -> list[Process]:
+        scans.append(tuple(fields))
+        return [Process(None), Process("LTK-MANAGER.EXE")]
+
     monkeypatch.setattr(
         "league_skin_manager.windows_integration.psutil.process_iter",
-        lambda _fields: [Process(None), Process("CSLOL-MANAGER.EXE")],
+        processes,
     )
-    assert ProcessLauncher.is_running("cslol-manager.exe")
+    assert ProcessLauncher.is_running("ltk-manager.exe")
     assert not ProcessLauncher.is_running("different.exe")
+    assert ProcessLauncher.is_any_running(("cslol-manager.exe", "LTK-MANAGER.exe"))
+    assert not ProcessLauncher.is_any_running(())
+    assert scans == [("name",), ("name",), ("name",)]
 
 
 def test_launcher_rejects_missing_file_and_starts_existing(
