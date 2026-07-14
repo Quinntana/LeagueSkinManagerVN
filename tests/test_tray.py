@@ -127,6 +127,7 @@ def click(tray: TrayApplication, item: FakeMenuItem) -> None:
 def test_tray_is_visible_before_startup_callback_runs() -> None:
     backend = FakeBackend()
     callback_visibility: list[bool] = []
+    ports: list[str] = []
 
     def record_visibility() -> None:
         assert backend.icon is not None
@@ -135,11 +136,13 @@ def test_tray_is_visible_before_startup_callback_runs() -> None:
     tray = make_tray(
         backend,
         on_start=record_visibility,
+        on_migrate_to_ltk=lambda: ports.append("port"),
     )
 
     tray.run()
 
     assert callback_visibility == [True]
+    assert ports == []
     assert fake_icon(tray).visible is True
     items = menu_items(tray)
     assert [item.text for item in items] == [
@@ -148,7 +151,7 @@ def test_tray_is_visible_before_startup_callback_runs() -> None:
         "Sync now",
         "Open CSLOL Manager",
         "Open or install LTK Manager",
-        "Migrate CSLOL skins to LTK...",
+        "Port CSLOL skins to LTK now...",
         "Start with Windows",
         "Exit",
     ]
@@ -168,6 +171,20 @@ def test_status_sink_updates_title_icon_and_menu() -> None:
     assert tray.native_icon.icon == "image:SYNCING"
     assert menu_items(tray)[1].text == "Status: Downloading 4 of 20"
     assert fake_icon(tray).menu_updates == 1
+
+
+def test_sync_now_never_invokes_the_explicit_ltk_port_action() -> None:
+    backend = FakeBackend()
+    calls: list[str] = []
+    tray = make_tray(
+        backend,
+        on_sync=lambda: calls.append("sync"),
+        on_migrate_to_ltk=lambda: calls.append("port"),
+    )
+
+    click(tray, menu_items(tray)[2])
+
+    assert calls == ["sync"]
 
 
 def test_menu_actions_toggle_startup_and_exit_only_once() -> None:

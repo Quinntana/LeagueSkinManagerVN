@@ -152,16 +152,18 @@ def coordinator(
 
 def test_start_prepares_latest_release_without_launching(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
     value, _notifications, statuses, _resumed = coordinator(
         tmp_path,
         companion,
-        FakeMigration(tmp_path),
+        migration,
     )
 
     assert value.start() is True
     wait_until(lambda: companion.prepare_calls == 1 and "cached" in statuses[-1][0])
 
     assert companion.start_calls == 0
+    assert migration.calls == []
     assert value.shutdown(1.0) is True
     assert companion.closed == 1
     assert value.shutdown(1.0) is True

@@ -141,7 +141,7 @@ class LtkTaskCoordinator:
         return True
 
     def request_migration(self, source: Path) -> bool:
-        """Queue one confirmed migration; reject duplicate migration requests."""
+        """Queue one user-confirmed port; this is never called by automatic startup work."""
 
         if not self.start():
             return False
@@ -158,7 +158,7 @@ class LtkTaskCoordinator:
             self._migration_cancel.clear()
             self._migration_queued = True
             self._queue.put(_Task(_TaskKind.MIGRATE, selected))
-        self._publish_status("migration queued", True)
+        self._publish_status("explicit CSLOL-to-LTK port queued", True)
         return True
 
     def cancel_migration(self) -> bool:

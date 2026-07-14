@@ -409,7 +409,7 @@ class DesktopApplication:
         self._cancel_migration_button.pack(side="right")
         ttk.Button(
             companion,
-            text="Migrate CSLOL skins to LTK...",
+            text="Port CSLOL skins to LTK now...",
             style="Secondary.TButton",
             command=self._migration_clicked,
         ).pack(side="right", padx=(0, 8))
@@ -625,10 +625,10 @@ class DesktopApplication:
                 return
             if self._on_migrate_to_ltk(source) is False:
                 if self._ltk_status_var is not None:
-                    self._ltk_status_var.set("LTK companion: migration was not queued")
+                    self._ltk_status_var.set("LTK companion: port was not queued")
                 return
             if self._ltk_status_var is not None:
-                self._ltk_status_var.set("LTK companion: migration queued")
+                self._ltk_status_var.set("LTK companion: explicit port queued")
             if self._cancel_migration_button is not None:
                 self._cancel_migration_button.configure(state="normal")
         except Exception as exc:
@@ -660,10 +660,11 @@ class DesktopApplication:
 
         return bool(
             messagebox.askyesno(
-                "Migrate CSLOL skins to LTK",
+                "Port CSLOL skins to LTK now",
                 (
                     f"Source: {source}\n\n"
-                    "LeagueSkinManagerVN will validate and queue these mods in LTK's archive "
+                    "Only after you confirm, LeagueSkinManagerVN will validate and queue these "
+                    "mods in LTK's archive "
                     "inbox, then open LTK Manager. CSLOL originals are left unchanged.\n\n"
                     "Close both CSLOL Manager and LTK Manager before continuing. Existing "
                     "and previously queued content is detected by SHA-256 and skipped. Continue?"

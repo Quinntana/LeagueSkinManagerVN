@@ -302,7 +302,7 @@ def test_tray_migration_request_is_selected_and_confirmed_on_tk_thread(tmp_path:
     assert root.actions[:3] == ["show", "lift", "focus"]
     assert confirmations == [selected]
     assert migrated == [selected]
-    assert app._ltk_status_var.get() == "LTK companion: migration queued"
+    assert app._ltk_status_var.get() == "LTK companion: explicit port queued"
     assert app._cancel_migration_button.state == "normal"
 
 

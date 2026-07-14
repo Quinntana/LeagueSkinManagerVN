@@ -71,10 +71,13 @@ installer and updater manage the external application.
     and required to have a valid Windows Authenticode signature from `Natoken LLC`.
     Verification failures are never downgraded to warnings. Downloading does not run the
     installer; an explicit **Open / install LTK** or confirmed migration action does.
-11. The migration chooser accepts either a CSLOL Manager root or its direct `installed`
-    folder. Both CSLOL and LTK (including the legacy LeagueSkinManagerLTK app/patcher)
-    must be closed. Valid mods are queued only through LTK's supported `archives` inbox;
-    LTK's library, profiles, and indexes are never edited by this app.
+11. The port chooser accepts either a CSLOL Manager root or its direct `installed`
+    folder. Porting is **manual only**: startup, automatic LTK release preparation, and
+    `Sync now` never scan or copy CSLOL mods into LTK. Files are considered only after the
+    user presses **Port CSLOL skins to LTK now...** and confirms the selected folder. Both
+    CSLOL and LTK (including the legacy LeagueSkinManagerLTK app/patcher) must be closed.
+    Valid mods are queued only through LTK's supported `archives` inbox; LTK's library,
+    profiles, and indexes are never edited by this app.
 12. Migration reuses the verified package cache when an extracted mod still matches its
     manifest fingerprint and deterministically repackages changed or user-owned mods.
     Packages are SHA-256 deduplicated across both the current inbox and a bounded,
@@ -100,9 +103,9 @@ invoked directly by LeagueSkinManagerVN.
   a sync or migration.
 - `Open or install LTK Manager`: launches a current external LTK install, or runs the
   cached, verified official per-user installer with passive/restart switches.
-- `Migrate CSLOL skins to LTK...`: opens the desktop folder chooser on Tk's UI thread,
-  confirms the non-destructive handoff, shows progress/cancellation, and opens LTK after
-  packages and migration history are durable.
+- `Port CSLOL skins to LTK now...`: the only action that can begin a port. It opens the
+  desktop folder chooser on Tk's UI thread, confirms the non-destructive handoff, shows
+  progress/cancellation, and opens LTK after packages and migration history are durable.
 - `Reset migration history...` (desktop): an explicit confirmation-only recovery action
   for intentionally requeuing content removed from LTK. It deletes no CSLOL or LTK data.
 - `Start with Windows`: explicit per-user HKCU toggle; disabled by default.

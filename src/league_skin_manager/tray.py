@@ -208,7 +208,7 @@ class TrayApplication:
                 self._start_ltk_clicked,
             ),
             self._backend.MenuItem(
-                "Migrate CSLOL skins to LTK...",
+                "Port CSLOL skins to LTK now...",
                 self._migrate_to_ltk_clicked,
             ),
             self._backend.MenuItem(
@@ -243,7 +243,7 @@ class TrayApplication:
         self._invoke("LTK Manager launch", self._on_start_ltk)
 
     def _migrate_to_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
-        self._invoke("opening the LTK migration tool", self._on_migrate_to_ltk)
+        self._invoke("opening the explicit CSLOL-to-LTK port tool", self._on_migrate_to_ltk)
 
     def _startup_checked(self, _item: object) -> bool:
         try:
