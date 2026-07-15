@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "LeagueSkinManagerVN"
-version = "0.3.0"
+version = "2.5.0"
 description = "A tool for managing League of Legends custom skins"
 authors = ["Quinntana <archimedesstar@gmail.com>"]
 license = "GPL-3.0"

@@ -9,7 +9,7 @@ from pathlib import Path
 
 APP_NAME = "LeagueSkinManagerVN"
 APP_DISPLAY_NAME = "League Skin Manager VN"
-APP_VERSION = "0.3.0"
+APP_VERSION = "2.5.0"
 APP_PUBLISHER = "Quinntana"
 APP_INFO_URL = "https://github.com/Quinntana/LeagueSkinManagerVN"
 UNINSTALL_APP_NAME = "LeagueSkinManagerVNUninstall"
