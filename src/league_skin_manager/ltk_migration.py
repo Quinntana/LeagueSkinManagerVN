@@ -19,7 +19,7 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol, cast
@@ -137,6 +137,7 @@ class MigrationResult:
     reused_cache: int
     packaged: int
     issues: tuple[MigrationIssue, ...]
+    report_error: str | None = None
 
     @property
     def cancelled(self) -> bool:
@@ -145,6 +146,14 @@ class MigrationResult:
     @property
     def blocked(self) -> bool:
         return self.status == "blocked"
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedPortStatus:
+    """Read-only summary of VN-managed mods not yet handed to LTK."""
+
+    total: int
+    pending: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +372,57 @@ class LtkMigrationService:
             LOGGER.warning("Ignoring relative LTK modStoragePath: %s", configured)
             return default
         return _absolute_path(path)
+
+    def inspect_managed_port_status(self, selection: Path) -> ManagedPortStatus:
+        """Return how many VN-managed mods still need an explicit LTK port.
+
+        A mod is considered ported only when the migration ledger contains the
+        exact absolute installed source path together with the managed state's
+        installed-content digest. The inspection shares the migration lock so
+        it cannot observe a ledger checkpoint in progress, and it never creates
+        or changes files.
+        """
+
+        if not self._lock.acquire(blocking=False):
+            raise MigrationBusyError("An LTK migration is already in progress")
+        try:
+            source_dir = self.normalize_source(selection)
+            state = self._load_managed_state()
+            history = self._load_history()
+            ported = {
+                (record.source, record.content_sha256)
+                for record in history.values()
+                if record.content_sha256 is not None
+            }
+            managed_sources = {
+                str(_absolute_path(source_dir / entry.directory)) for entry in state.entries
+            }
+            # The ledger is keyed by archive digest, so two different VN-owned
+            # directories with byte-identical package content intentionally share
+            # one record. Treat that content as handed off only when the retained
+            # record belongs to another current VN-managed entry; an unrelated
+            # user mod or external CSLOL folder must not clear VN's reminder.
+            ported_content = {
+                record.content_sha256
+                for record in history.values()
+                if record.content_sha256 is not None and record.source in managed_sources
+            }
+            pending = sum(
+                1
+                for entry in state.entries
+                if not entry.content_sha256
+                or (
+                    (
+                        str(_absolute_path(source_dir / entry.directory)),
+                        entry.content_sha256,
+                    )
+                    not in ported
+                    and entry.content_sha256 not in ported_content
+                )
+            )
+            return ManagedPortStatus(total=len(state.entries), pending=pending)
+        finally:
+            self._lock.release()
 
     def forget_history(self) -> None:
         """Atomically clear VN's migration ledger so packages may be requeued.
@@ -627,7 +687,15 @@ class LtkMigrationService:
             packaged=packaged,
             issues=tuple(issues),
         )
-        self._write_report(result)
+        try:
+            self._write_report(result)
+        except (OSError, LtkMigrationError) as error:
+            # Archive and ledger checkpoints are the authoritative handoff. An
+            # unavailable diagnostics directory must not turn a completed,
+            # durable queue operation into a misleading "not started" failure.
+            message = str(error) or error.__class__.__name__
+            LOGGER.error("LTK migration completed but its audit report was unavailable: %s", error)
+            result = replace(result, report_error=message)
         reporter.emit(status, processed)
         return result
 
@@ -677,15 +745,28 @@ class LtkMigrationService:
         return _PreparedMod(tree=tree, fingerprint=fingerprint, display_name=display_name)
 
     def _load_managed_entries(self) -> dict[str, ManagedEntry]:
-        if not _is_safe_regular_file(self.managed_state_path):
-            return {}
         try:
-            raw = json.loads(self.managed_state_path.read_text(encoding="utf-8"))
-            state = ManagedState.from_json(raw)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ManagedStateError):
+            state = self._load_managed_state()
+        except ManagedStateError:
             LOGGER.warning("Managed-skin state is unavailable; live mods will be repackaged")
             return {}
         return {entry.directory: entry for entry in state.entries}
+
+    def _load_managed_state(self) -> ManagedState:
+        path = self.managed_state_path
+        if not os.path.lexists(path):
+            return ManagedState.empty()
+        if not _is_safe_regular_file(path):
+            raise ManagedStateError(f"Unsafe managed-skin state: {path}")
+        try:
+            before = _safe_file_stat(path)
+            with _open_regular_file(path, before) as stream:
+                encoded = stream.read()
+            _require_same_file(path, before)
+            raw = json.loads(encoded.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, LtkMigrationError) as error:
+            raise ManagedStateError("Managed-skin state is unreadable") from error
+        return ManagedState.from_json(raw)
 
     def _load_history(self) -> dict[str, _HistoryRecord]:
         path = self.migration_state_path

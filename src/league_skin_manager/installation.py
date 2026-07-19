@@ -88,6 +88,22 @@ class InstallLayout:
         return lexical
 
 
+def is_installed_executable(executable: Path, layout: InstallLayout) -> bool:
+    """Return whether this exact, normal file is the owned installed executable."""
+
+    try:
+        install_dir = layout.validated_install_dir()
+        candidate = Path(os.path.abspath(executable))
+        expected = Path(os.path.abspath(layout.executable))
+        if candidate != expected or candidate.parent != install_dir:
+            return False
+        if not candidate.is_file() or _is_reparse_point(candidate):
+            return False
+        return candidate.resolve() == expected.resolve()
+    except (InstallationError, OSError, ValueError):
+        return False
+
+
 def quote_command(executable: Path, *arguments: str) -> str:
     if any('"' in argument for argument in arguments):
         raise ValueError("command arguments cannot contain quotes")
@@ -237,5 +253,6 @@ __all__ = [
     "UNINSTALL_REGISTRY_PARENT",
     "apps_entry_values",
     "installed_size_kib",
+    "is_installed_executable",
     "quote_command",
 ]

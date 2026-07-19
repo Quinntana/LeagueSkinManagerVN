@@ -86,15 +86,23 @@ class TrayApplication:
         on_sync: Action,
         on_start_manager: Action,
         on_open_cslol_skins: Action,
+        on_copy_cslol_manager_path: Action,
         on_start_ltk: Action,
         on_open_ltk_install: Action,
         on_open_ltk_storage: Action,
         on_migrate_to_ltk: Action,
+        on_cancel_ltk_migration: Action,
+        on_reset_ltk_migration: Action,
         on_remove_ltk_skins: Action,
+        on_open_data: Action,
+        on_open_log: Action,
         startup_enabled: StartupGetter,
         set_startup_enabled: StartupSetter,
         on_uninstall: Action,
         on_exit: Action,
+        runtime_label: str,
+        uninstall_available: bool,
+        startup_available: bool,
         backend: TrayBackend | None = None,
         image_factory: ImageFactory = make_status_icon,
         app_name: str = APP_NAME,
@@ -105,15 +113,25 @@ class TrayApplication:
         self._on_sync = on_sync
         self._on_start_manager = on_start_manager
         self._on_open_cslol_skins = on_open_cslol_skins
+        self._on_copy_cslol_manager_path = on_copy_cslol_manager_path
         self._on_start_ltk = on_start_ltk
         self._on_open_ltk_install = on_open_ltk_install
         self._on_open_ltk_storage = on_open_ltk_storage
         self._on_migrate_to_ltk = on_migrate_to_ltk
+        self._on_cancel_ltk_migration = on_cancel_ltk_migration
+        self._on_reset_ltk_migration = on_reset_ltk_migration
         self._on_remove_ltk_skins = on_remove_ltk_skins
+        self._on_open_data = on_open_data
+        self._on_open_log = on_open_log
         self._startup_enabled = startup_enabled
         self._set_startup_enabled = set_startup_enabled
         self._on_uninstall = on_uninstall
         self._on_exit = on_exit
+        if not runtime_label.strip():
+            raise ValueError("runtime_label must not be empty")
+        self._runtime_label = runtime_label.strip()
+        self._uninstall_available = bool(uninstall_available)
+        self._startup_available = bool(startup_available)
         self._backend = backend or self._load_backend()
         self._image_factory = image_factory
         self._app_name = app_name
@@ -122,6 +140,13 @@ class TrayApplication:
         self._lock = RLock()
         self._state = AppState.STARTING
         self._detail = "Starting"
+        self._skin_count: int | None = None
+        self._catalog_patch: str | None = None
+        self._ltk_detail = "checking the latest official release"
+        self._ltk_migration_active = False
+        self._ltk_port_pending: int | None = None
+        self._ltk_port_total: int | None = None
+        self._ltk_port_unavailable = False
         self._exit_requested = False
         self._stopped = False
         self._icon = self._backend.Icon(
@@ -182,6 +207,67 @@ class TrayApplication:
         except Exception:
             self._logger.exception("Unable to refresh tray status")
 
+    def update_library(self, skin_count: int, patch: str | None) -> None:
+        """Publish a cached local catalog summary without doing menu-time I/O."""
+
+        if skin_count < 0:
+            raise ValueError("skin_count cannot be negative")
+        with self._lock:
+            self._skin_count = skin_count
+            self._catalog_patch = patch.strip() if patch and patch.strip() else None
+            title = self._title()
+        try:
+            self._icon.title = title
+            self._refresh_menu()
+        except Exception:
+            self._logger.exception("Unable to refresh tray catalog summary")
+
+    def update_ltk_status(self, detail: str, *, migration_active: bool = False) -> None:
+        """Publish LTK companion state independently from VN skin sync state."""
+
+        normalized = detail.strip() or "status unavailable"
+        with self._lock:
+            self._ltk_detail = normalized
+            self._ltk_migration_active = bool(migration_active)
+        try:
+            self._refresh_menu()
+        except Exception:
+            self._logger.exception("Unable to refresh tray LTK status")
+
+    def update_ltk_port_status(
+        self,
+        *,
+        pending: int | None,
+        total: int | None,
+        unavailable: bool = False,
+    ) -> None:
+        """Publish whether current VN-managed skins still need an explicit LTK port."""
+
+        if unavailable:
+            if pending is not None or total is not None:
+                raise ValueError("unavailable LTK port status cannot include counts")
+        elif pending is None or total is None:
+            raise ValueError("LTK port status requires both pending and total counts")
+        elif (
+            isinstance(pending, bool)
+            or isinstance(total, bool)
+            or pending < 0
+            or total < 0
+            or pending > total
+        ):
+            raise ValueError("LTK port counts must satisfy 0 <= pending <= total")
+
+        with self._lock:
+            self._ltk_port_pending = pending
+            self._ltk_port_total = total
+            self._ltk_port_unavailable = bool(unavailable)
+            title = self._title()
+        try:
+            self._icon.title = title
+            self._refresh_menu()
+        except Exception:
+            self._logger.exception("Unable to refresh tray LTK port status")
+
     def notify(self, title: str, message: str) -> None:
         """Notification sink suitable for :class:`AppController`."""
 
@@ -197,11 +283,23 @@ class TrayApplication:
     def _build_menu(self) -> object:
         with self._lock:
             detail = self._detail
+            state = self._state
+            skin_count = self._skin_count
+            catalog_patch = self._catalog_patch
+            ltk_detail = self._ltk_detail
+            migration_active = self._ltk_migration_active
+            ltk_port_pending = self._ltk_port_pending
+            ltk_port_total = self._ltk_port_total
+            ltk_port_unavailable = self._ltk_port_unavailable
         cslol_menu = self._backend.Menu(
             self._backend.MenuItem("Open CSLOL Manager", self._start_manager_clicked),
             self._backend.MenuItem(
                 "Open installed skins folder",
                 self._open_cslol_skins_clicked,
+            ),
+            self._backend.MenuItem(
+                "Copy CSLOL Manager folder path",
+                self._copy_cslol_manager_path_clicked,
             ),
         )
         ltk_menu = self._backend.Menu(
@@ -215,36 +313,86 @@ class TrayApplication:
                 self._open_ltk_storage_clicked,
             ),
             self._backend.MenuItem(
-                "Port CSLOL skins to LTK now...",
+                self._ltk_port_action_label(ltk_port_pending),
                 self._migrate_to_ltk_clicked,
+            ),
+            self._backend.MenuItem(
+                "Cancel active LTK port",
+                self._cancel_ltk_migration_clicked,
+                enabled=migration_active,
+            ),
+        )
+        maintenance_menu = self._backend.Menu(
+            self._backend.MenuItem(
+                "Open LeagueSkinManagerVN data folder",
+                self._open_data_clicked,
+            ),
+            self._backend.MenuItem(
+                "Open diagnostics log",
+                self._open_log_clicked,
+            ),
+            self._backend.MenuItem(
+                "Reset LTK port history...",
+                self._reset_ltk_migration_clicked,
             ),
             self._backend.MenuItem(
                 "Remove all LTK skins...",
                 self._remove_ltk_skins_clicked,
             ),
+            self._backend.MenuItem(
+                "Uninstall LeagueSkinManagerVN...",
+                self._uninstall_clicked,
+                enabled=self._uninstall_available,
+            ),
         )
         return self._backend.Menu(
             self._backend.MenuItem(
-                "Open LeagueSkinManagerVN",
+                "Browse/search VN skin library...",
                 self._show_clicked,
                 default=True,
             ),
             self._backend.MenuItem(
-                f"Status: {detail}",
+                self._clip_menu_text(f"Sync: {detail}"),
                 None,
                 enabled=False,
             ),
-            self._backend.MenuItem("Sync VN skins now", self._sync_clicked),
+            self._backend.MenuItem(
+                self._library_label(skin_count, catalog_patch),
+                None,
+                enabled=False,
+            ),
+            self._backend.MenuItem(
+                self._clip_menu_text(f"LTK: {ltk_detail}"),
+                None,
+                enabled=False,
+            ),
+            self._backend.MenuItem(
+                self._ltk_port_label(
+                    ltk_port_pending,
+                    ltk_port_total,
+                    unavailable=ltk_port_unavailable,
+                ),
+                None,
+                enabled=False,
+            ),
+            self._backend.MenuItem(
+                f"Runtime: {self._runtime_label}",
+                None,
+                enabled=False,
+            ),
+            self._backend.MenuItem(
+                "Sync VN skins now",
+                self._sync_clicked,
+                enabled=state not in (AppState.STARTING, AppState.SYNCING, AppState.STOPPING),
+            ),
             self._backend.MenuItem("CSLOL Manager", cslol_menu),
             self._backend.MenuItem("LTK Manager", ltk_menu),
+            self._backend.MenuItem("Maintenance", maintenance_menu),
             self._backend.MenuItem(
                 "Start with Windows",
                 self._startup_clicked,
                 checked=self._startup_checked,
-            ),
-            self._backend.MenuItem(
-                "Uninstall LeagueSkinManagerVN...",
-                self._uninstall_clicked,
+                enabled=self._startup_available,
             ),
             self._backend.MenuItem("Exit", self._exit_clicked),
         )
@@ -258,7 +406,55 @@ class TrayApplication:
             return
 
     def _title(self) -> str:
-        return f"{self._app_name} - {self._detail}"
+        parts = [self._app_name, self._detail]
+        if self._skin_count is not None:
+            parts.append(f"{self._skin_count:,} skins")
+        if self._ltk_port_pending:
+            parts.append("LTK port recommended")
+        return self._clip_text(" | ".join(parts), 127)
+
+    @classmethod
+    def _clip_menu_text(cls, text: str) -> str:
+        return cls._clip_text(text, 96)
+
+    @staticmethod
+    def _clip_text(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    @classmethod
+    def _library_label(cls, skin_count: int | None, patch: str | None) -> str:
+        if skin_count is None:
+            return "Library: reading local catalog"
+        if skin_count == 0 and patch is None:
+            return "Library: not synced yet"
+        patch_label = patch or "unknown"
+        return cls._clip_menu_text(f"Library: {skin_count:,} VN skins | patch {patch_label}")
+
+    @classmethod
+    def _ltk_port_label(
+        cls,
+        pending: int | None,
+        total: int | None,
+        *,
+        unavailable: bool,
+    ) -> str:
+        if unavailable:
+            return "LTK port: status unavailable; check diagnostics"
+        if pending is None or total is None:
+            return "LTK port: checking VN handoff state"
+        if total == 0:
+            return "LTK port: no VN-managed skins to port"
+        if pending == 0:
+            return cls._clip_menu_text(f"LTK port: all {total:,} current VN skins were queued")
+        return cls._clip_menu_text(f"LTK port: {pending:,} of {total:,} VN skins need manual port")
+
+    @staticmethod
+    def _ltk_port_action_label(pending: int | None) -> str:
+        if pending:
+            return f"Port CSLOL skins to LTK now ({pending:,} pending)..."
+        return "Port CSLOL skins to LTK now..."
 
     def _sync_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("skin sync", self._on_sync)
@@ -272,6 +468,12 @@ class TrayApplication:
     def _open_cslol_skins_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("opening the CSLOL installed skins folder", self._on_open_cslol_skins)
 
+    def _copy_cslol_manager_path_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke(
+            "copying the CSLOL Manager folder path",
+            self._on_copy_cslol_manager_path,
+        )
+
     def _start_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("LTK Manager launch", self._on_start_ltk)
 
@@ -284,8 +486,20 @@ class TrayApplication:
     def _migrate_to_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("opening the explicit CSLOL-to-LTK port tool", self._on_migrate_to_ltk)
 
+    def _cancel_ltk_migration_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("cancelling the active LTK port", self._on_cancel_ltk_migration)
+
+    def _reset_ltk_migration_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("resetting LTK port history", self._on_reset_ltk_migration)
+
     def _remove_ltk_skins_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("removing all LTK skins", self._on_remove_ltk_skins)
+
+    def _open_data_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the application data folder", self._on_open_data)
+
+    def _open_log_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the diagnostics log", self._on_open_log)
 
     def _startup_checked(self, _item: object) -> bool:
         try:

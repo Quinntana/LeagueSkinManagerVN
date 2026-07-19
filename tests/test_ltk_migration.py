@@ -14,6 +14,7 @@ from league_skin_manager.atomic import atomic_write_bytes as real_atomic_write_b
 from league_skin_manager.ltk_migration import (
     LtkMigrationService,
     MigrationBlockedError,
+    MigrationBusyError,
     MigrationHistoryError,
     MigrationProgress,
     MigrationSourceError,
@@ -24,6 +25,7 @@ from league_skin_manager.skin_installer import (
     inspect_extracted_mod,
     managed_directory_name,
 )
+from league_skin_manager.sync_service import ManagedStateError
 
 
 def create_fantome(path: Path, *, name: str = "Test skin", wad: bytes = b"wad") -> Path:
@@ -94,6 +96,162 @@ def create_managed_mod(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def queued_archives(path: Path) -> list[Path]:
     return sorted(path.glob("*.fantome"))
+
+
+def write_history(
+    service: LtkMigrationService,
+    *,
+    source: Path,
+    content_sha256: str,
+) -> None:
+    service.migration_state_path.parent.mkdir(parents=True, exist_ok=True)
+    service.migration_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "packages": {
+                    "f" * 64: {
+                        "source": str(source),
+                        "name": source.name,
+                        "queued_at": "2026-07-19T00:00:00+00:00",
+                        "content_sha256": content_sha256,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_managed_port_status_matches_exact_absolute_source_and_content(
+    tmp_path: Path,
+) -> None:
+    installed, live, _cache = create_managed_mod(tmp_path)
+    service = make_service(tmp_path)
+    fingerprint = inspect_extracted_mod(live)
+    assert fingerprint is not None
+    write_history(service, source=live, content_sha256=fingerprint.sha256)
+    before = {
+        path: path.read_bytes()
+        for path in (service.managed_state_path, service.migration_state_path)
+    }
+
+    status = service.inspect_managed_port_status(installed.parent)
+
+    assert (status.total, status.pending) == (1, 0)
+    assert {
+        path: path.read_bytes()
+        for path in (service.managed_state_path, service.migration_state_path)
+    } == before
+    assert not (tmp_path / "reports").exists()
+    assert not (tmp_path / "ltk-data").exists()
+
+
+@pytest.mark.parametrize("mismatch", ["path", "digest"])
+def test_managed_port_status_requires_both_exact_ledger_fields(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    installed, live, _cache = create_managed_mod(tmp_path)
+    service = make_service(tmp_path)
+    fingerprint = inspect_extracted_mod(live)
+    assert fingerprint is not None
+    source = live.parent / "different" if mismatch == "path" else live
+    digest = "e" * 64 if mismatch == "digest" else fingerprint.sha256
+    write_history(service, source=source, content_sha256=digest)
+
+    status = service.inspect_managed_port_status(installed)
+
+    assert (status.total, status.pending) == (1, 1)
+
+
+def test_managed_port_status_counts_identical_vn_content_as_one_handoff(
+    tmp_path: Path,
+) -> None:
+    installed, live, _cache = create_managed_mod(tmp_path)
+    service = make_service(tmp_path)
+    fingerprint = inspect_extracted_mod(live)
+    assert fingerprint is not None
+    raw = json.loads(service.managed_state_path.read_text(encoding="utf-8"))
+    duplicate_source = "skins/Ahri/Foxfire Ahri Copy.fantome"
+    duplicate_directory = managed_directory_name(
+        "Ahri",
+        "Foxfire Ahri Copy",
+        duplicate_source,
+    )
+    shutil.copytree(live, installed / duplicate_directory)
+    duplicate_entry = dict(raw["entries"][0])
+    duplicate_entry.update(
+        {
+            "name": "Foxfire Ahri Copy",
+            "source_path": duplicate_source,
+            "directory": duplicate_directory,
+        }
+    )
+    raw["entries"].append(duplicate_entry)
+    service.managed_state_path.write_text(json.dumps(raw), encoding="utf-8")
+    write_history(service, source=live, content_sha256=fingerprint.sha256)
+
+    status = service.inspect_managed_port_status(installed)
+
+    assert (status.total, status.pending) == (2, 0)
+
+
+def test_managed_port_status_treats_missing_managed_digest_as_pending(
+    tmp_path: Path,
+) -> None:
+    installed, live, _cache = create_managed_mod(tmp_path)
+    service = make_service(tmp_path)
+    raw = json.loads(service.managed_state_path.read_text(encoding="utf-8"))
+    raw["entries"][0].pop("content_sha256")
+    service.managed_state_path.write_text(json.dumps(raw), encoding="utf-8")
+    write_history(service, source=live, content_sha256="d" * 64)
+
+    status = service.inspect_managed_port_status(installed)
+
+    assert (status.total, status.pending) == (1, 1)
+
+
+def test_managed_port_status_preserves_state_and_history_validation_errors(
+    tmp_path: Path,
+) -> None:
+    installed = tmp_path / "cslol-manager" / "installed"
+    installed.mkdir(parents=True)
+    service = make_service(tmp_path)
+    service.managed_state_path.parent.mkdir(parents=True)
+    service.managed_state_path.write_text(
+        json.dumps({"schema_version": 999, "entries": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManagedStateError, match="schema"):
+        service.inspect_managed_port_status(installed)
+
+    service.managed_state_path.unlink()
+    service.migration_state_path.parent.mkdir(parents=True, exist_ok=True)
+    service.migration_state_path.write_text(
+        json.dumps({"schema_version": 999, "packages": {}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(MigrationHistoryError, match="schema"):
+        service.inspect_managed_port_status(installed)
+
+    service.migration_state_path.write_bytes(b"x" * 65)
+    service.max_history_bytes = 64
+    with pytest.raises(MigrationHistoryError, match="size limit"):
+        service.inspect_managed_port_status(installed)
+
+
+def test_managed_port_status_is_exclusive_with_migration(tmp_path: Path) -> None:
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    service = make_service(tmp_path)
+    assert service._lock.acquire(blocking=False)
+    try:
+        with pytest.raises(MigrationBusyError, match="already in progress"):
+            service.inspect_managed_port_status(installed)
+    finally:
+        service._lock.release()
 
 
 def test_normalizes_cslol_root_or_direct_installed_folder(tmp_path: Path) -> None:
@@ -377,7 +535,9 @@ def test_consumed_archive_is_skipped_until_explicit_history_reset(tmp_path: Path
     assert record["source"].endswith("custom")
     assert record["name"] == "custom"
     assert record["queued_at"]
-    assert record["content_sha256"] == inspect_extracted_mod(installed / "custom").sha256
+    fingerprint = inspect_extracted_mod(installed / "custom")
+    assert fingerprint is not None
+    assert record["content_sha256"] == fingerprint.sha256
     assert not list(ledger.parent.glob("*.tmp"))
 
     service.forget_history()
@@ -629,6 +789,26 @@ def test_manager_starting_during_work_returns_blocked_partial_result(
     assert result.queued == 0
     assert any("Close LTK Manager" in issue.reason for issue in result.issues)
     assert result.report_path.is_file()
+
+
+def test_report_write_failure_does_not_hide_a_durable_migration_result(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    service = make_service(tmp_path)
+
+    def fail_report(_path: Path, _value: object) -> None:
+        raise OSError("report disk full")
+
+    monkeypatch.setattr(migration_module, "atomic_write_json", fail_report)
+
+    result = service.migrate(installed)
+
+    assert result.status == "completed"
+    assert result.report_error == "report disk full"
+    assert not result.report_path.exists()
 
 
 def test_malformed_and_over_limit_mods_are_reported_without_touching_source(

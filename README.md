@@ -1,14 +1,16 @@
 # LeagueSkinManagerVN
 
-A native Windows desktop and tray application that keeps a CSLOL Manager
+A native Windows tray application with an optional searchable library that keeps a CSLOL Manager
 installation and an application-owned set of League skin mods synchronized,
 while also providing a verified official LTK Manager companion and a safe
 CSLOL-to-LTK migration path. User mods, profiles, and CSLOL originals are not
 overwritten.
 
-## Desktop library
+## Optional skin library
 
-Normal launches open a desktop library backed by the validated offline manifest:
+Normal launches stay in the system tray and do not construct or run Tk. Choose
+**Browse/search VN skin library...** only when you want the optional window backed by
+the validated offline manifest:
 
 - Instant accent- and punctuation-tolerant search across champion and skin names.
 - Champion filtering and sortable Champion, Skin, and Package size columns.
@@ -17,9 +19,10 @@ Normal launches open a desktop library backed by the validated offline manifest:
 - `Sync VN skins`, CSLOL and LTK launch controls, a guided LTK migration tool,
   background startup, refresh, and clean exit controls.
 
-Closing the window keeps the service available in the tray. Windows startup uses
-`--background`, so login remains unobtrusive. The tray's default action reopens the
-desktop window.
+Closing the window keeps the core service available in the tray. The tray owns the
+application lifetime; a presentation failure does not stop synchronization, process
+monitoring, CSLOL, or LTK tasks. `--background` remains a compatibility option, while
+`--show-window` is the only startup option that explicitly opens the optional window.
 
 ## Important notice
 
@@ -71,6 +74,8 @@ installer and updater manage the external application.
     and required to have a valid Windows Authenticode signature from `Natoken LLC`.
     Verification failures are never downgraded to warnings. Downloading does not run the
     installer; an explicit **Open / install LTK** or confirmed migration action does.
+    LeagueSkinManagerVN does not change LTK's content-enforcement or safety settings and
+    does not pass flags intended to disable them.
 11. The port chooser accepts either a CSLOL Manager root or its direct `installed`
     folder. Porting is **manual only**: startup, automatic LTK release preparation, and
     `Sync now` never scan or copy CSLOL mods into LTK. Files are considered only after the
@@ -78,7 +83,14 @@ installer and updater manage the external application.
     CSLOL and LTK (including the legacy LeagueSkinManagerLTK app/patcher) must be closed.
     Valid mods are queued only through LTK's supported `archives` inbox; normal porting
     never edits LTK's library, profiles, or indexes directly.
-12. Migration reuses the verified package cache when an extracted mod still matches its
+12. A separate tray summary compares every current VN-managed mod's exact installed path
+    and content SHA-256 with the durable migration ledger. After a skin update it reports
+    how many current VN skins need a manual port and marks the port action with the pending
+    count. A zero count means those exact packages were queued or previously observed in
+    LTK's archive inbox; it does not claim that LTK imported or activated them. This check
+    is read-only, survives restarts, refreshes after successful sync/port/history actions,
+    and never starts a port by itself.
+13. Migration reuses the verified package cache when an extracted mod still matches its
     manifest fingerprint and deterministically repackages changed or user-owned mods.
     WAD-heavy packages use ZIP's no-recompression mode, avoiding expensive level-9
     deflate for data that is already compressed. Packages are SHA-256 deduplicated across
@@ -100,25 +112,35 @@ invoked directly by LeagueSkinManagerVN.
 
 ## Tray controls
 
-- `Status`: current lifecycle/synchronization state.
-- `Sync VN skins now`: starts one manual update; a second concurrent sync is rejected safely.
-- `CSLOL Manager` submenu: opens CSLOL Manager or its direct `installed` skins folder.
-- `LTK Manager` submenu: opens/installs LTK, opens the detected application folder, opens
-  the configured skin-storage folder, starts the explicit port tool, or removes all skins.
-- `Port CSLOL skins to LTK now...`: the only action that can begin a port. It opens the
-  desktop folder chooser on Tk's UI thread, confirms the non-destructive handoff, shows
-  progress/cancellation, and opens LTK after packages and migration history are durable.
+- Disabled summary rows show current sync detail, VN skin count and patch, LTK companion
+  state, exact pending manual-port count, and whether this executable is the installed or
+  portable build.
+- `Sync VN skins now`: starts one manual update and is disabled while a sync or shutdown
+  is active. Sync never starts the manual LTK port action.
+- `CSLOL Manager`: opens CSLOL, opens its direct `installed` skins folder, or copies
+  the manager root path (for example
+  `%APPDATA%\LeagueSkinManagerVN\cslol-manager`) without appending `installed`.
+- `LTK Manager`: opens/installs LTK, opens its application or skin-storage folder,
+  starts the explicit port tool, or cancels an active port. When current VN-managed
+  content is not in the port ledger, the action shows the pending count.
+- `Port CSLOL skins to LTK now...`: the only action that can begin a port. It opens a
+  small folder chooser only after the click, defaults its confirmation to No, and does
+  not open or depend on the custom skin-library window.
+- `Maintenance`: opens AppData or the rotating diagnostics log, resets LTK port
+  history, removes LTK skins, or launches the installed uninstaller.
 - `Remove all LTK skins...`: a default-No destructive confirmation. With LTK and its
-  patcher closed, it removes every archive (including non-VN skins), extracted metadata,
-  WAD report, and generated profile overlay from LTK's configured storage. LTK itself,
-  settings, logs, and named profile definitions are preserved. The VN port history is
-  reset so a later explicit port can intentionally add skins again.
-- `Reset port history...` (desktop): an explicit confirmation-only recovery action
+  patcher closed, it first resets the VN port history and then removes every archive
+  (including non-VN skins), extracted metadata, WAD report, and generated profile overlay
+  from LTK's configured storage. If history cannot be reset safely, cleanup does not
+  start. LTK itself, settings, logs, and named profile definitions are preserved. A later
+  explicit port can intentionally add skins again.
+- `Reset LTK port history...`: an explicit default-No recovery action
   for intentionally requeuing content removed from LTK. It deletes no CSLOL or LTK data.
-- `Start with Windows`: explicit per-user HKCU toggle; disabled by default.
+- `Start with Windows`: explicit per-user HKCU toggle; disabled by default. A portable
+  copy cannot take startup ownership from the installed copy.
 - `Uninstall LeagueSkinManagerVN...`: stops bounded background work, starts the exact
-  installed uninstaller after this process exits, and uses the same cleanup path as
-  Windows Apps & Features.
+  installed uninstaller after this process exits, and is disabled for a portable copy.
+  It uses the same cleanup path as Windows Apps & Features.
 - `Exit`: requests cancellation. If the bounded wait expires, the tray and
   single-instance locks remain active until background work has stopped safely.
 
@@ -147,6 +169,11 @@ The per-user setup installs program files under
 `%LOCALAPPDATA%\Programs\LeagueSkinManagerVN` and registers **League Skin Manager VN**
 in Windows Apps & Features. Its uninstall command points to the installed
 `LeagueSkinManagerVNUninstall.exe`.
+
+Setup and uninstall confirmations default to No. Installed and portable copies share
+the same global application mutex, so setup pauses instead of replacing files while
+either copy is active. The tray identifies its runtime mode; only the exact installed
+executable may own Windows startup or launch the installed uninstaller.
 
 The uninstaller requests no elevation, participates in the application mutex,
 refuses to run while the service, manager, or an owned helper process is active,

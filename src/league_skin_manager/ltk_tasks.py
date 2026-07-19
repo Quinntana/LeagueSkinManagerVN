@@ -39,6 +39,7 @@ from .operation_gate import OperationGate
 
 NotifySink = Callable[[str, str], None]
 StatusSink = Callable[[str, bool], None]
+PortStateChangedSink = Callable[[], None]
 RunningPredicate = Callable[[], bool]
 ResumeCallback = Callable[[], object]
 
@@ -72,6 +73,7 @@ class LtkTaskCoordinator:
         resume_cslol_launches: ResumeCallback,
         notify_sink: NotifySink | None = None,
         status_sink: StatusSink | None = None,
+        port_state_changed_sink: PortStateChangedSink | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._companion = companion
@@ -82,6 +84,7 @@ class LtkTaskCoordinator:
         self._resume_cslol_launches = resume_cslol_launches
         self._notify_sink = notify_sink
         self._status_sink = status_sink
+        self._port_state_changed_sink = port_state_changed_sink
         self._logger = logger or logging.getLogger(__name__)
 
         self._lock = RLock()
@@ -413,7 +416,10 @@ class LtkTaskCoordinator:
                 self._publish_status(f"migration not started: {exc}", False)
                 self._notify("LTK migration", str(exc))
                 return
-            self._finish_migration(result)
+            try:
+                self._finish_migration(result)
+            finally:
+                self._publish_port_state_changed()
         finally:
             lease.release()
             try:
@@ -423,12 +429,13 @@ class LtkTaskCoordinator:
 
     def _finish_migration(self, result: MigrationResult) -> None:
         summary = f"{result.queued} queued, {result.skipped} already queued, {result.failed} failed"
+        report_note = self._migration_report_note(result)
         if result.cancelled:
             self._mark_migration_finished()
             self._publish_status(f"migration cancelled ({summary})", False)
             self._notify(
                 "LTK migration cancelled",
-                f"Partial result: {summary}. Report: {result.report_path}",
+                f"Partial result: {summary}. {report_note}",
             )
             return
         if result.blocked:
@@ -437,7 +444,7 @@ class LtkTaskCoordinator:
             self._publish_status(f"migration stopped safely: {reason}", False)
             self._notify(
                 "LTK migration stopped",
-                f"{reason}. Partial result: {summary}. Report: {result.report_path}",
+                f"{reason}. Partial result: {summary}. {report_note}",
             )
             return
 
@@ -454,17 +461,18 @@ class LtkTaskCoordinator:
                 self._publish_status(f"migration complete ({summary}); LTK launch failed", False)
                 self._notify(
                     "LTK migration complete",
-                    f"{summary}. LTK could not be opened: {exc}. Report: {result.report_path}",
+                    f"{summary}. LTK could not be opened: {exc}. {report_note}",
                 )
                 return
             else:
                 self._publish_launch(launch)
 
         self._mark_migration_finished()
-        self._publish_status(f"migration complete: {summary}", False)
+        report_status = "; audit report unavailable" if result.report_error else ""
+        self._publish_status(f"migration complete: {summary}{report_status}", False)
         self._notify(
             "LTK migration complete",
-            f"{summary}. CSLOL originals were unchanged. Report: {result.report_path}",
+            f"{summary}. CSLOL originals were unchanged. {report_note}",
         )
 
     def _remove_all_skins(self) -> None:
@@ -479,27 +487,37 @@ class LtkTaskCoordinator:
                 self._mark_cleanup_finished()
                 self._publish_status("LTK skin cleanup cancelled before it started", False)
                 return
+            # Invalidate dedupe history before destructive external cleanup. If
+            # history cannot be reset, leave the LTK library untouched. If the
+            # cleanup later fails, an empty ledger remains safely conservative
+            # and a future manual port can recover without stale skips.
+            self._publish_status("resetting LTK port history before cleanup", False)
+            try:
+                self._migration.forget_history()
+            except LtkMigrationError as exc:
+                self._logger.warning(
+                    "LTK cleanup was not started because history reset failed: %s",
+                    exc,
+                )
+                self._mark_cleanup_finished()
+                self._publish_status("LTK cleanup not started; port-history reset failed", False)
+                self._notify(
+                    "Remove all LTK skins",
+                    "No LTK skins were removed because LeagueSkinManagerVN could not safely "
+                    f"reset its port history first: {exc}",
+                )
+                return
+            self._publish_port_state_changed()
             self._publish_status("removing all LTK skins", False)
             try:
                 result = self._cleanup.remove_all()
-                self._migration.forget_history()
             except LtkSkinCleanupError as exc:
                 self._logger.warning("LTK skin cleanup could not finish: %s", exc)
                 self._mark_cleanup_finished()
                 self._publish_status(f"LTK skin cleanup not completed: {exc}", False)
-                self._notify("Remove all LTK skins", str(exc))
-                return
-            except LtkMigrationError as exc:
-                self._logger.warning(
-                    "LTK skins were removed but migration history remains: %s",
-                    exc,
-                )
-                self._mark_cleanup_finished()
-                self._publish_status("LTK skins removed; migration-history reset failed", False)
                 self._notify(
-                    "LTK skins removed",
-                    "The LTK library was cleared, but LeagueSkinManagerVN could not reset its "
-                    f"port history: {exc}. Use Reset migration history before porting again.",
+                    "Remove all LTK skins",
+                    f"{exc}. Port history was already reset so the tray remains conservative.",
                 )
                 return
             self._finish_cleanup(result)
@@ -536,6 +554,7 @@ class LtkTaskCoordinator:
             self._publish_status(f"could not reset migration history: {exc}", False)
             self._notify("LTK migration history", f"Could not reset history: {exc}")
             return
+        self._publish_port_state_changed()
         self._publish_status("migration history reset; packages may be requeued", False)
         self._notify(
             "LTK migration history",
@@ -581,6 +600,20 @@ class LtkTaskCoordinator:
         except Exception:
             self._logger.exception("LTK notification sink failed")
 
+    def _publish_port_state_changed(self) -> None:
+        if self._port_state_changed_sink is None:
+            return
+        try:
+            self._port_state_changed_sink()
+        except Exception:
+            self._logger.exception("LTK port-state change sink failed")
+
+    @staticmethod
+    def _migration_report_note(result: MigrationResult) -> str:
+        if result.report_error:
+            return f"Audit report unavailable: {result.report_error}"
+        return f"Report: {result.report_path}"
+
     def _close_companion(self) -> None:
         with self._lock:
             if self._closed:
@@ -607,6 +640,7 @@ def wait_for_ltk_tasks(
 __all__ = [
     "LtkTaskCoordinator",
     "NotifySink",
+    "PortStateChangedSink",
     "ResumeCallback",
     "RunningPredicate",
     "StatusSink",

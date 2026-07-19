@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import league_skin_manager.windows_integration as windows_integration
 from league_skin_manager.windows_integration import (
     ACTIVATION_EVENT_NAME,
     ERROR_ALREADY_EXISTS,
@@ -18,6 +19,7 @@ from league_skin_manager.windows_integration import (
     ProcessLauncher,
     SingleInstanceMutex,
     StartupRegistration,
+    copy_text_to_clipboard,
     open_path,
 )
 
@@ -46,6 +48,84 @@ class ActivationKernel32:
         self.SetEvent = Function(1)
         self.WaitForSingleObject = Function(WAIT_OBJECT_0)
         self.CloseHandle = Function(1)
+
+
+class ClipboardBackend:
+    def __init__(
+        self, open_results: tuple[bool, ...] = (True,), *, fail_on: str | None = None
+    ) -> None:
+        self.open_results = iter(open_results)
+        self.fail_on = fail_on
+        self.allocated: list[str] = []
+        self.open_calls = 0
+        self.empty_calls = 0
+        self.set_calls: list[int] = []
+        self.close_calls = 0
+        self.freed: list[int] = []
+
+    def allocate_unicode(self, text: str) -> int:
+        self.allocated.append(text)
+        if self.fail_on == "allocate":
+            raise OSError("allocation failed")
+        return 789
+
+    def open(self) -> bool:
+        self.open_calls += 1
+        if self.fail_on == "open":
+            raise OSError("open failed")
+        return next(self.open_results, False)
+
+    def empty(self) -> None:
+        self.empty_calls += 1
+        if self.fail_on == "empty":
+            raise OSError("empty failed")
+
+    def set_unicode(self, handle: int) -> None:
+        self.set_calls.append(handle)
+        if self.fail_on == "set":
+            raise OSError("set failed")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.fail_on == "close":
+            raise OSError("close failed")
+
+    def free(self, handle: int) -> None:
+        self.freed.append(handle)
+
+
+class ClipboardUser32:
+    def __init__(self) -> None:
+        self.OpenClipboard = Function(1)
+        self.EmptyClipboard = Function(1)
+        self.SetClipboardData = Function(789)
+        self.CloseClipboard = Function(1)
+
+
+class ClipboardKernel32:
+    def __init__(self) -> None:
+        self.GlobalAlloc = Function(456)
+        self.GlobalLock = Function(1234)
+        self.GlobalUnlock = Function(1)
+        self.GlobalFree = Function(0)
+
+
+def native_clipboard_backend(
+    monkeypatch: Any,
+) -> tuple[Any, ClipboardUser32, ClipboardKernel32, list[tuple[Any, ...]]]:
+    user32 = ClipboardUser32()
+    kernel32 = ClipboardKernel32()
+    copied: list[tuple[Any, ...]] = []
+    libraries = {"user32": user32, "kernel32": kernel32}
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda name, **_kwargs: libraries[name],
+    )
+    monkeypatch.setattr(ctypes, "set_last_error", lambda _value: None)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 0)
+    monkeypatch.setattr(ctypes, "memmove", lambda *args: copied.append(args))
+    return windows_integration._Win32ClipboardBackend(), user32, kernel32, copied
 
 
 def test_mutex_acquires_and_releases_native_handle(monkeypatch: Any) -> None:
@@ -157,6 +237,171 @@ def test_activation_event_context_manager_closes_handle() -> None:
 
     assert activation.handle is None
     assert len(kernel32.CloseHandle.calls) == 1
+
+
+def test_clipboard_transfers_handle_ownership_after_success() -> None:
+    backend = ClipboardBackend()
+
+    copy_text_to_clipboard("C:/Ứng dụng/cslol-manager", backend=backend)
+
+    assert backend.allocated == ["C:/Ứng dụng/cslol-manager"]
+    assert backend.open_calls == 1
+    assert backend.empty_calls == 1
+    assert backend.set_calls == [789]
+    assert backend.close_calls == 1
+    assert backend.freed == []
+
+
+def test_clipboard_retries_busy_backend_before_transfer(monkeypatch: Any) -> None:
+    backend = ClipboardBackend((False, False, True))
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "league_skin_manager.windows_integration.time.sleep",
+        delays.append,
+    )
+
+    copy_text_to_clipboard(
+        "manager path",
+        backend=backend,
+        attempts=4,
+        retry_delay_seconds=0.125,
+    )
+
+    assert backend.open_calls == 3
+    assert delays == [0.125, 0.125]
+    assert backend.close_calls == 1
+    assert backend.freed == []
+
+
+def test_clipboard_busy_failure_releases_untransferred_handle() -> None:
+    backend = ClipboardBackend((False, False, False))
+
+    with pytest.raises(OSError, match="clipboard is busy"):
+        copy_text_to_clipboard(
+            "manager path",
+            backend=backend,
+            attempts=3,
+            retry_delay_seconds=0,
+        )
+
+    assert backend.open_calls == 3
+    assert backend.empty_calls == 0
+    assert backend.close_calls == 0
+    assert backend.freed == [789]
+
+
+@pytest.mark.parametrize("failure", ("open", "empty", "set"))
+def test_clipboard_errors_release_handle_before_ownership_transfer(failure: str) -> None:
+    backend = ClipboardBackend(fail_on=failure)
+
+    with pytest.raises(OSError, match=f"{failure} failed"):
+        copy_text_to_clipboard("manager path", backend=backend)
+
+    assert backend.close_calls == (0 if failure == "open" else 1)
+    assert backend.freed == [789]
+
+
+@pytest.mark.parametrize(
+    ("text", "attempts", "retry_delay_seconds", "error", "message"),
+    (
+        (object(), 1, 0.0, TypeError, "must be a string"),
+        ("bad\x00text", 1, 0.0, ValueError, "NUL"),
+        ("text", 0, 0.0, ValueError, "attempts must be positive"),
+        ("text", 1, -0.1, ValueError, "cannot be negative"),
+    ),
+)
+def test_clipboard_rejects_invalid_input_before_allocating(
+    text: Any,
+    attempts: int,
+    retry_delay_seconds: float,
+    error: type[Exception],
+    message: str,
+) -> None:
+    backend = ClipboardBackend()
+
+    with pytest.raises(error, match=message):
+        copy_text_to_clipboard(
+            text,
+            backend=backend,
+            attempts=attempts,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+
+    assert backend.allocated == []
+
+
+def test_native_clipboard_backend_allocates_copies_and_calls_win32(monkeypatch: Any) -> None:
+    backend, user32, kernel32, copied = native_clipboard_backend(monkeypatch)
+    payload = "Ứ".encode("utf-16-le") + b"\x00\x00"
+
+    handle = backend.allocate_unicode("Ứ")
+
+    assert handle == 456
+    assert kernel32.GlobalAlloc.calls == [(windows_integration.GMEM_MOVEABLE, len(payload))]
+    assert kernel32.GlobalLock.calls[0][0].value == 456
+    assert copied == [(1234, payload, len(payload))]
+    assert kernel32.GlobalUnlock.calls[0][0].value == 456
+
+    assert backend.open()
+    backend.empty()
+    backend.set_unicode(handle)
+    backend.close()
+    backend.free(handle)
+
+    assert user32.OpenClipboard.calls == [(None,)]
+    assert user32.EmptyClipboard.calls == [()]
+    assert user32.SetClipboardData.calls[0][0] == windows_integration.CF_UNICODETEXT
+    assert user32.SetClipboardData.calls[0][1].value == 456
+    assert user32.CloseClipboard.calls == [()]
+    assert kernel32.GlobalFree.calls[0][0].value == 456
+
+
+def test_native_clipboard_backend_releases_failed_lock(monkeypatch: Any) -> None:
+    backend, _user32, kernel32, _copied = native_clipboard_backend(monkeypatch)
+    kernel32.GlobalLock.result = 0
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError):
+        backend.allocate_unicode("text")
+
+    assert kernel32.GlobalFree.calls[0][0].value == 456
+
+
+def test_native_clipboard_backend_surfaces_allocation_failure(monkeypatch: Any) -> None:
+    backend, _user32, kernel32, _copied = native_clipboard_backend(monkeypatch)
+    kernel32.GlobalAlloc.result = 0
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError):
+        backend.allocate_unicode("text")
+
+    assert kernel32.GlobalLock.calls == []
+    assert kernel32.GlobalFree.calls == []
+
+
+def test_native_clipboard_backend_releases_failed_unlock(monkeypatch: Any) -> None:
+    backend, _user32, kernel32, _copied = native_clipboard_backend(monkeypatch)
+    kernel32.GlobalUnlock.result = 0
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError):
+        backend.allocate_unicode("text")
+
+    assert kernel32.GlobalFree.calls[0][0].value == 456
+
+
+def test_native_clipboard_backend_surfaces_empty_and_set_failures(monkeypatch: Any) -> None:
+    backend, user32, _kernel32, _copied = native_clipboard_backend(monkeypatch)
+    user32.OpenClipboard.result = 0
+    assert not backend.open()
+
+    user32.EmptyClipboard.result = 0
+    with pytest.raises(OSError, match="empty the clipboard"):
+        backend.empty()
+
+    user32.SetClipboardData.result = 0
+    with pytest.raises(OSError, match="place text on the clipboard"):
+        backend.set_unicode(456)
 
 
 def test_startup_command_quotes_absolute_executable(tmp_path: Path) -> None:

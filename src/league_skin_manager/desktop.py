@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
@@ -112,17 +113,24 @@ class DesktopApplication:
         import tkinter as tk
         from tkinter import ttk
 
-        root = tk.Tk()
-        self._root = root
-        self._build_window(root, tk, ttk)
-        self._load_catalog_now()
-        if show_on_start:
-            root.deiconify()
-            root.lift()
-        else:
-            root.withdraw()
-        root.after(self.POLL_MILLISECONDS, self._drain_events)
-        root.mainloop()
+        root: Any | None = None
+        try:
+            root = tk.Tk()
+            self._root = root
+            self._build_window(root, tk, ttk)
+            self._load_catalog_now()
+            if show_on_start:
+                root.deiconify()
+                root.lift()
+            else:
+                root.withdraw()
+            root.after(self.POLL_MILLISECONDS, self._drain_events)
+            root.mainloop()
+        finally:
+            self._root = None
+            if root is not None:
+                with suppress(Exception):
+                    root.destroy()
 
     def show(self) -> None:
         self._events.put(("show", None))
@@ -674,6 +682,7 @@ class DesktopApplication:
                     "Close both CSLOL Manager and LTK Manager before continuing. Existing "
                     "and previously queued content is detected by SHA-256 and skipped. Continue?"
                 ),
+                default=messagebox.NO,
                 parent=root,
             )
         )
@@ -720,6 +729,7 @@ class DesktopApplication:
                     "The next migration may queue skins that are already installed in LTK. "
                     "No CSLOL or LTK files will be deleted."
                 ),
+                default=messagebox.NO,
                 parent=root,
             )
         )

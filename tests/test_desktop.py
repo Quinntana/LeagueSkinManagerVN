@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -142,6 +144,65 @@ def make_desktop(tmp_path: Path, **overrides: Any) -> DesktopApplication:
     }
     values.update(overrides)
     return DesktopApplication(**values)
+
+
+def test_run_cleans_up_optional_root_without_showing_it_by_default(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    actions: list[str] = []
+
+    class Root:
+        def withdraw(self) -> None:
+            actions.append("withdraw")
+
+        def deiconify(self) -> None:
+            actions.append("show")
+
+        def lift(self) -> None:
+            actions.append("lift")
+
+        def after(self, _milliseconds: int, _callback: object) -> None:
+            actions.append("after")
+
+        def mainloop(self) -> None:
+            actions.append("mainloop")
+
+        def destroy(self) -> None:
+            actions.append("destroy")
+
+    root = Root()
+    fake_tk = SimpleNamespace(Tk=lambda: root, ttk=object())
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    app = make_desktop(tmp_path)
+    monkeypatch.setattr(app, "_build_window", lambda *_args: actions.append("build"))
+    monkeypatch.setattr(app, "_load_catalog_now", lambda: actions.append("catalog"))
+
+    app.run(show_on_start=False)
+
+    assert actions == ["build", "catalog", "withdraw", "after", "mainloop", "destroy"]
+    assert app._root is None
+
+
+def test_native_desktop_confirmations_default_to_no(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def askyesno(title: str, _message: str, **options: object) -> bool:
+        calls.append((title, options))
+        return False
+
+    messagebox = SimpleNamespace(NO="no", askyesno=askyesno)
+    fake_tk = SimpleNamespace(messagebox=messagebox)
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    app = make_desktop(tmp_path)
+    app._root = object()
+
+    assert not app._confirm_migration(tmp_path / "installed")
+    assert not app._confirm_history_reset()
+    assert [options["default"] for _title, options in calls] == ["no", "no"]
 
 
 def attach_presenter_fakes(app: DesktopApplication) -> tuple[FakeRoot, FakeTree]:

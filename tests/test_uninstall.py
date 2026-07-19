@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import psutil
@@ -16,6 +17,7 @@ from league_skin_manager.uninstall import (
     Uninstaller,
     UninstallStatus,
     cleanup_relocated_copy,
+    confirm_uninstall,
     find_running_process,
     launch_installed_uninstaller_after_exit,
     launch_relocated_uninstaller,
@@ -24,6 +26,27 @@ from league_skin_manager.uninstall import (
     run_uninstall_entrypoint,
     wait_for_process_exit,
 )
+
+
+def test_uninstall_confirmation_defaults_to_no(monkeypatch: Any) -> None:
+    calls: list[tuple[object, str, str, int]] = []
+
+    class User32:
+        @staticmethod
+        def MessageBoxW(owner: object, message: str, title: str, flags: int) -> int:
+            calls.append((owner, message, title, flags))
+            return 6
+
+    monkeypatch.setattr(uninstall_module.os, "name", "nt")
+    monkeypatch.setattr(
+        uninstall_module.ctypes,
+        "windll",
+        SimpleNamespace(user32=User32()),
+        raising=False,
+    )
+
+    assert confirm_uninstall("Uninstall", "Remove?") is True
+    assert calls[0][3] & 0x00000100
 
 
 def app_paths(tmp_path: Path) -> tuple[Path, Path]:

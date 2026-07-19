@@ -7,11 +7,12 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Collection
 from contextlib import suppress
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import psutil
 
@@ -24,6 +25,96 @@ MUTEX_NAMES = (LEGACY_MUTEX_NAME, MUTEX_NAME)
 ACTIVATION_EVENT_NAME = "Local\\LeagueSkinManagerVN_Activate_v1"
 WAIT_OBJECT_0 = 0x00000000
 WAIT_TIMEOUT = 0x00000102
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
+class ClipboardBackend(Protocol):
+    """Minimal ownership-aware boundary around the Win32 clipboard."""
+
+    def allocate_unicode(self, text: str) -> int: ...
+
+    def open(self) -> bool: ...
+
+    def empty(self) -> None: ...
+
+    def set_unicode(self, handle: int) -> None: ...
+
+    def close(self) -> None: ...
+
+    def free(self, handle: int) -> None: ...
+
+
+class _Win32ClipboardBackend:
+    def __init__(self) -> None:
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        self._user32.OpenClipboard.argtypes = [wintypes.HWND]
+        self._user32.OpenClipboard.restype = wintypes.BOOL
+        self._user32.EmptyClipboard.argtypes = []
+        self._user32.EmptyClipboard.restype = wintypes.BOOL
+        self._user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        self._user32.SetClipboardData.restype = wintypes.HANDLE
+        self._user32.CloseClipboard.argtypes = []
+        self._user32.CloseClipboard.restype = wintypes.BOOL
+
+        self._kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        self._kernel32.GlobalAlloc.restype = wintypes.HANDLE
+        self._kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+        self._kernel32.GlobalLock.restype = wintypes.LPVOID
+        self._kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+        self._kernel32.GlobalUnlock.restype = wintypes.BOOL
+        self._kernel32.GlobalFree.argtypes = [wintypes.HANDLE]
+        self._kernel32.GlobalFree.restype = wintypes.HANDLE
+
+    def allocate_unicode(self, text: str) -> int:
+        payload = text.encode("utf-16-le") + b"\x00\x00"
+        ctypes.set_last_error(0)
+        handle = self._kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+        if not handle:
+            raise _clipboard_error("allocate clipboard memory")
+        native_handle = int(handle)
+        pointer = self._kernel32.GlobalLock(wintypes.HANDLE(native_handle))
+        if not pointer:
+            self.free(native_handle)
+            raise _clipboard_error("lock clipboard memory")
+        try:
+            ctypes.memmove(pointer, payload, len(payload))
+        finally:
+            ctypes.set_last_error(0)
+            unlocked = self._kernel32.GlobalUnlock(wintypes.HANDLE(native_handle))
+            if not unlocked and ctypes.get_last_error():
+                self.free(native_handle)
+                raise _clipboard_error("unlock clipboard memory")
+        return native_handle
+
+    def open(self) -> bool:
+        ctypes.set_last_error(0)
+        return bool(self._user32.OpenClipboard(None))
+
+    def empty(self) -> None:
+        ctypes.set_last_error(0)
+        if not self._user32.EmptyClipboard():
+            raise _clipboard_error("empty the clipboard")
+
+    def set_unicode(self, handle: int) -> None:
+        ctypes.set_last_error(0)
+        if not self._user32.SetClipboardData(CF_UNICODETEXT, wintypes.HANDLE(handle)):
+            raise _clipboard_error("place text on the clipboard")
+
+    def close(self) -> None:
+        self._user32.CloseClipboard()
+
+    def free(self, handle: int) -> None:
+        self._kernel32.GlobalFree(wintypes.HANDLE(handle))
+
+
+def _clipboard_error(action: str) -> OSError:
+    error = ctypes.get_last_error()
+    if error:
+        return ctypes.WinError(error)
+    return OSError(f"Could not {action}")
 
 
 class SingleInstanceMutex:
@@ -291,6 +382,51 @@ class ProcessLauncher:
 
 def running_executable() -> Path:
     return Path(sys.executable).resolve()
+
+
+def copy_text_to_clipboard(
+    text: str,
+    *,
+    backend: ClipboardBackend | None = None,
+    attempts: int = 5,
+    retry_delay_seconds: float = 0.04,
+) -> None:
+    """Copy Unicode text without creating Tk or a hidden application window."""
+
+    if not isinstance(text, str):
+        raise TypeError("clipboard text must be a string")
+    if "\x00" in text:
+        raise ValueError("clipboard text cannot contain a NUL character")
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds cannot be negative")
+    if backend is None:
+        if os.name != "nt":
+            raise OSError("The Windows clipboard is unavailable")
+        backend = _Win32ClipboardBackend()
+
+    handle = backend.allocate_unicode(text)
+    opened = False
+    transferred = False
+    try:
+        for attempt in range(attempts):
+            if backend.open():
+                opened = True
+                break
+            if attempt + 1 < attempts and retry_delay_seconds:
+                time.sleep(retry_delay_seconds)
+        if not opened:
+            raise OSError("The clipboard is busy; try the copy action again")
+
+        backend.empty()
+        backend.set_unicode(handle)
+        transferred = True
+    finally:
+        if opened:
+            backend.close()
+        if not transferred:
+            backend.free(handle)
 
 
 def open_path(path: Path) -> None:

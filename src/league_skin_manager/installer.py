@@ -139,7 +139,13 @@ def confirm_install(title: str, message: str) -> bool:
     yes = 6
     yes_no = 0x00000004
     information = 0x00000040
-    result = ctypes.windll.user32.MessageBoxW(None, message, title, yes_no | information)
+    default_no = 0x00000100
+    result = ctypes.windll.user32.MessageBoxW(
+        None,
+        message,
+        title,
+        yes_no | information | default_no,
+    )
     return int(result) == yes
 
 

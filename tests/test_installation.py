@@ -14,6 +14,7 @@ from league_skin_manager.installation import (
     InstallLayout,
     apps_entry_values,
     installed_size_kib,
+    is_installed_executable,
     quote_command,
 )
 
@@ -44,7 +45,7 @@ def test_apps_entry_has_professional_per_user_values(tmp_path: Path) -> None:
     )
 
     assert values["DisplayName"] == ("League Skin Manager VN", "str")
-    assert values["DisplayVersion"] == ("2.6.0", "str")
+    assert values["DisplayVersion"] == ("2.7.0", "str")
     assert values["Publisher"] == ("Quinntana", "str")
     assert values["InstallLocation"] == (str(layout.install_dir), "str")
     assert values["UninstallString"] == (f'"{layout.uninstaller.resolve()}"', "str")
@@ -158,7 +159,7 @@ def test_registration_failure_deletes_new_partial_key(tmp_path: Path) -> None:
 
 
 def test_registration_failure_restores_existing_values(tmp_path: Path) -> None:
-    existing = {
+    existing: dict[str, tuple[object, object]] = {
         "DisplayName": (FakeRegistry.REG_SZ, "Previous name"),
         "CustomValue": (FakeRegistry.REG_DWORD, 7),
     }
@@ -183,6 +184,48 @@ def test_layout_rejects_executable_outside_exact_install_children(tmp_path: Path
 
     with pytest.raises(InstallationError, match="executable is outside"):
         unsafe.validated_install_dir()
+
+
+def test_installed_executable_accepts_only_exact_owned_normal_file(tmp_path: Path) -> None:
+    layout = InstallLayout.discover(tmp_path)
+    layout.install_dir.mkdir(parents=True)
+    layout.executable.write_bytes(b"application")
+    portable = tmp_path / f"{APP_NAME}.exe"
+    portable.write_bytes(b"portable")
+
+    assert is_installed_executable(layout.executable, layout)
+    assert not is_installed_executable(portable, layout)
+    assert not is_installed_executable(layout.uninstaller, layout)
+
+
+def test_installed_executable_rejects_missing_or_reparse_file(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    layout = InstallLayout.discover(tmp_path)
+    assert not is_installed_executable(layout.executable, layout)
+
+    layout.install_dir.mkdir(parents=True)
+    layout.executable.write_bytes(b"application")
+    monkeypatch.setattr(
+        "league_skin_manager.installation._is_reparse_point",
+        lambda path: path == layout.executable,
+    )
+    assert not is_installed_executable(layout.executable, layout)
+
+
+def test_installed_executable_treats_invalid_layout_as_portable(tmp_path: Path) -> None:
+    valid = InstallLayout.discover(tmp_path)
+    unsafe = InstallLayout(
+        local_appdata=valid.local_appdata,
+        install_dir=tmp_path / APP_NAME,
+        executable=tmp_path / APP_NAME / f"{APP_NAME}.exe",
+        uninstaller=tmp_path / APP_NAME / valid.uninstaller.name,
+    )
+    unsafe.install_dir.mkdir()
+    unsafe.executable.write_bytes(b"application")
+
+    assert not is_installed_executable(unsafe.executable, unsafe)
 
 
 def test_installed_size_rounds_up_and_rejects_missing_payload(tmp_path: Path) -> None:

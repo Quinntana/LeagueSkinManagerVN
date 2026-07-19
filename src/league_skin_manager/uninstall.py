@@ -359,7 +359,13 @@ def confirm_uninstall(title: str, message: str) -> bool:
     yes = 6
     yes_no = 0x00000004
     warning = 0x00000030
-    result = ctypes.windll.user32.MessageBoxW(None, message, title, yes_no | warning)
+    default_no = 0x00000100
+    result = ctypes.windll.user32.MessageBoxW(
+        None,
+        message,
+        title,
+        yes_no | warning | default_no,
+    )
     return int(result) == yes
 
 

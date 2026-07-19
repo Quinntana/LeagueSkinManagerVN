@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from typing import Any, cast
 
-from league_skin_manager.ltk_cleanup import LtkSkinCleanupResult, LtkSkinCleanupService
+from league_skin_manager.ltk_cleanup import (
+    LtkSkinCleanupError,
+    LtkSkinCleanupResult,
+    LtkSkinCleanupService,
+)
 from league_skin_manager.ltk_companion import (
     LtkCompanion,
     LtkCompanionResult,
@@ -18,6 +23,7 @@ from league_skin_manager.ltk_companion import (
     LtkVersion,
 )
 from league_skin_manager.ltk_migration import (
+    LtkMigrationError,
     LtkMigrationService,
     MigrationIssue,
     MigrationProgress,
@@ -87,6 +93,8 @@ class FakeMigration:
         self.tmp_path = tmp_path
         self.calls: list[Path] = []
         self.forget_calls = 0
+        self.migrate_error: LtkMigrationError | None = None
+        self.forget_error: LtkMigrationError | None = None
         self.result = MigrationResult(
             source_dir=tmp_path / "installed",
             storage_dir=tmp_path / "ltk",
@@ -110,17 +118,22 @@ class FakeMigration:
         progress: Any = None,
     ) -> MigrationResult:
         self.calls.append(source)
+        if self.migrate_error is not None:
+            raise self.migrate_error
         if progress is not None:
             progress(MigrationProgress("packaging", 1, 3, "Shaco"))
         return self.result
 
     def forget_history(self) -> None:
         self.forget_calls += 1
+        if self.forget_error is not None:
+            raise self.forget_error
 
 
 class FakeCleanup:
     def __init__(self, tmp_path: Path) -> None:
         self.calls = 0
+        self.error: LtkSkinCleanupError | None = None
         self.result = LtkSkinCleanupResult(
             storage_dir=tmp_path / "ltk",
             library_mods=7,
@@ -133,6 +146,8 @@ class FakeCleanup:
 
     def remove_all(self) -> LtkSkinCleanupResult:
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         return self.result
 
 
@@ -153,6 +168,7 @@ def coordinator(
     gate: OperationGate | None = None,
     running: Any = lambda: False,
     cleanup: FakeCleanup | None = None,
+    port_state_changed: Any = None,
 ) -> tuple[LtkTaskCoordinator, list[tuple[str, str]], list[tuple[str, bool]], list[str]]:
     notifications: list[tuple[str, str]] = []
     statuses: list[tuple[str, bool]] = []
@@ -166,6 +182,7 @@ def coordinator(
         resume_cslol_launches=lambda: resumed.append("resume"),
         notify_sink=lambda title, message: notifications.append((title, message)),
         status_sink=lambda detail, active: statuses.append((detail, active)),
+        port_state_changed_sink=port_state_changed,
         logger=logging.getLogger("test.ltk_tasks"),
     )
     return value, notifications, statuses, resumed
@@ -263,11 +280,13 @@ def test_migration_waits_for_gate_reports_progress_launches_ltk_and_resumes_cslo
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
+    port_state_changes: list[str] = []
     value, notifications, statuses, resumed = coordinator(
         tmp_path,
         companion,
         migration,
         gate=gate,
+        port_state_changed=lambda: port_state_changes.append("changed"),
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
@@ -283,6 +302,7 @@ def test_migration_waits_for_gate_reports_progress_launches_ltk_and_resumes_cslo
     assert any("packaging 1/3 - Shaco" in detail for detail, _active in statuses)
     assert notifications[-1][0] == "LTK migration complete"
     assert "2 queued, 1 already queued, 0 failed" in notifications[-1][1]
+    assert port_state_changes == ["changed"]
     assert value.migration_active is False
     assert value.shutdown(1.0)
 
@@ -293,11 +313,13 @@ def test_cancel_queued_migration_leaves_gate_and_service_untouched(tmp_path: Pat
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
+    port_state_changes: list[str] = []
     value, _notifications, statuses, resumed = coordinator(
         tmp_path,
         companion,
         migration,
         gate=gate,
+        port_state_changed=lambda: port_state_changes.append("changed"),
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
@@ -307,6 +329,7 @@ def test_cancel_queued_migration_leaves_gate_and_service_untouched(tmp_path: Pat
     wait_until(lambda: any("cancelled before" in detail for detail, _active in statuses))
 
     assert migration.calls == []
+    assert port_state_changes == []
     assert resumed == []
     blocker.release()
     assert value.shutdown(1.0)
@@ -334,7 +357,13 @@ def test_blocked_partial_migration_does_not_launch_ltk(tmp_path: Path) -> None:
             ),
         ),
     )
-    value, notifications, statuses, resumed = coordinator(tmp_path, companion, migration)
+    port_state_changes: list[str] = []
+    value, notifications, statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
     assert value.request_migration(tmp_path / "installed")
@@ -343,6 +372,84 @@ def test_blocked_partial_migration_does_not_launch_ltk(tmp_path: Path) -> None:
     assert companion.start_calls == 0
     assert "Close LTK Manager" in notifications[-1][1]
     assert statuses[-1][1] is False
+    assert port_state_changes == ["changed"]
+    assert value.shutdown(1.0)
+
+
+def test_returned_cancelled_migration_publishes_port_state_change(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    migration.result = replace(
+        migration.result,
+        status="cancelled",
+        queued=1,
+        skipped=0,
+    )
+    port_state_changes: list[str] = []
+    value, notifications, _statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_migration(tmp_path / "installed")
+    wait_until(lambda: resumed == ["resume"])
+
+    assert companion.start_calls == 0
+    assert notifications[-1][0] == "LTK migration cancelled"
+    assert port_state_changes == ["changed"]
+    assert value.shutdown(1.0)
+
+
+def test_migration_report_failure_is_visible_without_hiding_handoff(
+    tmp_path: Path,
+) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    migration.result = replace(migration.result, report_error="report disk full")
+    port_state_changes: list[str] = []
+    value, notifications, statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_migration(tmp_path / "installed")
+    wait_until(lambda: resumed == ["resume"])
+
+    assert port_state_changes == ["changed"]
+    assert "Audit report unavailable: report disk full" in notifications[-1][1]
+    assert "audit report unavailable" in statuses[-1][0]
+    assert value.shutdown(1.0)
+
+
+def test_migration_error_before_result_does_not_publish_port_state_change(
+    tmp_path: Path,
+) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    migration.migrate_error = LtkMigrationError("invalid source")
+    port_state_changes: list[str] = []
+    value, notifications, _statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_migration(tmp_path / "installed")
+    wait_until(lambda: resumed == ["resume"])
+
+    assert notifications[-1] == ("LTK migration", "invalid source")
+    assert port_state_changes == []
     assert value.shutdown(1.0)
 
 
@@ -363,16 +470,51 @@ def test_cancel_without_migration_and_invalid_shutdown_timeout(tmp_path: Path) -
 def test_explicit_history_reset_is_serialized_and_notified(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
     migration = FakeMigration(tmp_path)
-    value, notifications, statuses, _resumed = coordinator(tmp_path, companion, migration)
+    port_state_changes: list[str] = []
+    value, notifications, statuses, _resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
 
     assert value.request_history_reset()
     assert value.request_history_reset()
-    wait_until(lambda: migration.forget_calls == 1)
+    wait_until(lambda: any("packages may be requeued" in item[0] for item in statuses))
 
     assert "packages may be requeued" in statuses[-1][0]
     assert notifications[-1][0] == "LTK migration history"
+    assert port_state_changes == ["changed"]
+    assert value.shutdown(1.0)
+
+
+def test_port_state_sink_failure_does_not_change_history_reset_outcome(
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+
+    def fail_refresh() -> None:
+        raise RuntimeError("refresh failed")
+
+    value, notifications, statuses, _resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        port_state_changed=fail_refresh,
+    )
+    caplog.set_level(logging.ERROR, logger="test.ltk_tasks")
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_history_reset()
+    wait_until(lambda: any("packages may be requeued" in item[0] for item in statuses))
+
+    assert notifications[-1][0] == "LTK migration history"
+    assert "LTK port-state change sink failed" in caplog.text
     assert value.shutdown(1.0)
 
 
@@ -409,12 +551,14 @@ def test_explicit_cleanup_waits_for_gate_clears_history_and_resumes_cslol(
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
+    port_state_changes: list[str] = []
     value, notifications, statuses, resumed = coordinator(
         tmp_path,
         companion,
         migration,
         gate=gate,
         cleanup=cleanup,
+        port_state_changed=lambda: port_state_changes.append("changed"),
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
@@ -425,13 +569,72 @@ def test_explicit_cleanup_waits_for_gate_clears_history_and_resumes_cslol(
     assert cleanup.calls == 0
 
     blocker.release()
-    wait_until(lambda: cleanup.calls == 1 and migration.forget_calls == 1)
+    wait_until(lambda: any("removed all LTK skins" in item[0] for item in statuses))
 
     assert resumed == ["resume"]
     assert value.cleanup_active is False
     assert any("removed all LTK skins (7 package(s))" in item[0] for item in statuses)
     assert notifications[-1][0] == "All LTK skins removed"
     assert "LTK application were preserved" in notifications[-1][1]
+    assert port_state_changes == ["changed"]
+    assert value.shutdown(1.0)
+
+
+def test_cleanup_history_failure_leaves_ltk_library_untouched(
+    tmp_path: Path,
+) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    migration.forget_error = LtkMigrationError("ledger is locked")
+    cleanup = FakeCleanup(tmp_path)
+    port_state_changes: list[str] = []
+    value, notifications, statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        cleanup=cleanup,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_cleanup()
+    wait_until(lambda: resumed == ["resume"])
+
+    assert cleanup.calls == 0
+    assert "No LTK skins were removed" in notifications[-1][1]
+    assert statuses[-1][0] == "LTK cleanup not started; port-history reset failed"
+    assert port_state_changes == []
+    assert value.shutdown(1.0)
+
+
+def test_cleanup_failure_after_history_reset_remains_conservatively_pending(
+    tmp_path: Path,
+) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    cleanup = FakeCleanup(tmp_path)
+    cleanup.error = LtkSkinCleanupError("cleanup transaction failed")
+    port_state_changes: list[str] = []
+    value, notifications, statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        cleanup=cleanup,
+        port_state_changed=lambda: port_state_changes.append("changed"),
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_cleanup()
+    wait_until(lambda: resumed == ["resume"])
+
+    assert migration.forget_calls == 1
+    assert cleanup.calls == 1
+    assert port_state_changes == ["changed"]
+    assert notifications[-1][0] == "Remove all LTK skins"
+    assert "Port history was already reset" in notifications[-1][1]
+    assert statuses[-1][0] == "LTK skin cleanup not completed: cleanup transaction failed"
     assert value.shutdown(1.0)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -8,7 +9,13 @@ import pytest
 import league_skin_manager.installer as installer_module
 from league_skin_manager.config import APP_NAME, UNINSTALL_APP_NAME
 from league_skin_manager.installation import InstallationError, InstallLayout
-from league_skin_manager.installer import InstallResult, install_payload, main, payload_paths
+from league_skin_manager.installer import (
+    InstallResult,
+    confirm_install,
+    install_payload,
+    main,
+    payload_paths,
+)
 
 
 class Registration:
@@ -17,6 +24,27 @@ class Registration:
 
     def register(self, layout: InstallLayout, *, estimated_size_kib: int) -> None:
         self.calls.append((layout, estimated_size_kib))
+
+
+def test_setup_confirmation_defaults_to_no(monkeypatch: Any) -> None:
+    calls: list[tuple[object, str, str, int]] = []
+
+    class User32:
+        @staticmethod
+        def MessageBoxW(owner: object, message: str, title: str, flags: int) -> int:
+            calls.append((owner, message, title, flags))
+            return 6
+
+    monkeypatch.setattr(installer_module.os, "name", "nt")
+    monkeypatch.setattr(
+        installer_module.ctypes,
+        "windll",
+        SimpleNamespace(user32=User32()),
+        raising=False,
+    )
+
+    assert confirm_install("Setup", "Install?") is True
+    assert calls[0][3] & 0x00000100
 
 
 def payload(
