@@ -459,6 +459,55 @@ def _detached_creation_flags() -> int:
     )
 
 
+def launch_installed_uninstaller_after_exit(
+    layout: InstallLayout,
+    *,
+    wait_pid: int | None = None,
+    popen: Callable[..., Any] = subprocess.Popen,
+) -> int:
+    """Start the installed uninstaller after this application process exits.
+
+    The child receives only a validated, exact uninstaller path.  Waiting for
+    the current application PID lets the normal uninstaller acquire the app
+    mutex instead of racing shutdown when invoked from the tray.
+    """
+
+    install_dir = layout.validated_install_dir()
+    uninstaller = validated_installed_uninstaller(layout)
+    selected_pid = os.getpid() if wait_pid is None else wait_pid
+    if selected_pid <= 0:
+        raise ValueError("Invalid application process identifier")
+
+    environment = os.environ.copy()
+    environment[_RELOCATED_WAIT_PID_ENV] = str(selected_pid)
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    process = popen(
+        [str(uninstaller)],
+        cwd=str(install_dir),
+        close_fds=True,
+        creationflags=_detached_creation_flags(),
+        env=environment,
+    )
+    pid = getattr(process, "pid", None)
+    return int(pid) if isinstance(pid, int) and not isinstance(pid, bool) else 0
+
+
+def validated_installed_uninstaller(layout: InstallLayout) -> Path:
+    """Return the exact normal-file uninstaller from the validated install layout."""
+
+    install_dir = layout.validated_install_dir()
+    uninstaller = Path(os.path.abspath(layout.uninstaller))
+    if (
+        uninstaller.parent != install_dir
+        or not os.path.lexists(uninstaller)
+        or not uninstaller.is_file()
+        or _is_reparse_point(uninstaller)
+        or uninstaller.resolve() != uninstaller
+    ):
+        raise InstallationError("The installed uninstaller is missing or unsafe")
+    return uninstaller
+
+
 def launch_relocated_uninstaller(
     layout: InstallLayout,
     *,
@@ -633,6 +682,7 @@ __all__ = [
     "Uninstaller",
     "cleanup_relocated_copy",
     "find_running_process",
+    "launch_installed_uninstaller_after_exit",
     "launch_relocated_uninstaller",
     "main",
     "remove_app_data_tree",
@@ -640,5 +690,6 @@ __all__ = [
     "remove_install_tree",
     "remove_user_startup_registration",
     "run_uninstall_entrypoint",
+    "validated_installed_uninstaller",
     "wait_for_process_exit",
 ]

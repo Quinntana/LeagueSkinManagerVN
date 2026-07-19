@@ -11,7 +11,7 @@ from league_skin_manager.tray import TrayApplication
 @dataclass
 class FakeMenuItem:
     text: str
-    action: Callable[..., object] | None
+    action: object | None
     options: dict[str, Any] = field(default_factory=dict)
 
 
@@ -79,7 +79,7 @@ class FakeBackend:
     def MenuItem(
         self,
         text: str,
-        action: Callable[..., object] | None,
+        action: object | None,
         **options: Any,
     ) -> FakeMenuItem:
         return FakeMenuItem(text, action, options)
@@ -94,10 +94,15 @@ def make_tray(
         "on_show": lambda: None,
         "on_sync": lambda: None,
         "on_start_manager": lambda: None,
+        "on_open_cslol_skins": lambda: None,
         "on_start_ltk": lambda: None,
+        "on_open_ltk_install": lambda: None,
+        "on_open_ltk_storage": lambda: None,
         "on_migrate_to_ltk": lambda: None,
+        "on_remove_ltk_skins": lambda: None,
         "startup_enabled": lambda: False,
         "set_startup_enabled": lambda _enabled: None,
+        "on_uninstall": lambda: None,
         "on_exit": lambda: None,
         "backend": backend,
         "image_factory": lambda state: f"image:{state.name}",
@@ -120,8 +125,13 @@ def fake_icon(tray: TrayApplication) -> FakeIcon:
 
 
 def click(tray: TrayApplication, item: FakeMenuItem) -> None:
-    assert item.action is not None
+    assert callable(item.action)
     item.action(tray.native_icon, item)
+
+
+def submenu(item: FakeMenuItem) -> tuple[FakeMenuItem, ...]:
+    assert isinstance(item.action, FakeMenu)
+    return item.action.items
 
 
 def test_tray_is_visible_before_startup_callback_runs() -> None:
@@ -148,12 +158,23 @@ def test_tray_is_visible_before_startup_callback_runs() -> None:
     assert [item.text for item in items] == [
         "Open LeagueSkinManagerVN",
         "Status: Starting",
-        "Sync now",
-        "Open CSLOL Manager",
-        "Open or install LTK Manager",
-        "Port CSLOL skins to LTK now...",
+        "Sync VN skins now",
+        "CSLOL Manager",
+        "LTK Manager",
         "Start with Windows",
+        "Uninstall LeagueSkinManagerVN...",
         "Exit",
+    ]
+    assert [item.text for item in submenu(items[3])] == [
+        "Open CSLOL Manager",
+        "Open installed skins folder",
+    ]
+    assert [item.text for item in submenu(items[4])] == [
+        "Open or install LTK Manager",
+        "Open LTK application folder",
+        "Open LTK skin storage folder",
+        "Port CSLOL skins to LTK now...",
+        "Remove all LTK skins...",
     ]
     assert items[0].options["default"] is True
     assert items[1].options["enabled"] is False
@@ -202,28 +223,50 @@ def test_menu_actions_toggle_startup_and_exit_only_once() -> None:
         on_show=lambda: calls.append("show"),
         on_sync=lambda: calls.append("sync"),
         on_start_manager=lambda: calls.append("manager"),
+        on_open_cslol_skins=lambda: calls.append("cslol-folder"),
         on_start_ltk=lambda: calls.append("ltk"),
+        on_open_ltk_install=lambda: calls.append("ltk-app-folder"),
+        on_open_ltk_storage=lambda: calls.append("ltk-storage"),
         on_migrate_to_ltk=lambda: calls.append("migrate"),
+        on_remove_ltk_skins=lambda: calls.append("clean-ltk"),
         startup_enabled=lambda: startup["enabled"],
         set_startup_enabled=set_startup,
         on_exit=lambda: calls.append("exit"),
     )
     items = menu_items(tray)
+    cslol_items = submenu(items[3])
+    ltk_items = submenu(items[4])
 
     click(tray, items[0])
     click(tray, items[2])
-    click(tray, items[3])
-    click(tray, items[4])
+    click(tray, cslol_items[0])
+    click(tray, cslol_items[1])
+    click(tray, ltk_items[0])
+    click(tray, ltk_items[1])
+    click(tray, ltk_items[2])
+    click(tray, ltk_items[3])
+    click(tray, ltk_items[4])
     click(tray, items[5])
-    click(tray, items[6])
-    refreshed_startup = menu_items(tray)[6]
+    refreshed_startup = menu_items(tray)[5]
     checked = refreshed_startup.options["checked"]
     assert callable(checked)
     assert checked(refreshed_startup) is True
     click(tray, items[7])
     click(tray, items[7])
 
-    assert calls == ["show", "sync", "manager", "ltk", "migrate", "startup:True", "exit"]
+    assert calls == [
+        "show",
+        "sync",
+        "manager",
+        "cslol-folder",
+        "ltk",
+        "ltk-app-folder",
+        "ltk-storage",
+        "migrate",
+        "clean-ltk",
+        "startup:True",
+        "exit",
+    ]
     assert fake_icon(tray).stop_calls == 1
 
 
@@ -253,7 +296,7 @@ def test_failed_startup_toggle_keeps_existing_state_and_notifies() -> None:
         set_startup_enabled=lambda _enabled: False,
     )
 
-    click(tray, menu_items(tray)[6])
+    click(tray, menu_items(tray)[5])
 
     assert fake_icon(tray).notifications == [
         ("Start with Windows", "The startup setting could not be updated.")
@@ -277,7 +320,7 @@ def test_timed_out_shutdown_keeps_tray_active_and_allows_retry() -> None:
     assert exit_calls == 1
     assert fake_icon(tray).stop_calls == 0
     assert fake_icon(tray).notifications[-1] == (
-        "Shutdown still in progress",
+        "Action not completed",
         "Background work is still stopping. The app remains active; try Exit again.",
     )
 
@@ -301,3 +344,21 @@ def test_shutdown_callback_error_does_not_stop_tray() -> None:
         "LeagueSkinManagerVN",
         "Could not complete application shutdown: worker state unavailable",
     )
+
+
+def test_tray_uninstall_uses_the_same_bounded_shutdown_path() -> None:
+    backend = FakeBackend()
+    calls: list[str] = []
+
+    def uninstall() -> bool:
+        calls.append("uninstall")
+        return True
+
+    tray = make_tray(backend, on_uninstall=uninstall)
+
+    uninstall_item = menu_items(tray)[6]
+    click(tray, uninstall_item)
+    click(tray, uninstall_item)
+
+    assert calls == ["uninstall"]
+    assert fake_icon(tray).stop_calls == 1

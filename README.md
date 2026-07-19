@@ -14,7 +14,7 @@ Normal launches open a desktop library backed by the validated offline manifest:
 - Champion filtering and sortable Champion, Skin, and Package size columns.
 - Installed skin, champion, patch, and source-commit statistics.
 - Selected-mod details plus shortcuts for the installed folder, AppData, and logs.
-- `Sync now`, CSLOL and LTK launch controls, a guided LTK migration tool,
+- `Sync VN skins`, CSLOL and LTK launch controls, a guided LTK migration tool,
   background startup, refresh, and clean exit controls.
 
 Closing the window keeps the service available in the tray. Windows startup uses
@@ -76,14 +76,17 @@ installer and updater manage the external application.
     `Sync now` never scan or copy CSLOL mods into LTK. Files are considered only after the
     user presses **Port CSLOL skins to LTK now...** and confirms the selected folder. Both
     CSLOL and LTK (including the legacy LeagueSkinManagerLTK app/patcher) must be closed.
-    Valid mods are queued only through LTK's supported `archives` inbox; LTK's library,
-    profiles, and indexes are never edited by this app.
+    Valid mods are queued only through LTK's supported `archives` inbox; normal porting
+    never edits LTK's library, profiles, or indexes directly.
 12. Migration reuses the verified package cache when an extracted mod still matches its
     manifest fingerprint and deterministically repackages changed or user-owned mods.
-    Packages are SHA-256 deduplicated across both the current inbox and a bounded,
-    VN-owned migration ledger, so rerunning the tool stays idempotent even after LTK
-    consumes its inbox. Writes use fsynced temporary files, atomic renames, cancellation,
-    resource limits, and an audit report.
+    WAD-heavy packages use ZIP's no-recompression mode, avoiding expensive level-9
+    deflate for data that is already compressed. Packages are SHA-256 deduplicated across
+    both the current inbox and bounded VN-owned content/archive indexes. Unchanged repeat
+    ports skip packaging and full LTK archive scans even after LTK consumes its inbox.
+    Writes still use fsynced temporary files, atomic renames, cancellation, resource
+    limits, and an audit report. Legacy migration history is read compatibly and upgraded
+    without requeueing unchanged packages.
 
 If the network or source is unavailable, a valid existing manager/mod installation
 remains usable and the tray reports `Ready offline`. A first run with nothing cached
@@ -98,17 +101,24 @@ invoked directly by LeagueSkinManagerVN.
 ## Tray controls
 
 - `Status`: current lifecycle/synchronization state.
-- `Sync now`: starts one manual update; a second concurrent sync is rejected safely.
-- `Open CSLOL Manager`: starts the installed CSLOL Manager, or queues the launch behind
-  a sync or migration.
-- `Open or install LTK Manager`: launches a current external LTK install, or runs the
-  cached, verified official per-user installer with passive/restart switches.
+- `Sync VN skins now`: starts one manual update; a second concurrent sync is rejected safely.
+- `CSLOL Manager` submenu: opens CSLOL Manager or its direct `installed` skins folder.
+- `LTK Manager` submenu: opens/installs LTK, opens the detected application folder, opens
+  the configured skin-storage folder, starts the explicit port tool, or removes all skins.
 - `Port CSLOL skins to LTK now...`: the only action that can begin a port. It opens the
   desktop folder chooser on Tk's UI thread, confirms the non-destructive handoff, shows
   progress/cancellation, and opens LTK after packages and migration history are durable.
-- `Reset migration history...` (desktop): an explicit confirmation-only recovery action
+- `Remove all LTK skins...`: a default-No destructive confirmation. With LTK and its
+  patcher closed, it removes every archive (including non-VN skins), extracted metadata,
+  WAD report, and generated profile overlay from LTK's configured storage. LTK itself,
+  settings, logs, and named profile definitions are preserved. The VN port history is
+  reset so a later explicit port can intentionally add skins again.
+- `Reset port history...` (desktop): an explicit confirmation-only recovery action
   for intentionally requeuing content removed from LTK. It deletes no CSLOL or LTK data.
 - `Start with Windows`: explicit per-user HKCU toggle; disabled by default.
+- `Uninstall LeagueSkinManagerVN...`: stops bounded background work, starts the exact
+  installed uninstaller after this process exits, and uses the same cleanup path as
+  Windows Apps & Features.
 - `Exit`: requests cancellation. If the bounded wait expires, the tray and
   single-instance locks remain active until background work has stopped safely.
 
@@ -122,13 +132,16 @@ All mutable data is under `%APPDATA%\LeagueSkinManagerVN`:
   installer files are pruned safely.
 - `managed_skins.json`: app-owned install manifest and transaction identity.
 - `ltk_migration_state.json`: bounded SHA-256 history for cross-run migration dedupe.
+- `ltk_archive_index.json`: VN-owned file-identity/hash cache that avoids repeatedly
+  hashing an unchanged large LTK archive library.
 - `migration-reports/`: timestamped migration results and per-mod failures.
 - `logs/LeagueSkinManagerVN.log`: rotating diagnostics.
 
 LTK itself remains external. Its normal data root is
 `%APPDATA%\dev.leaguetoolkit.manager`, or the absolute `modStoragePath` selected in LTK's
 own settings. LeagueSkinManagerVN writes only complete packages to that root's
-`archives` directory after confirmation.
+`archives` directory after port confirmation. Only the separate, explicitly confirmed
+**Remove all LTK skins** action clears LTK-owned skin artifacts.
 
 The per-user setup installs program files under
 `%LOCALAPPDATA%\Programs\LeagueSkinManagerVN` and registers **League Skin Manager VN**
@@ -143,7 +156,8 @@ CSLOL profiles, other application data, and installed program files. Portable
 executables outside the fixed per-user install directory are never deleted. The
 separately installed official LTK Manager and its application data are also never
 removed by the LeagueSkinManagerVN uninstaller; only this app's cached installer,
-migration ledger, and reports are removed with its AppData.
+migration ledger, archive index, and reports are removed with its AppData. Removing LTK
+skins is always a separate explicit action and is never part of app uninstall.
 
 ## Development
 

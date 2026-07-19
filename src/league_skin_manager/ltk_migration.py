@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, cast
 from uuid import uuid4
 
 from .atomic import atomic_write_bytes, atomic_write_json
@@ -45,6 +45,7 @@ LTK_SETTINGS_FILENAME = "settings.json"
 LTK_ARCHIVES_DIRECTORY_NAME = "archives"
 MIGRATION_REPORT_SCHEMA_VERSION = 1
 MIGRATION_STATE_SCHEMA_VERSION = 1
+ARCHIVE_INDEX_SCHEMA_VERSION = 1
 DEFAULT_MAX_MODS = 20_000
 DEFAULT_MAX_EXISTING_ARCHIVES = 50_000
 DEFAULT_MAX_TOTAL_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
@@ -172,6 +173,17 @@ class _HistoryRecord:
     source: str
     name: str
     queued_at: str
+    content_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchiveIndexRecord:
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    device: int
+    inode: int
+    sha256: str
 
 
 @dataclass(slots=True)
@@ -240,6 +252,7 @@ class LtkMigrationService:
         ltk_app_data_dir: Path | None = None,
         report_dir: Path | None = None,
         migration_state_path: Path | None = None,
+        archive_index_path: Path | None = None,
         cslol_is_running: Callable[[], bool] | None = None,
         ltk_is_running: Callable[[], bool] | None = None,
         max_mods: int = DEFAULT_MAX_MODS,
@@ -284,8 +297,15 @@ class LtkMigrationService:
             if migration_state_path is not None
             else self.managed_state_path.parent / "ltk_migration_state.json"
         )
+        self.archive_index_path = _absolute_path(
+            archive_index_path
+            if archive_index_path is not None
+            else self.migration_state_path.parent / "ltk_archive_index.json"
+        )
         if self.migration_state_path == self.managed_state_path:
             raise ValueError("Migration ledger must be separate from managed-skin state")
+        if self.archive_index_path in {self.managed_state_path, self.migration_state_path}:
+            raise ValueError("LTK archive index must use its own VN-owned file")
         self.cslol_is_running = cslol_is_running or (lambda: False)
         self.ltk_is_running = ltk_is_running or (lambda: False)
         self.max_mods = max_mods
@@ -358,6 +378,8 @@ class LtkMigrationService:
             storage_dir = self.resolve_storage_dir()
             _require_history_outside_ltk(self.migration_state_path, self.ltk_app_data_dir)
             _require_history_outside_ltk(self.migration_state_path, storage_dir)
+            _require_archive_index_outside_ltk(self.archive_index_path, self.ltk_app_data_dir)
+            _require_archive_index_outside_ltk(self.archive_index_path, storage_dir)
             if os.path.lexists(self.migration_state_path) and not _is_safe_regular_file(
                 self.migration_state_path
             ):
@@ -401,8 +423,12 @@ class LtkMigrationService:
         _require_disjoint(source_dir, archives_dir)
         if _is_within(self.migration_state_path, source_dir):
             raise MigrationHistoryError("Migration ledger cannot be inside the CSLOL source")
+        if _is_within(self.archive_index_path, source_dir):
+            raise MigrationHistoryError("Archive index cannot be inside the CSLOL source")
         _require_history_outside_ltk(self.migration_state_path, self.ltk_app_data_dir)
         _require_history_outside_ltk(self.migration_state_path, storage_dir)
+        _require_archive_index_outside_ltk(self.archive_index_path, self.ltk_app_data_dir)
+        _require_archive_index_outside_ltk(self.archive_index_path, storage_dir)
         self._ensure_processes_stopped()
         history = self._load_history()
         history_session = _HistorySession(
@@ -411,6 +437,14 @@ class LtkMigrationService:
             pending_queued_archives={},
         )
         known_hashes = set(history)
+        known_content = {
+            (record.source, record.content_sha256)
+            for record in history.values()
+            if record.content_sha256 is not None
+        }
+        legacy_sources = {
+            record.source for record in history.values() if record.content_sha256 is None
+        }
 
         candidates = self._scan_candidates(source_dir)
         reporter = _ProgressReporter(progress, len(candidates))
@@ -424,14 +458,20 @@ class LtkMigrationService:
         packaged = 0
         processed = 0
         status = "completed"
+        archives_indexed = False
+
+        def index_archives_once() -> None:
+            nonlocal archives_indexed
+            if archives_indexed:
+                return
+            _ensure_safe_directory_tree(archives_dir)
+            reporter.emit("indexing", processed)
+            known_hashes.update(self._index_existing_archives(archives_dir, guard))
+            archives_indexed = True
 
         try:
             reporter.emit("scanning", 0)
             guard.checkpoint(force_process_check=True)
-            _ensure_safe_directory_tree(archives_dir)
-            reporter.emit("indexing", 0)
-            existing_archive_hashes = self._index_existing_archives(archives_dir, guard)
-            known_hashes.update(existing_archive_hashes)
             managed_entries = self._load_managed_entries()
             aggregate_bytes = 0
 
@@ -450,17 +490,26 @@ class LtkMigrationService:
                         raise LtkMigrationError(
                             "Selected mods exceed the aggregate uncompressed-size limit"
                         )
+                    content_sha256 = prepared.fingerprint.sha256
+                    if (str(candidate), content_sha256) in known_content:
+                        skipped += 1
+                        processed += 1
+                        reporter.emit("migrating", processed, source=candidate)
+                        continue
                     entry = managed_entries.get(candidate.name)
                     cache_path = self._verified_cache(entry, prepared.fingerprint)
                     if cache_path is not None:
                         reused_cache += 1
                         archive_hash = _stable_sha256(cache_path, guard)
+                        if archive_hash not in known_hashes:
+                            index_archives_once()
                         if archive_hash in known_hashes:
                             self._remember_history(
                                 history_session,
                                 archive_hash,
                                 candidate,
                                 prepared.display_name,
+                                content_sha256,
                                 known_hashes=known_hashes,
                             )
                             skipped += 1
@@ -473,7 +522,6 @@ class LtkMigrationService:
                             )
                             staged = self._copy_to_partial(cache_path, archives_dir, guard)
                             try:
-                                archive_hash = _stable_sha256(staged, guard)
                                 self._validate_staged_archive(
                                     staged,
                                     expected_size=entry.size if entry is not None else None,
@@ -488,6 +536,7 @@ class LtkMigrationService:
                                     history_session,
                                     candidate,
                                     prepared.display_name,
+                                    content_sha256,
                                 ):
                                     queued += 1
                                 else:
@@ -502,18 +551,27 @@ class LtkMigrationService:
                             mod_name=prepared.display_name,
                             source=candidate,
                         )
-                        staged = self._package_to_partial(prepared.tree, archives_dir, guard)
+                        _ensure_safe_directory_tree(archives_dir)
+                        staged = self._package_to_partial(
+                            prepared.tree,
+                            archives_dir,
+                            guard,
+                            fast=str(candidate) not in legacy_sources,
+                        )
                         try:
                             self._validate_staged_archive(staged)
                             archive_hash = _stable_sha256(staged, guard)
                             self._require_unchanged(candidate, prepared.fingerprint)
                             guard.checkpoint(force_process_check=True)
+                            if archive_hash not in known_hashes:
+                                index_archives_once()
                             if archive_hash in known_hashes:
                                 self._remember_history(
                                     history_session,
                                     archive_hash,
                                     candidate,
                                     prepared.display_name,
+                                    content_sha256,
                                     known_hashes=known_hashes,
                                 )
                                 skipped += 1
@@ -524,6 +582,7 @@ class LtkMigrationService:
                                 history_session,
                                 candidate,
                                 prepared.display_name,
+                                content_sha256,
                             ):
                                 queued += 1
                             else:
@@ -689,6 +748,7 @@ class LtkMigrationService:
                     "source": record.source,
                     "name": record.name,
                     "queued_at": record.queued_at,
+                    "content_sha256": record.content_sha256,
                 }
                 for digest, record in history.items()
             },
@@ -710,11 +770,25 @@ class LtkMigrationService:
         archive_hash: str,
         source: Path,
         display_name: str,
+        content_sha256: str,
         *,
         known_hashes: set[str],
         queued_archive: Path | None = None,
     ) -> None:
-        if archive_hash in session.records:
+        if not _SHA256_PATTERN.fullmatch(content_sha256):
+            raise MigrationHistoryError("Migration history content digest is invalid")
+        existing = session.records.get(archive_hash)
+        if existing is not None:
+            if existing.source == str(source) and existing.content_sha256 is None:
+                session.records[archive_hash] = _HistoryRecord(
+                    source=existing.source,
+                    name=existing.name,
+                    queued_at=existing.queued_at,
+                    content_sha256=content_sha256,
+                )
+                session.pending_hashes.add(archive_hash)
+                if len(session.pending_hashes) >= self.history_checkpoint_records:
+                    self._checkpoint_history(session, known_hashes)
             return
         if len(session.records) >= self.max_history_records:
             raise MigrationHistoryError("Migration history record limit has been reached")
@@ -722,6 +796,7 @@ class LtkMigrationService:
             source=str(source),
             name=display_name,
             queued_at=datetime.now(timezone.utc).isoformat(),
+            content_sha256=content_sha256,
         )
         _validate_history_record(record)
         session.records[archive_hash] = record
@@ -794,6 +869,7 @@ class LtkMigrationService:
         archives_dir: Path,
         guard: _Guard,
     ) -> set[str]:
+        cached = self._load_archive_index(archives_dir)
         try:
             entries = sorted(
                 archives_dir.iterdir(),
@@ -811,19 +887,109 @@ class LtkMigrationService:
                 "LTK archive inbox contains too many packages to deduplicate safely"
             )
         hashes: set[str] = set()
+        updated: dict[str, _ArchiveIndexRecord] = {}
         for archive in candidates:
             guard.checkpoint()
             if not _is_safe_regular_file(archive):
                 LOGGER.warning("Ignoring unsafe existing LTK archive: %s", archive)
                 continue
             try:
-                if archive.stat().st_size > self.max_compressed_bytes:
+                archive_stat = _safe_file_stat(archive)
+                if archive_stat.st_size > self.max_compressed_bytes:
                     LOGGER.warning("Ignoring oversized existing LTK archive: %s", archive)
                     continue
-                hashes.add(_stable_sha256(archive, guard))
-            except OSError:
+                record = cached.get(archive.name)
+                if record is not None and _archive_record_matches(record, archive_stat):
+                    digest = record.sha256
+                else:
+                    digest = _stable_sha256(archive, guard)
+                    archive_stat = _safe_file_stat(archive)
+                hashes.add(digest)
+                updated[archive.name] = _archive_record(archive_stat, digest)
+            except (LtkMigrationError, OSError):
                 LOGGER.warning("Could not hash existing LTK archive: %s", archive)
+        self._write_archive_index(archives_dir, updated)
         return hashes
+
+    def _load_archive_index(self, archives_dir: Path) -> dict[str, _ArchiveIndexRecord]:
+        path = self.archive_index_path
+        if not os.path.lexists(path):
+            return {}
+        if not _is_safe_regular_file(path):
+            LOGGER.warning("Ignoring unsafe VN-owned LTK archive index: %s", path)
+            return {}
+        try:
+            before = _safe_file_stat(path)
+            if before.st_size > self.max_history_bytes:
+                raise ValueError("archive index exceeds its size limit")
+            with _open_regular_file(path, before) as stream:
+                encoded = stream.read(self.max_history_bytes + 1)
+            _require_same_file(path, before)
+            raw = json.loads(encoded.decode("utf-8"))
+            if not isinstance(raw, Mapping):
+                raise ValueError("archive index must be a JSON object")
+            if raw.get("schema_version") != ARCHIVE_INDEX_SCHEMA_VERSION:
+                raise ValueError("archive index schema is unsupported")
+            expected_storage = os.path.normcase(str(_absolute_path(archives_dir)))
+            raw_storage = raw.get("archives_dir")
+            if (
+                not isinstance(raw_storage, str)
+                or os.path.normcase(raw_storage) != expected_storage
+            ):
+                return {}
+            records = raw.get("archives")
+            if not isinstance(records, Mapping) or len(records) > self.max_existing_archives:
+                raise ValueError("archive index records are invalid")
+            parsed: dict[str, _ArchiveIndexRecord] = {}
+            for name, value in records.items():
+                parsed[_validate_archive_index_name(name)] = _archive_record_from_json(value)
+            return parsed
+        except (
+            LtkMigrationError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            LOGGER.warning("Ignoring unreadable VN-owned LTK archive index: %s", error)
+            return {}
+
+    def _write_archive_index(
+        self,
+        archives_dir: Path,
+        records: Mapping[str, _ArchiveIndexRecord],
+    ) -> None:
+        path = self.archive_index_path
+        if os.path.lexists(path) and not _is_safe_regular_file(path):
+            LOGGER.warning("Cannot update unsafe VN-owned LTK archive index: %s", path)
+            return
+        payload = {
+            "schema_version": ARCHIVE_INDEX_SCHEMA_VERSION,
+            "archives_dir": str(_absolute_path(archives_dir)),
+            "archives": {
+                name: {
+                    "size": record.size,
+                    "mtime_ns": record.mtime_ns,
+                    "ctime_ns": record.ctime_ns,
+                    "device": record.device,
+                    "inode": record.inode,
+                    "sha256": record.sha256,
+                }
+                for name, record in sorted(records.items())
+            },
+        }
+        try:
+            _ensure_safe_directory_tree(path.parent)
+            # Match atomic_write_json's exact formatting so the limit applies
+            # to the bytes that will actually be persisted.
+            encoded = (
+                json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            if len(encoded) > self.max_history_bytes:
+                raise ValueError("archive index would exceed its size limit")
+            atomic_write_json(path, payload)
+        except (LtkMigrationError, OSError, ValueError) as error:
+            LOGGER.warning("Could not update VN-owned LTK archive index: %s", error)
 
     def _copy_to_partial(self, source: Path, archives_dir: Path, guard: _Guard) -> Path:
         staged = archives_dir / f".lsmvn-{uuid4().hex}.partial"
@@ -850,24 +1016,35 @@ class LtkMigrationService:
         tree: _ModTree,
         archives_dir: Path,
         guard: _Guard,
+        *,
+        fast: bool,
     ) -> Path:
         staged = archives_dir / f".lsmvn-{uuid4().hex}.partial"
+        compression = zipfile.ZIP_STORED if fast else zipfile.ZIP_DEFLATED
         try:
             with staged.open("xb") as raw_output:
                 with zipfile.ZipFile(
                     raw_output,
                     mode="w",
-                    compression=zipfile.ZIP_DEFLATED,
-                    compresslevel=9,
+                    compression=compression,
+                    compresslevel=None if fast else 9,
                     strict_timestamps=True,
                 ) as archive:
                     for relative in tree.directories:
                         guard.checkpoint()
-                        info = _deterministic_zip_info(f"{relative.as_posix()}/", directory=True)
+                        info = _deterministic_zip_info(
+                            f"{relative.as_posix()}/",
+                            directory=True,
+                            compression=compression,
+                        )
                         archive.writestr(info, b"")
                     for item in tree.files:
                         guard.checkpoint()
-                        info = _deterministic_zip_info(item.relative.as_posix(), directory=False)
+                        info = _deterministic_zip_info(
+                            item.relative.as_posix(),
+                            directory=False,
+                            compression=compression,
+                        )
                         with (
                             _open_regular_file(item.path, item.stat_result) as source,
                             archive.open(info, mode="w", force_zip64=True) as destination,
@@ -964,6 +1141,7 @@ class LtkMigrationService:
         session: _HistorySession,
         source: Path,
         display_name: str,
+        content_sha256: str,
     ) -> bool:
         queued = self._commit_archive(staged, archive_hash, known_hashes)
         destination = staged.parent / f"lsmvn-{archive_hash}.fantome"
@@ -973,6 +1151,7 @@ class LtkMigrationService:
                 archive_hash,
                 source,
                 display_name,
+                content_sha256,
                 known_hashes=known_hashes,
                 queued_archive=destination if queued else None,
             )
@@ -1132,15 +1311,64 @@ def _read_display_name(tree: _ModTree) -> str:
     return metadata.path.parent.parent.name
 
 
+def _validate_archive_index_name(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or Path(value).name != value
+        or "/" in value
+        or "\\" in value
+        or Path(value).suffix.casefold() not in {".fantome", ".modpkg"}
+    ):
+        raise ValueError("archive index contains an invalid filename")
+    return value
+
+
+def _archive_record_from_json(value: object) -> _ArchiveIndexRecord:
+    if not isinstance(value, Mapping):
+        raise ValueError("archive index record must be a JSON object")
+    fields = tuple(value.get(name) for name in ("size", "mtime_ns", "ctime_ns", "device", "inode"))
+    if any(isinstance(field, bool) or not isinstance(field, int) or field < 0 for field in fields):
+        raise ValueError("archive index record has invalid file identity")
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or not _SHA256_PATTERN.fullmatch(sha256):
+        raise ValueError("archive index record has an invalid digest")
+    size, mtime_ns, ctime_ns, device, inode = (cast(int, field) for field in fields)
+    return _ArchiveIndexRecord(size, mtime_ns, ctime_ns, device, inode, sha256)
+
+
+def _archive_record(value: os.stat_result, sha256: str) -> _ArchiveIndexRecord:
+    return _ArchiveIndexRecord(
+        size=value.st_size,
+        mtime_ns=value.st_mtime_ns,
+        ctime_ns=value.st_ctime_ns,
+        device=value.st_dev,
+        inode=value.st_ino,
+        sha256=sha256,
+    )
+
+
+def _archive_record_matches(record: _ArchiveIndexRecord, value: os.stat_result) -> bool:
+    return record == _archive_record(value, record.sha256)
+
+
 def _history_record_from_json(value: object) -> _HistoryRecord:
     if not isinstance(value, Mapping):
         raise MigrationHistoryError("Migration history record must be a JSON object")
     source = value.get("source")
     name = value.get("name")
     queued_at = value.get("queued_at")
+    content_sha256 = value.get("content_sha256")
     if not isinstance(source, str) or not isinstance(name, str) or not isinstance(queued_at, str):
         raise MigrationHistoryError("Migration history record has invalid fields")
-    record = _HistoryRecord(source=source, name=name, queued_at=queued_at)
+    if content_sha256 is not None and not isinstance(content_sha256, str):
+        raise MigrationHistoryError("Migration history content digest has an invalid type")
+    record = _HistoryRecord(
+        source=source,
+        name=name,
+        queued_at=queued_at,
+        content_sha256=content_sha256,
+    )
     _validate_history_record(record)
     return record
 
@@ -1152,6 +1380,8 @@ def _validate_history_record(record: _HistoryRecord) -> None:
         raise MigrationHistoryError("Migration history package name is invalid")
     if not record.queued_at or len(record.queued_at) > _MAX_HISTORY_TIMESTAMP_LENGTH:
         raise MigrationHistoryError("Migration history timestamp is invalid")
+    if record.content_sha256 is not None and not _SHA256_PATTERN.fullmatch(record.content_sha256):
+        raise MigrationHistoryError("Migration history content digest is invalid")
     try:
         timestamp = datetime.fromisoformat(record.queued_at)
     except ValueError as error:
@@ -1160,9 +1390,14 @@ def _validate_history_record(record: _HistoryRecord) -> None:
         raise MigrationHistoryError("Migration history timestamp must include a timezone")
 
 
-def _deterministic_zip_info(name: str, *, directory: bool) -> zipfile.ZipInfo:
+def _deterministic_zip_info(
+    name: str,
+    *,
+    directory: bool,
+    compression: int,
+) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
-    info.compress_type = zipfile.ZIP_DEFLATED
+    info.compress_type = compression
     info.create_system = 3
     info.external_attr = ((stat.S_IFDIR | 0o755) if directory else (stat.S_IFREG | 0o644)) << 16
     if directory:
@@ -1309,6 +1544,11 @@ def _require_disjoint(source_dir: Path, archives_dir: Path) -> None:
 def _require_history_outside_ltk(history_path: Path, storage_dir: Path) -> None:
     if _is_within(history_path, storage_dir):
         raise MigrationHistoryError("VN migration ledger cannot be stored in LTK-owned data")
+
+
+def _require_archive_index_outside_ltk(index_path: Path, storage_dir: Path) -> None:
+    if _is_within(index_path, storage_dir):
+        raise MigrationHistoryError("VN archive index cannot be stored in LTK-owned data")
 
 
 def _is_within(path: Path, directory: Path) -> bool:

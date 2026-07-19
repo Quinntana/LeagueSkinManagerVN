@@ -215,6 +215,7 @@ def test_tampered_managed_source_is_packaged_from_live_tree_not_cache(
 
 def test_live_packaging_is_deterministic_and_migration_is_idempotent(
     tmp_path: Path,
+    monkeypatch: Any,
 ) -> None:
     installed = tmp_path / "cslol-manager" / "installed"
     installed.mkdir(parents=True)
@@ -225,6 +226,14 @@ def test_live_packaging_is_deterministic_and_migration_is_idempotent(
     first_archive = queued_archives(first_result.archives_dir)[0]
     original_bytes = first_archive.read_bytes()
     original_name = first_archive.name
+    with zipfile.ZipFile(first_archive) as archive:
+        assert {member.compress_type for member in archive.infolist()} == {zipfile.ZIP_STORED}
+
+    def unexpected_work(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("repeat migration should use its content ledger")
+
+    monkeypatch.setattr(first, "_index_existing_archives", unexpected_work)
+    monkeypatch.setattr(first, "_package_to_partial", unexpected_work)
 
     repeated = first.migrate(installed)
     assert repeated.queued == 0
@@ -242,6 +251,77 @@ def test_live_packaging_is_deterministic_and_migration_is_idempotent(
     second_archive = queued_archives(second_result.archives_dir)[0]
     assert second_archive.name == original_name
     assert second_archive.read_bytes() == original_bytes
+
+
+def test_existing_archive_hash_index_is_reused_when_file_identity_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    service = make_service(tmp_path)
+    archives = tmp_path / "ltk-data" / "archives"
+    archives.mkdir(parents=True)
+    existing = create_fantome(archives / "existing.fantome", wad=b"existing")
+    guard = migration_module._Guard(service, None)
+
+    first = service._index_existing_archives(archives, guard)
+    assert len(first) == 1
+    assert service.archive_index_path.is_file()
+
+    monkeypatch.setattr(
+        migration_module,
+        "_stable_sha256",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged archive should use its VN-owned hash index")
+        ),
+    )
+    repeated = service._index_existing_archives(archives, guard)
+
+    assert repeated == first
+    assert existing.is_file()
+
+
+def test_legacy_history_uses_compatible_packaging_once_and_backfills_content_digest(
+    tmp_path: Path,
+) -> None:
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    source = create_live_mod(installed, "legacy-custom", wad=b"legacy")
+    service = make_service(tmp_path)
+    archives = tmp_path / "ltk-data" / "archives"
+    archives.mkdir(parents=True)
+    prepared = service._prepare_mod(source)
+    legacy_package = service._package_to_partial(
+        prepared.tree,
+        archives,
+        migration_module._Guard(service, None),
+        fast=False,
+    )
+    legacy_digest = migration_module._plain_sha256(legacy_package)
+    legacy_package.unlink()
+    service.migration_state_path.parent.mkdir(parents=True, exist_ok=True)
+    service.migration_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "packages": {
+                    legacy_digest: {
+                        "source": str(source),
+                        "name": "legacy-custom",
+                        "queued_at": "2026-01-01T00:00:00+00:00",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = service.migrate(installed)
+
+    assert result.queued == 0
+    assert result.skipped == 1
+    assert queued_archives(archives) == []
+    state = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
+    assert state["packages"][legacy_digest]["content_sha256"] == prepared.fingerprint.sha256
 
 
 def test_deduplicates_same_bytes_already_queued_as_modpkg(tmp_path: Path) -> None:
@@ -297,6 +377,7 @@ def test_consumed_archive_is_skipped_until_explicit_history_reset(tmp_path: Path
     assert record["source"].endswith("custom")
     assert record["name"] == "custom"
     assert record["queued_at"]
+    assert record["content_sha256"] == inspect_extracted_mod(installed / "custom").sha256
     assert not list(ledger.parent.glob("*.tmp"))
 
     service.forget_history()

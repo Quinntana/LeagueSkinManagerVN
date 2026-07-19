@@ -19,6 +19,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, RLock, Thread
 
+from .ltk_cleanup import LtkSkinCleanupError, LtkSkinCleanupResult, LtkSkinCleanupService
 from .ltk_companion import (
     LtkCancelled,
     LtkCompanion,
@@ -46,6 +47,7 @@ class _TaskKind(Enum):
     PREPARE = auto()
     START = auto()
     MIGRATE = auto()
+    CLEAN_SKINS = auto()
     RESET_HISTORY = auto()
     STOP = auto()
 
@@ -64,6 +66,7 @@ class LtkTaskCoordinator:
         *,
         companion: LtkCompanion,
         migration: LtkMigrationService,
+        cleanup: LtkSkinCleanupService,
         operation_gate: OperationGate,
         ltk_is_running: RunningPredicate,
         resume_cslol_launches: ResumeCallback,
@@ -73,6 +76,7 @@ class LtkTaskCoordinator:
     ) -> None:
         self._companion = companion
         self._migration = migration
+        self._cleanup = cleanup
         self._operation_gate = operation_gate
         self._ltk_is_running = ltk_is_running
         self._resume_cslol_launches = resume_cslol_launches
@@ -91,12 +95,18 @@ class LtkTaskCoordinator:
         self._active_kind: _TaskKind | None = None
         self._start_queued = False
         self._migration_queued = False
+        self._cleanup_queued = False
         self._reset_queued = False
 
     @property
     def migration_active(self) -> bool:
         with self._lock:
             return self._migration_queued or self._active_kind is _TaskKind.MIGRATE
+
+    @property
+    def cleanup_active(self) -> bool:
+        with self._lock:
+            return self._cleanup_queued or self._active_kind is _TaskKind.CLEAN_SKINS
 
     def start(self) -> bool:
         """Start the worker and automatically prepare the latest official installer."""
@@ -132,6 +142,12 @@ class LtkTaskCoordinator:
         with self._lock:
             if self._stopping:
                 return False
+            if self._cleanup_queued or self._active_kind is _TaskKind.CLEAN_SKINS:
+                self._notify(
+                    "LTK Manager",
+                    "Wait for the LTK skin cleanup to finish before opening LTK Manager.",
+                )
+                return False
             if self._start_queued or self._active_kind is _TaskKind.START:
                 self._publish_status("LTK launch is already queued", False)
                 return True
@@ -148,6 +164,12 @@ class LtkTaskCoordinator:
         selected = Path(source)
         with self._lock:
             if self._stopping:
+                return False
+            if self._cleanup_queued or self._active_kind is _TaskKind.CLEAN_SKINS:
+                self._notify(
+                    "LTK migration",
+                    "Wait for the LTK skin cleanup to finish before porting skins.",
+                )
                 return False
             if self._migration_queued or self._active_kind is _TaskKind.MIGRATE:
                 self._notify(
@@ -172,6 +194,34 @@ class LtkTaskCoordinator:
         self._publish_status("cancelling migration safely", True)
         return True
 
+    def request_cleanup(self) -> bool:
+        """Queue one explicit, already-confirmed removal of every LTK skin."""
+
+        if not self.start():
+            return False
+        with self._lock:
+            if self._stopping:
+                return False
+            if self._migration_queued or self._active_kind is _TaskKind.MIGRATE:
+                self._notify(
+                    "Remove all LTK skins",
+                    "Wait for the active CSLOL-to-LTK port to finish or cancel it first.",
+                )
+                return False
+            if self._start_queued or self._active_kind is _TaskKind.START:
+                self._notify(
+                    "Remove all LTK skins",
+                    "Wait for the queued LTK launch to finish, then close LTK and try again.",
+                )
+                return False
+            if self._cleanup_queued or self._active_kind is _TaskKind.CLEAN_SKINS:
+                self._publish_status("LTK skin cleanup is already queued", False)
+                return True
+            self._cleanup_queued = True
+            self._queue.put(_Task(_TaskKind.CLEAN_SKINS))
+        self._publish_status("explicit LTK skin cleanup queued", False)
+        return True
+
     def request_history_reset(self) -> bool:
         """Queue an explicit reset so previously imported packages may be requeued."""
 
@@ -184,6 +234,12 @@ class LtkTaskCoordinator:
                 self._notify(
                     "LTK migration history",
                     "Wait for the active migration to finish before resetting its history.",
+                )
+                return False
+            if self._cleanup_queued or self._active_kind is _TaskKind.CLEAN_SKINS:
+                self._notify(
+                    "LTK migration history",
+                    "Wait for the LTK skin cleanup to finish before resetting history.",
                 )
                 return False
             if self._reset_queued or self._active_kind is _TaskKind.RESET_HISTORY:
@@ -233,6 +289,8 @@ class LtkTaskCoordinator:
                             self._start_queued = False
                         elif task.kind is _TaskKind.MIGRATE:
                             self._migration_queued = False
+                        elif task.kind is _TaskKind.CLEAN_SKINS:
+                            self._cleanup_queued = False
                         elif task.kind is _TaskKind.RESET_HISTORY:
                             self._reset_queued = False
                     if self._stop_event.is_set():
@@ -245,11 +303,15 @@ class LtkTaskCoordinator:
                         if task.source is None:
                             raise RuntimeError("LTK migration task has no source")
                         self._migrate(task.source)
+                    elif task.kind is _TaskKind.CLEAN_SKINS:
+                        self._remove_all_skins()
                     elif task.kind is _TaskKind.RESET_HISTORY:
                         self._reset_history()
                 except Exception as exc:
                     if task.kind is _TaskKind.MIGRATE:
                         self._mark_migration_finished()
+                    elif task.kind is _TaskKind.CLEAN_SKINS:
+                        self._mark_cleanup_finished()
                     self._logger.exception("Unexpected LTK companion worker failure")
                     self._publish_status(f"operation failed: {exc}", False)
                     self._notify("LTK companion", f"Operation failed: {exc}")
@@ -262,6 +324,7 @@ class LtkTaskCoordinator:
                 self._active_kind = None
                 self._start_queued = False
                 self._migration_queued = False
+                self._cleanup_queued = False
                 self._reset_queued = False
 
     def _prepare(self) -> None:
@@ -404,6 +467,59 @@ class LtkTaskCoordinator:
             f"{summary}. CSLOL originals were unchanged. Report: {result.report_path}",
         )
 
+    def _remove_all_skins(self) -> None:
+        self._publish_status("waiting for skin synchronization to finish", False)
+        lease = self._operation_gate.acquire("LTK skin cleanup", self._stop_event)
+        if lease is None:
+            self._mark_cleanup_finished()
+            self._publish_status("LTK skin cleanup cancelled before it started", False)
+            return
+        try:
+            if self._stop_event.is_set():
+                self._mark_cleanup_finished()
+                self._publish_status("LTK skin cleanup cancelled before it started", False)
+                return
+            self._publish_status("removing all LTK skins", False)
+            try:
+                result = self._cleanup.remove_all()
+                self._migration.forget_history()
+            except LtkSkinCleanupError as exc:
+                self._logger.warning("LTK skin cleanup could not finish: %s", exc)
+                self._mark_cleanup_finished()
+                self._publish_status(f"LTK skin cleanup not completed: {exc}", False)
+                self._notify("Remove all LTK skins", str(exc))
+                return
+            except LtkMigrationError as exc:
+                self._logger.warning(
+                    "LTK skins were removed but migration history remains: %s",
+                    exc,
+                )
+                self._mark_cleanup_finished()
+                self._publish_status("LTK skins removed; migration-history reset failed", False)
+                self._notify(
+                    "LTK skins removed",
+                    "The LTK library was cleared, but LeagueSkinManagerVN could not reset its "
+                    f"port history: {exc}. Use Reset migration history before porting again.",
+                )
+                return
+            self._finish_cleanup(result)
+        finally:
+            lease.release()
+            try:
+                self._resume_cslol_launches()
+            except Exception:
+                self._logger.exception("Could not resume queued CSLOL Manager launches")
+
+    def _finish_cleanup(self, result: LtkSkinCleanupResult) -> None:
+        self._mark_cleanup_finished()
+        count = max(result.library_mods, result.archives)
+        self._publish_status(f"removed all LTK skins ({count} package(s))", False)
+        self._notify(
+            "All LTK skins removed",
+            f"Removed {count} LTK skin package(s) and cleared generated profile data. "
+            "LTK settings, logs, and the LTK application were preserved. Port history was reset.",
+        )
+
     def _migration_progress(self, progress: MigrationProgress) -> None:
         name = f" - {progress.mod_name}" if progress.mod_name else ""
         if progress.total:
@@ -440,6 +556,11 @@ class LtkTaskCoordinator:
     def _mark_migration_finished(self) -> None:
         with self._lock:
             if self._active_kind is _TaskKind.MIGRATE:
+                self._active_kind = None
+
+    def _mark_cleanup_finished(self) -> None:
+        with self._lock:
+            if self._active_kind is _TaskKind.CLEAN_SKINS:
                 self._active_kind = None
 
     def _publish_status(self, detail: str, migration_active: bool) -> None:

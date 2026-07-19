@@ -44,7 +44,7 @@ def test_apps_entry_has_professional_per_user_values(tmp_path: Path) -> None:
     )
 
     assert values["DisplayName"] == ("League Skin Manager VN", "str")
-    assert values["DisplayVersion"] == ("2.5.0", "str")
+    assert values["DisplayVersion"] == ("2.6.0", "str")
     assert values["Publisher"] == ("Quinntana", "str")
     assert values["InstallLocation"] == (str(layout.install_dir), "str")
     assert values["UninstallString"] == (f'"{layout.uninstaller.resolve()}"', "str")

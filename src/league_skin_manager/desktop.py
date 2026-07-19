@@ -256,14 +256,14 @@ class DesktopApplication:
         ttk.Label(title_group, text="Skin Library", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             title_group,
-            text="Browse verified skins and manage synchronization from one place.",
+            text="Search VN skins here; use the system tray for quick CSLOL and LTK actions.",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(3, 0))
         actions = ttk.Frame(header, style="App.TFrame")
         actions.pack(side="right")
         ttk.Button(
             actions,
-            text="Sync now",
+            text="Sync VN skins",
             style="Secondary.TButton",
             command=self._sync_clicked,
         ).pack(side="left", padx=(0, 8))
@@ -275,7 +275,7 @@ class DesktopApplication:
         ).pack(side="left", padx=(0, 8))
         ttk.Button(
             actions,
-            text="Open / install LTK",
+            text="Open or install LTK",
             style="Secondary.TButton",
             command=self._ltk_clicked,
         ).pack(side="left")
@@ -294,6 +294,7 @@ class DesktopApplication:
 
         filters = ttk.Frame(panel, style="Panel.TFrame")
         filters.pack(fill="x", pady=(0, 12))
+        ttk.Label(filters, text="Search", style="Panel.TLabel").pack(side="left", padx=(0, 7))
         self._search_var = tk.StringVar()
         search = ttk.Entry(
             filters,
@@ -304,6 +305,10 @@ class DesktopApplication:
         search.pack(side="left", fill="x", expand=True, padx=(0, 10))
         search.insert(0, "")
         self._search_var.trace_add("write", self._filter_changed)
+        ttk.Label(filters, text="Champion", style="Panel.TLabel").pack(
+            side="left",
+            padx=(4, 7),
+        )
         self._champion_var = tk.StringVar(value=self.ALL_CHAMPIONS)
         self._champion_box = ttk.Combobox(
             filters,
@@ -352,7 +357,7 @@ class DesktopApplication:
         ).pack(side="left", padx=(0, 7))
         ttk.Button(
             footer_actions,
-            text="App data",
+            text="Open app data",
             style="Secondary.TButton",
             command=lambda: self._open_path(self._data_dir),
         ).pack(side="left", padx=(0, 7))
@@ -409,13 +414,13 @@ class DesktopApplication:
         self._cancel_migration_button.pack(side="right")
         ttk.Button(
             companion,
-            text="Port CSLOL skins to LTK now...",
+            text="Port from CSLOL to LTK...",
             style="Secondary.TButton",
             command=self._migration_clicked,
         ).pack(side="right", padx=(0, 8))
         ttk.Button(
             companion,
-            text="Reset migration history...",
+            text="Reset port history...",
             style="Secondary.TButton",
             command=self._reset_migration_history_clicked,
         ).pack(side="right", padx=(0, 8))

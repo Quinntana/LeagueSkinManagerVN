@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, cast
 
+from league_skin_manager.ltk_cleanup import LtkSkinCleanupResult, LtkSkinCleanupService
 from league_skin_manager.ltk_companion import (
     LtkCompanion,
     LtkCompanionResult,
@@ -117,6 +118,24 @@ class FakeMigration:
         self.forget_calls += 1
 
 
+class FakeCleanup:
+    def __init__(self, tmp_path: Path) -> None:
+        self.calls = 0
+        self.result = LtkSkinCleanupResult(
+            storage_dir=tmp_path / "ltk",
+            library_mods=7,
+            archives=6,
+            metadata_directories=7,
+            profile_directories=2,
+            reports_removed=True,
+            library_reset=True,
+        )
+
+    def remove_all(self) -> LtkSkinCleanupResult:
+        self.calls += 1
+        return self.result
+
+
 def wait_until(predicate: Any, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -133,6 +152,7 @@ def coordinator(
     *,
     gate: OperationGate | None = None,
     running: Any = lambda: False,
+    cleanup: FakeCleanup | None = None,
 ) -> tuple[LtkTaskCoordinator, list[tuple[str, str]], list[tuple[str, bool]], list[str]]:
     notifications: list[tuple[str, str]] = []
     statuses: list[tuple[str, bool]] = []
@@ -140,6 +160,7 @@ def coordinator(
     value = LtkTaskCoordinator(
         companion=cast(LtkCompanion, companion),
         migration=cast(LtkMigrationService, migration),
+        cleanup=cast(LtkSkinCleanupService, cleanup or FakeCleanup(tmp_path)),
         operation_gate=gate or OperationGate(),
         ltk_is_running=running,
         resume_cslol_launches=lambda: resumed.append("resume"),
@@ -376,4 +397,66 @@ def test_history_reset_is_rejected_while_migration_is_waiting(tmp_path: Path) ->
     assert "active migration" in notifications[-1][1]
     assert value.cancel_migration()
     blocker.release()
+    assert value.shutdown(1.0)
+
+
+def test_explicit_cleanup_waits_for_gate_clears_history_and_resumes_cslol(
+    tmp_path: Path,
+) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    cleanup = FakeCleanup(tmp_path)
+    gate = OperationGate()
+    blocker = gate.try_acquire("skin synchronization")
+    assert blocker is not None
+    value, notifications, statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        gate=gate,
+        cleanup=cleanup,
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_cleanup()
+    assert value.request_cleanup()
+    wait_until(lambda: value.cleanup_active)
+    assert cleanup.calls == 0
+
+    blocker.release()
+    wait_until(lambda: cleanup.calls == 1 and migration.forget_calls == 1)
+
+    assert resumed == ["resume"]
+    assert value.cleanup_active is False
+    assert any("removed all LTK skins (7 package(s))" in item[0] for item in statuses)
+    assert notifications[-1][0] == "All LTK skins removed"
+    assert "LTK application were preserved" in notifications[-1][1]
+    assert value.shutdown(1.0)
+
+
+def test_cleanup_and_migration_requests_reject_each_other(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    migration = FakeMigration(tmp_path)
+    cleanup = FakeCleanup(tmp_path)
+    gate = OperationGate()
+    blocker = gate.try_acquire("skin synchronization")
+    assert blocker is not None
+    value, notifications, _statuses, _resumed = coordinator(
+        tmp_path,
+        companion,
+        migration,
+        gate=gate,
+        cleanup=cleanup,
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+    assert value.request_migration(tmp_path / "installed")
+    wait_until(lambda: value.migration_active)
+
+    assert value.request_cleanup() is False
+    assert "active CSLOL-to-LTK port" in notifications[-1][1]
+    assert value.cancel_migration()
+    blocker.release()
+    wait_until(lambda: not value.migration_active)
     assert value.shutdown(1.0)

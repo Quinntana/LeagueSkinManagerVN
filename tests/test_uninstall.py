@@ -9,7 +9,7 @@ import pytest
 
 import league_skin_manager.uninstall as uninstall_module
 from league_skin_manager.config import APP_NAME
-from league_skin_manager.installation import InstallLayout
+from league_skin_manager.installation import InstallationError, InstallLayout
 from league_skin_manager.uninstall import (
     BLOCKING_PROCESSES,
     RemovalState,
@@ -17,6 +17,7 @@ from league_skin_manager.uninstall import (
     UninstallStatus,
     cleanup_relocated_copy,
     find_running_process,
+    launch_installed_uninstaller_after_exit,
     launch_relocated_uninstaller,
     main,
     remove_install_tree,
@@ -140,6 +141,61 @@ def test_uninstall_removes_ltk_cache_and_history_but_preserves_external_ltk_data
     assert result.ok
     assert not data_dir.exists()
     assert sentinel.read_text(encoding="utf-8") == "external"
+
+
+def test_interactive_uninstall_removes_complete_owned_layout_and_keeps_neighbors(
+    tmp_path: Path,
+) -> None:
+    appdata, data_dir = app_paths(tmp_path)
+    local_appdata = tmp_path / "AppData" / "Local"
+    layout = InstallLayout.discover(local_appdata)
+    layout.install_dir.mkdir(parents=True)
+    layout.executable.write_bytes(b"main")
+    layout.uninstaller.write_bytes(b"uninstaller")
+    (layout.install_dir / "obsolete.bin").write_bytes(b"old")
+    for relative in (
+        "cache/packages/skin.fantome",
+        "cache/ltk/LTK-setup.exe",
+        "cslol-manager/installed/skin/WAD/skin.wad.client",
+        "cslol-manager/profiles/Default Profile.config",
+        "logs/LeagueSkinManagerVN.log",
+        "migration-reports/report.json",
+        "managed_skins.json",
+        "ltk_migration_state.json",
+        "ltk_archive_index.json",
+    ):
+        target = data_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"owned")
+    external_ltk = appdata / "dev.leaguetoolkit.manager"
+    external_ltk.mkdir()
+    external_skin = external_ltk / "archives" / "keep.fantome"
+    external_skin.parent.mkdir()
+    external_skin.write_bytes(b"external")
+    local_neighbor = local_appdata / "Programs" / "OtherApp" / "keep.exe"
+    local_neighbor.parent.mkdir(parents=True)
+    local_neighbor.write_bytes(b"neighbor")
+    notifications: list[tuple[str, str, bool]] = []
+
+    exit_code = main(
+        appdata=appdata,
+        local_appdata=local_appdata,
+        confirmer=lambda _title, _message: True,
+        notifier=lambda title, message, error: notifications.append((title, message, error)),
+        process_finder=lambda _names: None,
+        startup_remover=lambda: RemovalState.REMOVED,
+        registration_remover=lambda: RemovalState.REMOVED,
+        operation_mutex=FakeMutex(),
+        mutex=FakeMutex(),
+    )
+
+    assert exit_code == 0
+    assert not data_dir.exists()
+    assert not layout.install_dir.exists()
+    assert external_skin.read_bytes() == b"external"
+    assert local_neighbor.read_bytes() == b"neighbor"
+    assert notifications[-1][0] == "Uninstall complete"
+    assert notifications[-1][2] is False
 
 
 def test_install_file_failure_preserves_apps_registration_for_retry(tmp_path: Path) -> None:
@@ -276,6 +332,67 @@ def test_remove_install_tree_deletes_only_validated_program_directory(tmp_path: 
     assert state is RemovalState.REMOVED
     assert not layout.install_dir.exists()
     assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_tray_launches_exact_installed_uninstaller_after_application_exit(
+    tmp_path: Path,
+) -> None:
+    layout = InstallLayout.discover(tmp_path / "LocalAppData")
+    layout.install_dir.mkdir(parents=True)
+    layout.executable.write_bytes(b"main")
+    layout.uninstaller.write_bytes(b"uninstaller")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    class Process:
+        pid = 987
+
+    def launch(args: list[str], **kwargs: object) -> Process:
+        calls.append((args, kwargs))
+        return Process()
+
+    pid = launch_installed_uninstaller_after_exit(
+        layout,
+        wait_pid=321,
+        popen=launch,
+    )
+
+    assert pid == 987
+    assert calls[0][0] == [str(layout.uninstaller.resolve())]
+    assert calls[0][1]["cwd"] == str(layout.install_dir)
+    environment = calls[0][1]["env"]
+    assert isinstance(environment, dict)
+    assert environment["LSMVN_UNINSTALL_WAIT_PID"] == "321"
+    assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+
+
+def test_tray_uninstall_launch_rejects_missing_payload_and_bad_pid(tmp_path: Path) -> None:
+    layout = InstallLayout.discover(tmp_path / "LocalAppData")
+    layout.install_dir.mkdir(parents=True)
+
+    with pytest.raises(InstallationError, match="missing or unsafe"):
+        launch_installed_uninstaller_after_exit(layout, wait_pid=123)
+
+    layout.uninstaller.write_bytes(b"uninstaller")
+    with pytest.raises(ValueError, match="process identifier"):
+        launch_installed_uninstaller_after_exit(layout, wait_pid=0)
+
+
+def test_tray_uninstall_launch_rejects_reparse_payload(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    layout = InstallLayout.discover(tmp_path / "LocalAppData")
+    layout.install_dir.mkdir(parents=True)
+    layout.uninstaller.write_bytes(b"uninstaller")
+    original = uninstall_module._is_reparse_point
+    monkeypatch.setattr(
+        uninstall_module,
+        "_is_reparse_point",
+        lambda path: path == layout.uninstaller or original(path),
+    )
+
+    with pytest.raises(InstallationError, match="missing or unsafe"):
+        launch_installed_uninstaller_after_exit(layout, wait_pid=123)
 
 
 def test_relocation_copies_installed_uninstaller_and_passes_bootloader_pid(

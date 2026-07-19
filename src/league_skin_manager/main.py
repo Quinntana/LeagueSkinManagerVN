@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import sys
 from argparse import ArgumentParser
@@ -19,7 +20,9 @@ from .config import (
 )
 from .controller import AppController, AppState
 from .desktop import DesktopApplication
+from .installation import InstallationError, InstallLayout
 from .logging_setup import configure_logging
+from .ltk_cleanup import LtkSkinCleanupService
 from .ltk_companion import (
     LtkCompanion,
     LtkInstallLocator,
@@ -34,6 +37,10 @@ from .process_monitor import LeagueProcessMonitor, WindowsProcessLookup
 from .skin_source import GitHubSkinSource
 from .sync_service import SkinSyncService
 from .tray import TrayApplication
+from .uninstall import (
+    launch_installed_uninstaller_after_exit,
+    validated_installed_uninstaller,
+)
 from .windows_integration import (
     InstanceActivationEvent,
     ProcessLauncher,
@@ -43,6 +50,32 @@ from .windows_integration import (
     running_executable,
 )
 from .workflow import SynchronizationWorkflow
+
+
+def _confirm_remove_all_ltk_skins(storage_dir: Path) -> bool:
+    """Show one explicit, default-No confirmation for the destructive tray action."""
+
+    if sys.platform != "win32":
+        return False
+    message = (
+        "Permanently remove every skin from LTK Manager?\n\n"
+        f"LTK skin storage: {storage_dir}\n\n"
+        "This removes all archives, extracted metadata, WAD reports, and generated profile "
+        "overlays in that LTK library, including skins not installed by LeagueSkinManagerVN.\n\n"
+        "LTK Manager itself, its settings, logs, and your named profile definitions are kept. "
+        "Close LTK Manager and its patcher before continuing. This cannot be undone."
+    )
+    yes = 6
+    yes_no = 0x00000004
+    warning = 0x00000030
+    default_no = 0x00000100
+    result = ctypes.windll.user32.MessageBoxW(
+        None,
+        message,
+        "Remove all LTK skins",
+        yes_no | warning | default_no,
+    )
+    return int(result) == yes
 
 
 def _wait_for_workers(
@@ -171,12 +204,64 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
         def ltk_is_running() -> bool:
             return launcher.is_any_running(LTK_PROCESS_NAMES)
 
+        ltk_locator = LtkInstallLocator(excluded_roots=(paths.ltk_cache_dir,))
+        migration = LtkMigrationService(
+            paths.managed_manifest_file,
+            paths.package_cache_dir,
+            ltk_app_data_dir=paths.ltk_data_dir,
+            report_dir=paths.migration_report_dir,
+            migration_state_path=paths.ltk_migration_state_file,
+            archive_index_path=paths.ltk_archive_index_file,
+            cslol_is_running=lambda: launcher.is_running_under(paths.manager_dir),
+            ltk_is_running=ltk_is_running,
+        )
+        cleanup = LtkSkinCleanupService(
+            migration.resolve_storage_dir,
+            ltk_is_running=ltk_is_running,
+        )
+
         def startup_enabled() -> bool:
             return startup.is_enabled(executable)
 
         def set_startup_enabled(enabled: bool) -> bool:
             startup.set_enabled(executable, enabled)
             return True
+
+        def notify_user(title: str, message: str) -> None:
+            if tray is not None:
+                tray.notify(title, message)
+
+        def open_cslol_skins() -> bool:
+            open_path(paths.installed_dir)
+            return True
+
+        def open_ltk_install() -> bool:
+            installation = ltk_locator.locate()
+            if installation is None:
+                notify_user(
+                    "LTK Manager",
+                    "LTK Manager is not installed yet. Use Open or install LTK Manager first.",
+                )
+                return False
+            open_path(installation.executable.parent)
+            return True
+
+        def open_ltk_storage() -> bool:
+            storage_dir = migration.resolve_storage_dir()
+            if not storage_dir.is_dir():
+                notify_user(
+                    "LTK skin storage",
+                    "LTK has not created its skin storage yet. Open LTK Manager once first.",
+                )
+                return False
+            open_path(storage_dir)
+            return True
+
+        def request_ltk_cleanup() -> bool:
+            storage_dir = migration.resolve_storage_dir()
+            if not _confirm_remove_all_ltk_skins(storage_dir):
+                return False
+            return active_ltk_tasks().request_cleanup()
 
         def active_controller() -> AppController:
             if controller is None:
@@ -211,6 +296,33 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
                 tray.stop()
             return result
 
+        def uninstall_from_tray() -> bool:
+            try:
+                layout = InstallLayout.discover()
+                validated_installed_uninstaller(layout)
+            except InstallationError as exc:
+                logger.warning("Tray uninstall is unavailable: %s", exc)
+                notify_user(
+                    "Uninstall LeagueSkinManagerVN",
+                    f"The installed uninstaller is unavailable: {exc}",
+                )
+                return False
+            if not shutdown_services():
+                return False
+            try:
+                launch_installed_uninstaller_after_exit(layout)
+            except (InstallationError, OSError, ValueError) as exc:
+                logger.exception("Could not start the installed uninstaller from the tray")
+                notify_user(
+                    "Uninstall LeagueSkinManagerVN",
+                    "Background services stopped, but the uninstaller could not be started: "
+                    f"{exc}. Restart LeagueSkinManagerVN or uninstall it from Windows Settings.",
+                )
+                return False
+            if desktop is not None:
+                desktop.stop()
+            return True
+
         desktop = DesktopApplication(
             catalog_path=paths.managed_manifest_file,
             installed_dir=paths.installed_dir,
@@ -233,30 +345,25 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
             on_show=desktop.show,
             on_sync=lambda: active_controller().request_sync(),
             on_start_manager=lambda: active_controller().start_manager(),
+            on_open_cslol_skins=open_cslol_skins,
             on_start_ltk=lambda: active_ltk_tasks().request_start(),
+            on_open_ltk_install=open_ltk_install,
+            on_open_ltk_storage=open_ltk_storage,
             on_migrate_to_ltk=desktop.request_ltk_migration,
+            on_remove_ltk_skins=request_ltk_cleanup,
             startup_enabled=startup_enabled,
             set_startup_enabled=set_startup_enabled,
+            on_uninstall=uninstall_from_tray,
             on_exit=exit_from_tray,
             logger=logger.getChild("tray"),
         )
 
         ltk_release_client = LtkReleaseClient()
-        ltk_locator = LtkInstallLocator(excluded_roots=(paths.ltk_cache_dir,))
         ltk_companion = LtkCompanion(
             ltk_release_client,
             ltk_locator,
             PowerShellAuthenticodeVerifier(),
             paths.ltk_cache_dir,
-        )
-        migration = LtkMigrationService(
-            paths.managed_manifest_file,
-            paths.package_cache_dir,
-            ltk_app_data_dir=paths.ltk_data_dir,
-            report_dir=paths.migration_report_dir,
-            migration_state_path=paths.ltk_migration_state_file,
-            cslol_is_running=lambda: launcher.is_running_under(paths.manager_dir),
-            ltk_is_running=ltk_is_running,
         )
 
         def update_ltk_status(detail: str, migration_active: bool) -> None:
@@ -270,6 +377,7 @@ def run(*, sync_on_start: bool = True, show_window: bool = True) -> int:
         ltk_tasks = LtkTaskCoordinator(
             companion=ltk_companion,
             migration=migration,
+            cleanup=cleanup,
             operation_gate=operation_gate,
             ltk_is_running=ltk_is_running,
             resume_cslol_launches=lambda: active_controller().resume_pending_manager_launches(),

@@ -85,10 +85,15 @@ class TrayApplication:
         on_show: Action,
         on_sync: Action,
         on_start_manager: Action,
+        on_open_cslol_skins: Action,
         on_start_ltk: Action,
+        on_open_ltk_install: Action,
+        on_open_ltk_storage: Action,
         on_migrate_to_ltk: Action,
+        on_remove_ltk_skins: Action,
         startup_enabled: StartupGetter,
         set_startup_enabled: StartupSetter,
+        on_uninstall: Action,
         on_exit: Action,
         backend: TrayBackend | None = None,
         image_factory: ImageFactory = make_status_icon,
@@ -99,10 +104,15 @@ class TrayApplication:
         self._on_show = on_show
         self._on_sync = on_sync
         self._on_start_manager = on_start_manager
+        self._on_open_cslol_skins = on_open_cslol_skins
         self._on_start_ltk = on_start_ltk
+        self._on_open_ltk_install = on_open_ltk_install
+        self._on_open_ltk_storage = on_open_ltk_storage
         self._on_migrate_to_ltk = on_migrate_to_ltk
+        self._on_remove_ltk_skins = on_remove_ltk_skins
         self._startup_enabled = startup_enabled
         self._set_startup_enabled = set_startup_enabled
+        self._on_uninstall = on_uninstall
         self._on_exit = on_exit
         self._backend = backend or self._load_backend()
         self._image_factory = image_factory
@@ -187,6 +197,32 @@ class TrayApplication:
     def _build_menu(self) -> object:
         with self._lock:
             detail = self._detail
+        cslol_menu = self._backend.Menu(
+            self._backend.MenuItem("Open CSLOL Manager", self._start_manager_clicked),
+            self._backend.MenuItem(
+                "Open installed skins folder",
+                self._open_cslol_skins_clicked,
+            ),
+        )
+        ltk_menu = self._backend.Menu(
+            self._backend.MenuItem("Open or install LTK Manager", self._start_ltk_clicked),
+            self._backend.MenuItem(
+                "Open LTK application folder",
+                self._open_ltk_install_clicked,
+            ),
+            self._backend.MenuItem(
+                "Open LTK skin storage folder",
+                self._open_ltk_storage_clicked,
+            ),
+            self._backend.MenuItem(
+                "Port CSLOL skins to LTK now...",
+                self._migrate_to_ltk_clicked,
+            ),
+            self._backend.MenuItem(
+                "Remove all LTK skins...",
+                self._remove_ltk_skins_clicked,
+            ),
+        )
         return self._backend.Menu(
             self._backend.MenuItem(
                 "Open LeagueSkinManagerVN",
@@ -198,23 +234,17 @@ class TrayApplication:
                 None,
                 enabled=False,
             ),
-            self._backend.MenuItem("Sync now", self._sync_clicked),
-            self._backend.MenuItem(
-                "Open CSLOL Manager",
-                self._start_manager_clicked,
-            ),
-            self._backend.MenuItem(
-                "Open or install LTK Manager",
-                self._start_ltk_clicked,
-            ),
-            self._backend.MenuItem(
-                "Port CSLOL skins to LTK now...",
-                self._migrate_to_ltk_clicked,
-            ),
+            self._backend.MenuItem("Sync VN skins now", self._sync_clicked),
+            self._backend.MenuItem("CSLOL Manager", cslol_menu),
+            self._backend.MenuItem("LTK Manager", ltk_menu),
             self._backend.MenuItem(
                 "Start with Windows",
                 self._startup_clicked,
                 checked=self._startup_checked,
+            ),
+            self._backend.MenuItem(
+                "Uninstall LeagueSkinManagerVN...",
+                self._uninstall_clicked,
             ),
             self._backend.MenuItem("Exit", self._exit_clicked),
         )
@@ -239,11 +269,23 @@ class TrayApplication:
     def _start_manager_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("CSLOL Manager launch", self._on_start_manager)
 
+    def _open_cslol_skins_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the CSLOL installed skins folder", self._on_open_cslol_skins)
+
     def _start_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("LTK Manager launch", self._on_start_ltk)
 
+    def _open_ltk_install_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the LTK application folder", self._on_open_ltk_install)
+
+    def _open_ltk_storage_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("opening the LTK skin storage folder", self._on_open_ltk_storage)
+
     def _migrate_to_ltk_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("opening the explicit CSLOL-to-LTK port tool", self._on_migrate_to_ltk)
+
+    def _remove_ltk_skins_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("removing all LTK skins", self._on_remove_ltk_skins)
 
     def _startup_checked(self, _item: object) -> bool:
         try:
@@ -268,13 +310,27 @@ class TrayApplication:
             self.notify("Start with Windows", f"Could not update setting: {exc}")
 
     def _exit_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._request_shutdown(
+            self._on_exit,
+            failure_message=(
+                "Background work is still stopping. The app remains active; try Exit again."
+            ),
+        )
+
+    def _uninstall_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._request_shutdown(
+            self._on_uninstall,
+            failure_message="The uninstaller was not started. LeagueSkinManagerVN remains active.",
+        )
+
+    def _request_shutdown(self, callback: Action, *, failure_message: str) -> None:
         with self._lock:
             if self._exit_requested:
                 return
             self._exit_requested = True
         try:
             try:
-                result = self._on_exit()
+                result = callback()
             except Exception as exc:
                 self._logger.exception("Tray callback failed during application shutdown")
                 self.notify(
@@ -284,8 +340,8 @@ class TrayApplication:
                 return
             if result is False:
                 self.notify(
-                    "Shutdown still in progress",
-                    "Background work is still stopping. The app remains active; try Exit again.",
+                    "Action not completed",
+                    failure_message,
                 )
                 return
             self.stop()
