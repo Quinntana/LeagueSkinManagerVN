@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import threading
 import zipfile
 from pathlib import Path
@@ -9,842 +8,419 @@ from typing import Any
 
 import pytest
 
-from league_skin_manager import ltk_migration as migration_module
-from league_skin_manager.atomic import atomic_write_bytes as real_atomic_write_bytes
 from league_skin_manager.ltk_migration import (
+    MANAGED_PACKAGE_PREFIX,
     LtkMigrationService,
-    MigrationBlockedError,
-    MigrationBusyError,
-    MigrationHistoryError,
-    MigrationProgress,
-    MigrationSourceError,
+    LtkReconcileError,
+    ReconcileBlockedError,
+    ReconcileBusyError,
+    ReconcileProgress,
 )
-from league_skin_manager.skin_installer import (
-    extract_fantome,
-    git_blob_sha,
-    inspect_extracted_mod,
-    managed_directory_name,
-)
-from league_skin_manager.sync_service import ManagedStateError
+from league_skin_manager.skin_installer import git_blob_sha, managed_directory_name
 
 
-def create_fantome(path: Path, *, name: str = "Test skin", wad: bytes = b"wad") -> Path:
+def create_fantome(path: Path, *, name: str, wad: bytes) -> Path:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("META/info.json", json.dumps({"Name": name}))
         archive.writestr("WAD/Test.wad.client", wad)
     return path
 
 
-def create_live_mod(installed: Path, directory: str, *, wad: bytes = b"wad") -> Path:
-    mod = installed / directory
-    (mod / "META").mkdir(parents=True)
-    (mod / "META" / "info.json").write_text(
-        json.dumps({"Name": directory}),
-        encoding="utf-8",
-    )
-    (mod / "WAD").mkdir()
-    (mod / "WAD" / "Test.wad.client").write_bytes(wad)
-    return mod
+class Workspace:
+    """A managed skin set plus an LTK storage directory, both on disk."""
 
+    def __init__(self, tmp_path: Path) -> None:
+        self.root = tmp_path
+        self.state_path = tmp_path / "state" / "managed_skins.json"
+        self.cache_dir = tmp_path / "cache" / "packages"
+        self.storage_dir = tmp_path / "ltk-data"
+        self.archives_dir = self.storage_dir / "archives"
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.entries: list[dict[str, Any]] = []
+        self.removed: list[tuple[str, ...]] = []
+        self.toggle_resets = 0
 
-def make_service(tmp_path: Path, **options: Any) -> LtkMigrationService:
-    return LtkMigrationService(
-        tmp_path / "state" / "managed_skins.json",
-        tmp_path / "cache" / "packages",
-        ltk_app_data_dir=tmp_path / "ltk-data",
-        report_dir=tmp_path / "reports",
-        **options,
-    )
+    def add_skin(self, champion: str, name: str, *, wad: bytes | None = None) -> str:
+        """Add one managed skin together with its verified cache package."""
 
-
-def create_managed_mod(tmp_path: Path) -> tuple[Path, Path, Path]:
-    installed = tmp_path / "cslol-manager" / "installed"
-    installed.mkdir(parents=True)
-    source_path = "skins/Ahri/Foxfire Ahri.fantome"
-    directory = managed_directory_name("Ahri", "Foxfire Ahri", source_path)
-    archive = create_fantome(tmp_path / "skin.fantome", name="Foxfire Ahri")
-    live = installed / directory
-    extract_fantome(archive, live)
-    fingerprint = inspect_extracted_mod(live)
-    assert fingerprint is not None
-    source_sha = git_blob_sha(archive)
-    cache = tmp_path / "cache" / "packages" / f"{source_sha}.fantome"
-    cache.parent.mkdir(parents=True)
-    shutil.copyfile(archive, cache)
-    state = {
-        "schema_version": 1,
-        "transaction_id": "test",
-        "source_commit": "a" * 40,
-        "patch": "16.13.1",
-        "entries": [
+        source_path = f"skins/{champion}/{name}.fantome"
+        staged = self.root / f"{champion}-{name}.fantome".replace(" ", "-")
+        create_fantome(staged, name=name, wad=wad if wad is not None else name.encode())
+        source_sha = git_blob_sha(staged)
+        package = self.cache_dir / f"{source_sha}.fantome"
+        package.write_bytes(staged.read_bytes())
+        staged.unlink()
+        self.entries.append(
             {
-                "champion": "Ahri",
-                "name": "Foxfire Ahri",
+                "champion": champion,
+                "name": name,
                 "source_path": source_path,
                 "source_sha": source_sha,
-                "size": archive.stat().st_size,
-                "directory": directory,
-                "content_sha256": fingerprint.sha256,
+                "size": package.stat().st_size,
+                "directory": managed_directory_name(champion, name, source_path),
+                "content_sha256": "a" * 64,
             }
-        ],
-    }
-    state_path = tmp_path / "state" / "managed_skins.json"
-    state_path.parent.mkdir(parents=True)
-    state_path.write_text(json.dumps(state), encoding="utf-8")
-    return installed, live, cache
+        )
+        self.write_state()
+        return source_sha
+
+    def drop_skin(self, name: str) -> None:
+        self.entries = [entry for entry in self.entries if entry["name"] != name]
+        self.write_state()
+
+    def write_state(self) -> None:
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "transaction_id": "test",
+                    "source_commit": "a" * 40,
+                    "patch": "16.14.1",
+                    "entries": self.entries,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def service(self, **options: Any) -> LtkMigrationService:
+        options.setdefault("remove_ltk_mods", self._remove_mods)
+        options.setdefault("clear_ltk_toggles", self._clear_toggles)
+        return LtkMigrationService(
+            self.state_path,
+            self.cache_dir,
+            ltk_app_data_dir=self.storage_dir,
+            report_dir=self.root / "reports",
+            **options,
+        )
+
+    def _remove_mods(self, mod_ids: tuple[str, ...]) -> None:
+        """Mirror LtkSkinCleanupService.remove_mods: delete the stored packages."""
+
+        self.removed.append(mod_ids)
+        for mod_id in mod_ids:
+            (self.archives_dir / f"{mod_id}.fantome").unlink(missing_ok=True)
+
+    def _clear_toggles(self) -> int:
+        self.toggle_resets += 1
+        return 0
+
+    def queued(self) -> list[str]:
+        if not self.archives_dir.is_dir():
+            return []
+        return sorted(path.name for path in self.archives_dir.glob("*.fantome"))
+
+    def simulate_ltk_import(self, mod_id: str) -> Path:
+        """Reproduce LTK's import: rename to <mod-id>.fantome, bytes unchanged."""
+
+        queued = next(self.archives_dir.glob(f"{MANAGED_PACKAGE_PREFIX}*.fantome"))
+        adopted = self.archives_dir / f"{mod_id}.fantome"
+        queued.rename(adopted)
+        return adopted
 
 
-def queued_archives(path: Path) -> list[Path]:
-    return sorted(path.glob("*.fantome"))
+@pytest.fixture
+def workspace(tmp_path: Path) -> Workspace:
+    return Workspace(tmp_path)
 
 
-def write_history(
-    service: LtkMigrationService,
-    *,
-    source: Path,
-    content_sha256: str,
-) -> None:
-    service.migration_state_path.parent.mkdir(parents=True, exist_ok=True)
-    service.migration_state_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "packages": {
-                    "f" * 64: {
-                        "source": str(source),
-                        "name": source.name,
-                        "queued_at": "2026-07-19T00:00:00+00:00",
-                        "content_sha256": content_sha256,
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
+def test_reconcile_reaches_the_baseline_in_one_pass(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.add_skin("Aatrox", "Mecha Aatrox")
+    service = workspace.service()
+
+    result = service.reconcile()
+
+    assert result.status == "completed"
+    assert (result.expected, result.added, result.removed) == (2, 2, 0)
+    assert len(workspace.queued()) == 2
+    assert all(name.startswith(MANAGED_PACKAGE_PREFIX) for name in workspace.queued())
+    assert workspace.toggle_resets == 1
+
+
+def test_reconcile_is_idempotent(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service()
+    first = service.reconcile()
+    before = workspace.queued()
+
+    second = service.reconcile()
+
+    assert (second.added, second.removed) == (0, 0)
+    assert second.unchanged == first.expected
+    assert workspace.queued() == before
+
+
+def test_reconcile_is_idempotent_after_ltk_imports_the_package(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service()
+    assert service.reconcile().added == 1
+    adopted = workspace.simulate_ltk_import("11111111-2222-3333-4444-555555555555")
+
+    result = service.reconcile()
+
+    assert (result.added, result.removed) == (0, 0)
+    assert result.unchanged == 1
+    assert adopted.exists()
+    assert workspace.removed == []
+
+
+def test_reconcile_removes_a_superseded_version(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri", wad=b"old-patch")
+    service = workspace.service()
+    assert service.reconcile().added == 1
+    workspace.simulate_ltk_import("old-mod-id")
+
+    workspace.drop_skin("Foxfire Ahri")
+    workspace.add_skin("Ahri", "Foxfire Ahri", wad=b"new-patch")
+    result = service.reconcile()
+
+    assert (result.added, result.removed) == (1, 1)
+    assert workspace.removed == [("old-mod-id",)]
+
+
+def test_reconcile_removes_a_skin_that_left_the_managed_set(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.add_skin("Aatrox", "Mecha Aatrox")
+    service = workspace.service()
+    assert service.reconcile().added == 2
+
+    workspace.drop_skin("Mecha Aatrox")
+    result = service.reconcile()
+
+    assert (result.expected, result.added, result.removed) == (1, 0, 1)
+    assert len(workspace.queued()) == 1
+
+
+def test_reconcile_removes_packages_the_user_imported(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service()
+    assert service.reconcile().added == 1
+    workspace.simulate_ltk_import("vn-owned-id")
+    create_fantome(
+        workspace.archives_dir / "user-imported-id.fantome",
+        name="Someone else's skin",
+        wad=b"foreign",
     )
 
+    result = service.reconcile()
 
-def test_managed_port_status_matches_exact_absolute_source_and_content(
-    tmp_path: Path,
+    assert result.removed == 1
+    assert workspace.removed == [("user-imported-id",)]
+
+
+def test_reconcile_against_a_prepopulated_library_replaces_it_exactly(
+    workspace: Workspace,
 ) -> None:
-    installed, live, _cache = create_managed_mod(tmp_path)
-    service = make_service(tmp_path)
-    fingerprint = inspect_extracted_mod(live)
-    assert fingerprint is not None
-    write_history(service, source=live, content_sha256=fingerprint.sha256)
-    before = {
-        path: path.read_bytes()
-        for path in (service.managed_state_path, service.migration_state_path)
-    }
+    """A library built by another tool is corrected, not duplicated."""
 
-    status = service.inspect_managed_port_status(installed.parent)
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.add_skin("Aatrox", "Mecha Aatrox")
+    workspace.archives_dir.mkdir(parents=True)
+    for index in range(3):
+        create_fantome(
+            workspace.archives_dir / f"pre-existing-{index}.fantome",
+            name=f"Legacy skin {index}",
+            wad=f"legacy-{index}".encode(),
+        )
+    service = workspace.service()
 
-    assert (status.total, status.pending) == (1, 0)
-    assert {
-        path: path.read_bytes()
-        for path in (service.managed_state_path, service.migration_state_path)
-    } == before
-    assert not (tmp_path / "reports").exists()
-    assert not (tmp_path / "ltk-data").exists()
+    result = service.reconcile()
 
-
-@pytest.mark.parametrize("mismatch", ["path", "digest"])
-def test_managed_port_status_requires_both_exact_ledger_fields(
-    tmp_path: Path,
-    mismatch: str,
-) -> None:
-    installed, live, _cache = create_managed_mod(tmp_path)
-    service = make_service(tmp_path)
-    fingerprint = inspect_extracted_mod(live)
-    assert fingerprint is not None
-    source = live.parent / "different" if mismatch == "path" else live
-    digest = "e" * 64 if mismatch == "digest" else fingerprint.sha256
-    write_history(service, source=source, content_sha256=digest)
-
-    status = service.inspect_managed_port_status(installed)
-
-    assert (status.total, status.pending) == (1, 1)
+    assert (result.expected, result.added, result.removed) == (2, 2, 3)
+    assert len(workspace.queued()) == 2
+    assert workspace.removed == [("pre-existing-0", "pre-existing-1", "pre-existing-2")]
 
 
-def test_managed_port_status_counts_identical_vn_content_as_one_handoff(
-    tmp_path: Path,
-) -> None:
-    installed, live, _cache = create_managed_mod(tmp_path)
-    service = make_service(tmp_path)
-    fingerprint = inspect_extracted_mod(live)
-    assert fingerprint is not None
-    raw = json.loads(service.managed_state_path.read_text(encoding="utf-8"))
-    duplicate_source = "skins/Ahri/Foxfire Ahri Copy.fantome"
-    duplicate_directory = managed_directory_name(
-        "Ahri",
-        "Foxfire Ahri Copy",
-        duplicate_source,
-    )
-    shutil.copytree(live, installed / duplicate_directory)
-    duplicate_entry = dict(raw["entries"][0])
-    duplicate_entry.update(
-        {
-            "name": "Foxfire Ahri Copy",
-            "source_path": duplicate_source,
-            "directory": duplicate_directory,
-        }
-    )
-    raw["entries"].append(duplicate_entry)
-    service.managed_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    write_history(service, source=live, content_sha256=fingerprint.sha256)
+def test_reconcile_skips_a_skin_with_no_cached_package(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.add_skin("Aatrox", "Mecha Aatrox")
+    next(iter(workspace.cache_dir.iterdir())).unlink()
+    service = workspace.service()
 
-    status = service.inspect_managed_port_status(installed)
+    result = service.reconcile()
 
-    assert (status.total, status.pending) == (2, 0)
+    assert (result.expected, result.added) == (1, 1)
 
 
-def test_managed_port_status_treats_missing_managed_digest_as_pending(
-    tmp_path: Path,
-) -> None:
-    installed, live, _cache = create_managed_mod(tmp_path)
-    service = make_service(tmp_path)
-    raw = json.loads(service.managed_state_path.read_text(encoding="utf-8"))
-    raw["entries"][0].pop("content_sha256")
-    service.managed_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    write_history(service, source=live, content_sha256="d" * 64)
+def test_reconcile_is_blocked_while_a_manager_runs(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service(ltk_is_running=lambda: True)
 
-    status = service.inspect_managed_port_status(installed)
+    with pytest.raises(ReconcileBlockedError, match="Close LTK Manager"):
+        service.reconcile()
 
-    assert (status.total, status.pending) == (1, 1)
+    assert workspace.queued() == []
+    assert workspace.toggle_resets == 0
 
 
-def test_managed_port_status_preserves_state_and_history_validation_errors(
-    tmp_path: Path,
-) -> None:
-    installed = tmp_path / "cslol-manager" / "installed"
-    installed.mkdir(parents=True)
-    service = make_service(tmp_path)
-    service.managed_state_path.parent.mkdir(parents=True)
-    service.managed_state_path.write_text(
-        json.dumps({"schema_version": 999, "entries": []}),
-        encoding="utf-8",
-    )
+def test_reconcile_is_blocked_when_process_state_is_unknown(workspace: Workspace) -> None:
+    def explode() -> bool:
+        raise OSError("process table unavailable")
 
-    with pytest.raises(ManagedStateError, match="schema"):
-        service.inspect_managed_port_status(installed)
+    service = workspace.service(cslol_is_running=explode)
 
-    service.managed_state_path.unlink()
-    service.migration_state_path.parent.mkdir(parents=True, exist_ok=True)
-    service.migration_state_path.write_text(
-        json.dumps({"schema_version": 999, "packages": {}}),
-        encoding="utf-8",
-    )
-    with pytest.raises(MigrationHistoryError, match="schema"):
-        service.inspect_managed_port_status(installed)
-
-    service.migration_state_path.write_bytes(b"x" * 65)
-    service.max_history_bytes = 64
-    with pytest.raises(MigrationHistoryError, match="size limit"):
-        service.inspect_managed_port_status(installed)
+    with pytest.raises(ReconcileBlockedError, match="Could not verify"):
+        service.reconcile()
 
 
-def test_managed_port_status_is_exclusive_with_migration(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    service = make_service(tmp_path)
+def test_pre_cancelled_reconcile_changes_nothing(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    cancelled = threading.Event()
+    cancelled.set()
+    service = workspace.service()
+
+    result = service.reconcile(cancel_event=cancelled)
+
+    assert result.cancelled
+    assert workspace.queued() == []
+    assert result.report_path.is_file()
+
+
+def test_reconcile_reports_progress_and_writes_a_report(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service()
+    seen: list[ReconcileProgress] = []
+
+    result = service.reconcile(progress=seen.append)
+
+    assert any(item.phase == "queueing" for item in seen)
+    assert any(item.skin_name == "Foxfire Ahri" for item in seen)
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "completed"
+    assert (report["added"], report["expected"]) == (1, 1)
+
+
+def test_reconcile_rejects_a_non_callable_progress(workspace: Workspace) -> None:
+    service = workspace.service()
+
+    with pytest.raises(TypeError, match="progress must be callable"):
+        service.reconcile(progress=object())  # type: ignore[arg-type]
+
+
+def test_reconcile_and_inspection_are_exclusive(workspace: Workspace) -> None:
+    service = workspace.service()
     assert service._lock.acquire(blocking=False)
     try:
-        with pytest.raises(MigrationBusyError, match="already in progress"):
-            service.inspect_managed_port_status(installed)
+        with pytest.raises(ReconcileBusyError, match="already in progress"):
+            service.reconcile()
+        with pytest.raises(ReconcileBusyError, match="already in progress"):
+            service.inspect_baseline()
     finally:
         service._lock.release()
 
 
-def test_normalizes_cslol_root_or_direct_installed_folder(tmp_path: Path) -> None:
-    root = tmp_path / "cslol-manager"
-    installed = root / "installed"
-    installed.mkdir(parents=True)
-    service = make_service(tmp_path)
+def test_inspect_baseline_reports_drift_without_changing_anything(
+    workspace: Workspace,
+) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.add_skin("Aatrox", "Mecha Aatrox")
+    service = workspace.service()
 
-    assert service.normalize_source(root) == installed
-    assert service.normalize_source(installed) == installed
+    empty = service.inspect_baseline()
 
-    invalid = tmp_path / "not-cslol"
-    invalid.mkdir()
-    with pytest.raises(MigrationSourceError, match="root folder"):
-        service.normalize_source(invalid)
-    with pytest.raises(MigrationSourceError, match="safe directory"):
-        service.normalize_source(tmp_path / "missing")
+    assert (empty.expected, empty.present, empty.extra) == (2, 0, 0)
+    assert empty.missing == 2
+    assert not empty.at_baseline
+    assert workspace.queued() == []
+
+    service.reconcile()
+    current = service.inspect_baseline()
+
+    assert (current.expected, current.present, current.extra) == (2, 2, 0)
+    assert current.at_baseline
 
 
-def test_honors_only_absolute_ltk_custom_storage_path(tmp_path: Path) -> None:
-    app_data = tmp_path / "ltk-data"
-    app_data.mkdir()
-    custom = tmp_path / "external-ltk-storage"
-    settings = app_data / "settings.json"
-    settings.write_text(json.dumps({"modStoragePath": str(custom)}), encoding="utf-8")
-    service = LtkMigrationService(
-        tmp_path / "state.json",
-        tmp_path / "cache",
-        ltk_app_data_dir=app_data,
+def test_inspect_baseline_counts_foreign_packages_as_extra(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.archives_dir.mkdir(parents=True)
+    create_fantome(workspace.archives_dir / "foreign.fantome", name="Foreign", wad=b"foreign")
+    service = workspace.service()
+
+    status = service.inspect_baseline()
+
+    assert (status.expected, status.present, status.extra) == (1, 0, 1)
+    assert not status.at_baseline
+
+
+def test_reconcile_without_a_removal_boundary_reports_instead_of_deleting(
+    workspace: Workspace,
+) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    workspace.archives_dir.mkdir(parents=True)
+    foreign = create_fantome(
+        workspace.archives_dir / "foreign-id.fantome",
+        name="Foreign",
+        wad=b"foreign",
     )
+    service = workspace.service(remove_ltk_mods=None)
+
+    result = service.reconcile()
+
+    assert result.removed == 0
+    assert foreign.exists()
+    assert any("no removal boundary" in issue.reason for issue in result.issues)
+
+
+def test_a_corrupt_package_index_degrades_to_a_fresh_digest(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service()
+    service.reconcile()
+
+    assert service.package_index_path.is_file()
+    index = json.loads(service.package_index_path.read_text(encoding="utf-8"))
+    assert index["schema_version"] == 1
+    assert len(index["packages"]) == 1
+
+    service.package_index_path.write_text("not json", encoding="utf-8")
+    repeat = service.reconcile()
+
+    assert (repeat.added, repeat.removed) == (0, 0)
+
+
+def test_indexes_may_not_live_inside_ltk_storage(workspace: Workspace) -> None:
+    workspace.add_skin("Ahri", "Foxfire Ahri")
+    service = workspace.service(
+        archive_index_path=workspace.storage_dir / "archive-index.json",
+    )
+
+    with pytest.raises(LtkReconcileError, match="cannot be stored in LTK-owned data"):
+        service.reconcile()
+
+
+def test_storage_dir_honours_an_absolute_mod_storage_path(workspace: Workspace) -> None:
+    workspace.storage_dir.mkdir(parents=True, exist_ok=True)
+    custom = workspace.root / "custom-storage"
+    (workspace.storage_dir / "settings.json").write_text(
+        json.dumps({"modStoragePath": str(custom)}),
+        encoding="utf-8",
+    )
+    service = workspace.service()
 
     assert service.resolve_storage_dir() == custom
 
-    settings.write_text(json.dumps({"modStoragePath": "relative/storage"}), encoding="utf-8")
-    assert service.resolve_storage_dir() == app_data
-    settings.write_text("not-json", encoding="utf-8")
-    assert service.resolve_storage_dir() == app_data
 
-
-@pytest.mark.parametrize("running_manager", ["cslol", "ltk"])
-def test_running_manager_blocks_before_creating_ltk_storage(
-    tmp_path: Path,
-    running_manager: str,
+@pytest.mark.parametrize(
+    "settings",
+    ["not json", json.dumps({"modStoragePath": "relative/path"}), json.dumps([1, 2])],
+)
+def test_storage_dir_falls_back_for_unusable_settings(
+    workspace: Workspace,
+    settings: str,
 ) -> None:
-    installed = tmp_path / "cslol-manager" / "installed"
-    installed.mkdir(parents=True)
-    create_live_mod(installed, "custom")
-    service = make_service(
-        tmp_path,
-        cslol_is_running=lambda: running_manager == "cslol",
-        ltk_is_running=lambda: running_manager == "ltk",
-    )
+    workspace.storage_dir.mkdir(parents=True, exist_ok=True)
+    (workspace.storage_dir / "settings.json").write_text(settings, encoding="utf-8")
+    service = workspace.service()
 
-    with pytest.raises(MigrationBlockedError, match="Close"):
-        service.migrate(installed)
+    assert service.resolve_storage_dir() == workspace.storage_dir
 
-    assert not (tmp_path / "ltk-data").exists()
-    assert not (tmp_path / "reports").exists()
 
+def test_resource_limits_must_be_positive(workspace: Workspace) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        workspace.service(max_mods=0)
 
-def test_process_lookup_failure_blocks_closed(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
 
-    def fail_lookup() -> bool:
-        raise OSError("process snapshot unavailable")
-
-    service = make_service(tmp_path, ltk_is_running=fail_lookup)
-    with pytest.raises(MigrationBlockedError, match="verify"):
-        service.migrate(installed)
-
-
-def test_verified_managed_cache_is_reused_without_editing_ltk_library(
-    tmp_path: Path,
-) -> None:
-    installed, _live, cache = create_managed_mod(tmp_path)
-    storage = tmp_path / "ltk-data"
-    storage.mkdir()
-    library = storage / "library.json"
-    library.write_bytes(b"do-not-touch")
-    service = make_service(tmp_path)
-    events: list[MigrationProgress] = []
-
-    result = service.migrate(installed.parent, progress=events.append)
-
-    archives = queued_archives(storage / "archives")
-    assert result.status == "completed"
-    assert result.queued == 1
-    assert result.reused_cache == 1
-    assert result.packaged == 0
-    assert len(archives) == 1
-    assert archives[0].read_bytes() == cache.read_bytes()
-    assert library.read_bytes() == b"do-not-touch"
-    assert events[-1].phase == "completed"
-    report = json.loads(result.report_path.read_text(encoding="utf-8"))
-    assert report["queued"] == 1
-    assert report["status"] == "completed"
-    assert not list(result.report_path.parent.glob("*.tmp"))
-
-
-def test_tampered_managed_source_is_packaged_from_live_tree_not_cache(
-    tmp_path: Path,
-) -> None:
-    installed, live, cache = create_managed_mod(tmp_path)
-    (live / "WAD" / "Test.wad.client").write_bytes(b"live-user-edit")
-    service = make_service(tmp_path)
-
-    result = service.migrate(installed)
-
-    archives = queued_archives(result.archives_dir)
-    assert result.queued == 1
-    assert result.reused_cache == 0
-    assert result.packaged == 1
-    assert len(archives) == 1
-    assert archives[0].read_bytes() != cache.read_bytes()
-    with zipfile.ZipFile(archives[0]) as archive:
-        assert archive.read("WAD/Test.wad.client") == b"live-user-edit"
-
-
-def test_live_packaging_is_deterministic_and_migration_is_idempotent(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    installed = tmp_path / "cslol-manager" / "installed"
-    installed.mkdir(parents=True)
-    create_live_mod(installed, "Handmade Skin", wad=b"custom-wad")
-    first = make_service(tmp_path)
-
-    first_result = first.migrate(installed)
-    first_archive = queued_archives(first_result.archives_dir)[0]
-    original_bytes = first_archive.read_bytes()
-    original_name = first_archive.name
-    with zipfile.ZipFile(first_archive) as archive:
-        assert {member.compress_type for member in archive.infolist()} == {zipfile.ZIP_STORED}
-
-    def unexpected_work(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("repeat migration should use its content ledger")
-
-    monkeypatch.setattr(first, "_index_existing_archives", unexpected_work)
-    monkeypatch.setattr(first, "_package_to_partial", unexpected_work)
-
-    repeated = first.migrate(installed)
-    assert repeated.queued == 0
-    assert repeated.skipped == 1
-    assert len(queued_archives(repeated.archives_dir)) == 1
-
-    second_storage = tmp_path / "ltk-data-2"
-    second = LtkMigrationService(
-        tmp_path / "missing-state.json",
-        tmp_path / "missing-cache",
-        ltk_app_data_dir=second_storage,
-        report_dir=tmp_path / "reports-2",
-    )
-    second_result = second.migrate(installed)
-    second_archive = queued_archives(second_result.archives_dir)[0]
-    assert second_archive.name == original_name
-    assert second_archive.read_bytes() == original_bytes
-
-
-def test_existing_archive_hash_index_is_reused_when_file_identity_is_unchanged(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    service = make_service(tmp_path)
-    archives = tmp_path / "ltk-data" / "archives"
-    archives.mkdir(parents=True)
-    existing = create_fantome(archives / "existing.fantome", wad=b"existing")
-    guard = migration_module._Guard(service, None)
-
-    first = service._index_existing_archives(archives, guard)
-    assert len(first) == 1
-    assert service.archive_index_path.is_file()
-
-    monkeypatch.setattr(
-        migration_module,
-        "_stable_sha256",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unchanged archive should use its VN-owned hash index")
-        ),
-    )
-    repeated = service._index_existing_archives(archives, guard)
-
-    assert repeated == first
-    assert existing.is_file()
-
-
-def test_legacy_history_uses_compatible_packaging_once_and_backfills_content_digest(
-    tmp_path: Path,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    source = create_live_mod(installed, "legacy-custom", wad=b"legacy")
-    service = make_service(tmp_path)
-    archives = tmp_path / "ltk-data" / "archives"
-    archives.mkdir(parents=True)
-    prepared = service._prepare_mod(source)
-    legacy_package = service._package_to_partial(
-        prepared.tree,
-        archives,
-        migration_module._Guard(service, None),
-        fast=False,
-    )
-    legacy_digest = migration_module._plain_sha256(legacy_package)
-    legacy_package.unlink()
-    service.migration_state_path.parent.mkdir(parents=True, exist_ok=True)
-    service.migration_state_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "packages": {
-                    legacy_digest: {
-                        "source": str(source),
-                        "name": "legacy-custom",
-                        "queued_at": "2026-01-01T00:00:00+00:00",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    result = service.migrate(installed)
-
-    assert result.queued == 0
-    assert result.skipped == 1
-    assert queued_archives(archives) == []
-    state = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert state["packages"][legacy_digest]["content_sha256"] == prepared.fingerprint.sha256
-
-
-def test_deduplicates_same_bytes_already_queued_as_modpkg(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "custom")
-    first = make_service(tmp_path)
-    first_result = first.migrate(installed)
-    generated = queued_archives(first_result.archives_dir)[0]
-    duplicate = first_result.archives_dir / "already-there.modpkg"
-    generated.replace(duplicate)
-    first.migration_state_path.unlink()
-
-    repeated = first.migrate(installed)
-
-    assert repeated.skipped == 1
-    assert repeated.queued == 0
-    assert duplicate.is_file()
-    assert queued_archives(repeated.archives_dir) == []
-
-    duplicate.unlink()
-    after_consumption = first.migrate(installed)
-    assert after_consumption.skipped == 1
-    assert after_consumption.queued == 0
-    assert queued_archives(after_consumption.archives_dir) == []
-
-
-def test_consumed_archive_is_skipped_until_explicit_history_reset(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "custom", wad=b"history-test")
-    ledger = tmp_path / "vn-owned-state" / "migration.json"
-    service = LtkMigrationService(
-        tmp_path / "managed.json",
-        tmp_path / "cache",
-        ltk_app_data_dir=tmp_path / "ltk-data",
-        report_dir=tmp_path / "reports",
-        migration_state_path=ledger,
-    )
-
-    first = service.migrate(installed)
-    archive = queued_archives(first.archives_dir)[0]
-    archive.unlink()  # LTK consumes archives after importing them.
-
-    repeated = service.migrate(installed)
-    assert repeated.queued == 0
-    assert repeated.skipped == 1
-    assert queued_archives(repeated.archives_dir) == []
-    state = json.loads(ledger.read_text(encoding="utf-8"))
-    assert state["schema_version"] == 1
-    assert len(state["packages"]) == 1
-    record = next(iter(state["packages"].values()))
-    assert record["source"].endswith("custom")
-    assert record["name"] == "custom"
-    assert record["queued_at"]
-    fingerprint = inspect_extracted_mod(installed / "custom")
-    assert fingerprint is not None
-    assert record["content_sha256"] == fingerprint.sha256
-    assert not list(ledger.parent.glob("*.tmp"))
-
-    service.forget_history()
-    assert json.loads(ledger.read_text(encoding="utf-8"))["packages"] == {}
-    after_reset = service.migrate(installed)
-    assert after_reset.queued == 1
-    assert after_reset.skipped == 0
-
-
-def test_malformed_or_oversized_history_fails_before_ltk_mutation(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "custom")
-    ledger = tmp_path / "state" / "ltk_migration_state.json"
-    ledger.parent.mkdir()
-    ledger.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "packages": {"not-a-sha256": {"source": "x", "name": "x", "queued_at": "x"}},
-            }
-        ),
-        encoding="utf-8",
-    )
-    service = make_service(tmp_path)
-
-    with pytest.raises(MigrationHistoryError, match="invalid package digest"):
-        service.migrate(installed)
-    assert not (tmp_path / "ltk-data").exists()
-
-    # Explicit reset remains available to recover a corrupt regular ledger.
-    service.forget_history()
-    assert service.migrate(installed).queued == 1
-
-    other = tmp_path / "oversized" / "installed"
-    other.mkdir(parents=True)
-    create_live_mod(other, "custom")
-    oversized_ledger = tmp_path / "oversized-state.json"
-    oversized_ledger.write_bytes(b"x" * 65)
-    limited = LtkMigrationService(
-        tmp_path / "other-managed.json",
-        tmp_path / "other-cache",
-        ltk_app_data_dir=tmp_path / "other-ltk",
-        migration_state_path=oversized_ledger,
-        max_history_bytes=64,
-    )
-    with pytest.raises(MigrationHistoryError, match="size limit"):
-        limited.migrate(other)
-    assert not (tmp_path / "other-ltk").exists()
-
-
-class _CancelAfterChecks:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self.calls = 0
-
-    def is_set(self) -> bool:
-        self.calls += 1
-        return self.calls >= self.limit
-
-
-def test_cancellation_removes_partial_archive_and_writes_partial_report(
-    tmp_path: Path,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "large", wad=b"x" * (4 * 1024 * 1024))
-    cancelled = _CancelAfterChecks(limit=10)
-    service = make_service(tmp_path)
-
-    result = service.migrate(installed, cancel_event=cancelled)
-
-    assert result.cancelled
-    assert result.queued == 0
-    assert result.report_path.is_file()
-    assert not list(result.archives_dir.glob("*.partial"))
-    assert not queued_archives(result.archives_dir)
-
-
-def test_cancellation_keeps_each_completed_queue_durable_in_history(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "first", wad=b"first")
-    create_live_mod(installed, "second", wad=b"second")
-    cancelled = threading.Event()
-
-    def cancel_after_first(event: MigrationProgress) -> None:
-        if event.phase == "migrating" and event.completed == 1:
-            cancelled.set()
-
-    service = make_service(tmp_path)
-    partial = service.migrate(
-        installed,
-        cancel_event=cancelled,
-        progress=cancel_after_first,
-    )
-
-    assert partial.cancelled
-    assert partial.queued == 1
-    state = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert len(state["packages"]) == 1
-    queued_archives(partial.archives_dir)[0].unlink()
-
-    resumed = service.migrate(installed)
-    assert resumed.skipped == 1
-    assert resumed.queued == 1
-    final_state = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert len(final_state["packages"]) == 2
-
-
-def test_ledger_write_failure_rolls_back_newly_queued_archive(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "custom")
-    service = make_service(tmp_path)
-
-    def fail_history_write(_path: Path, _value: bytes) -> None:
-        raise OSError("disk full")
-
-    monkeypatch.setattr(migration_module, "atomic_write_bytes", fail_history_write)
-
-    with pytest.raises(MigrationHistoryError, match="persist"):
-        service.migrate(installed)
-
-    assert not queued_archives(tmp_path / "ltk-data" / "archives")
-    assert not list((tmp_path / "ltk-data" / "archives").glob("*.partial"))
-
-
-def test_many_packages_use_bounded_history_checkpoints(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    for index in range(130):
-        create_live_mod(
-            installed,
-            f"mod-{index:03d}",
-            wad=f"wad-{index}".encode(),
-        )
-    service = make_service(tmp_path)
-    real_atomic_write = real_atomic_write_bytes
-    history_writes = 0
-
-    def count_history_write(path: Path, value: bytes) -> None:
-        nonlocal history_writes
-        if path == service.migration_state_path:
-            history_writes += 1
-        real_atomic_write(path, value)
-
-    monkeypatch.setattr(migration_module, "atomic_write_bytes", count_history_write)
-
-    result = service.migrate(installed)
-
-    assert result.queued == 130
-    assert history_writes == 3  # 64, 128, and the final two records.
-    state = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert len(state["packages"]) == 130
-
-
-def test_failed_checkpoint_rolls_back_only_work_after_last_durable_boundary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    for index in range(5):
-        create_live_mod(installed, f"mod-{index}", wad=f"wad-{index}".encode())
-    service = LtkMigrationService(
-        tmp_path / "state" / "managed_skins.json",
-        tmp_path / "cache",
-        ltk_app_data_dir=tmp_path / "ltk-data",
-        report_dir=tmp_path / "reports",
-        history_checkpoint_records=2,
-    )
-    real_atomic_write = real_atomic_write_bytes
-    write_calls = 0
-
-    def fail_second_checkpoint(path: Path, value: bytes) -> None:
-        nonlocal write_calls
-        write_calls += 1
-        if write_calls == 2:
-            raise OSError("checkpoint disk failure")
-        real_atomic_write(path, value)
-
-    monkeypatch.setattr(migration_module, "atomic_write_bytes", fail_second_checkpoint)
-
-    with pytest.raises(MigrationHistoryError, match="persist"):
-        service.migrate(installed)
-
-    assert write_calls == 2
-    assert len(queued_archives(tmp_path / "ltk-data" / "archives")) == 2
-    durable = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert len(durable["packages"]) == 2
-    assert not list((tmp_path / "ltk-data" / "archives").glob("*.partial"))
-
-    monkeypatch.setattr(migration_module, "atomic_write_bytes", real_atomic_write)
-    resumed = service.migrate(installed)
-    assert resumed.skipped == 2
-    assert resumed.queued == 3
-    final = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert len(final["packages"]) == 5
-
-
-def test_manager_start_after_first_queue_flushes_blocked_partial_history(
-    tmp_path: Path,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "first", wad=b"first")
-    create_live_mod(installed, "second", wad=b"second")
-    ltk_running = False
-
-    def start_ltk_after_first(event: MigrationProgress) -> None:
-        nonlocal ltk_running
-        if event.phase == "migrating" and event.completed == 1:
-            ltk_running = True
-
-    service = make_service(tmp_path, ltk_is_running=lambda: ltk_running)
-    partial = service.migrate(installed, progress=start_ltk_after_first)
-
-    assert partial.blocked
-    assert partial.queued == 1
-    state = json.loads(service.migration_state_path.read_text(encoding="utf-8"))
-    assert len(state["packages"]) == 1
-
-
-def test_manager_starting_during_work_returns_blocked_partial_result(
-    tmp_path: Path,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "custom")
-    ltk_running = False
-
-    def report_progress(event: MigrationProgress) -> None:
-        nonlocal ltk_running
-        if event.phase == "migrating":
-            ltk_running = True
-
-    service = make_service(tmp_path, ltk_is_running=lambda: ltk_running)
-
-    result = service.migrate(installed, progress=report_progress)
-
-    assert result.blocked
-    assert result.queued == 0
-    assert any("Close LTK Manager" in issue.reason for issue in result.issues)
-    assert result.report_path.is_file()
-
-
-def test_report_write_failure_does_not_hide_a_durable_migration_result(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    service = make_service(tmp_path)
-
-    def fail_report(_path: Path, _value: object) -> None:
-        raise OSError("report disk full")
-
-    monkeypatch.setattr(migration_module, "atomic_write_json", fail_report)
-
-    result = service.migrate(installed)
-
-    assert result.status == "completed"
-    assert result.report_error == "report disk full"
-    assert not result.report_path.exists()
-
-
-def test_malformed_and_over_limit_mods_are_reported_without_touching_source(
-    tmp_path: Path,
-) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    malformed = installed / "missing-wad"
-    (malformed / "META").mkdir(parents=True)
-    metadata = malformed / "META" / "info.json"
-    metadata.write_text("{}", encoding="utf-8")
-    original = metadata.read_bytes()
-    service = make_service(tmp_path, max_members_per_mod=1)
-
-    result = service.migrate(installed)
-
-    assert result.status == "completed"
-    assert result.failed == 1
-    assert result.queued == 0
-    assert result.issues
-    assert metadata.read_bytes() == original
-    report = json.loads(result.report_path.read_text(encoding="utf-8"))
-    assert report["failed"] == 1
-    assert report["issues"][0]["source"].endswith("missing-wad")
-
-
-def test_pre_cancelled_migration_is_reported_without_archives(tmp_path: Path) -> None:
-    installed = tmp_path / "installed"
-    installed.mkdir()
-    create_live_mod(installed, "custom")
-    cancelled = threading.Event()
-    cancelled.set()
-    service = make_service(tmp_path)
-
-    result = service.migrate(installed, cancel_event=cancelled)
-
-    assert result.cancelled
-    assert not result.archives_dir.exists()
-    assert result.report_path.is_file()
+def test_separate_index_files_are_required(workspace: Workspace) -> None:
+    shared = workspace.root / "shared-index.json"
+    with pytest.raises(ValueError, match="must be separate"):
+        workspace.service(archive_index_path=shared, package_index_path=shared)

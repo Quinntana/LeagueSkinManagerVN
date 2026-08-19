@@ -225,3 +225,93 @@ def test_concurrent_cleanup_and_invalid_limit_are_rejected(tmp_path: Path) -> No
             service.remove_all()
     finally:
         service._lock.release()
+
+
+def test_remove_mods_removes_only_the_named_mod_and_all_its_references(
+    tmp_path: Path,
+) -> None:
+    storage = populated_storage(tmp_path)
+    (storage / "wad-reports.json").write_text(
+        json.dumps({"version": 2, "reports": {"one": {"modId": "one"}, "two": {"modId": "two"}}}),
+        encoding="utf-8",
+    )
+    service = LtkSkinCleanupService(lambda: storage, ltk_is_running=lambda: False)
+
+    result = service.remove_mods(["one"])
+
+    assert result.removed_ids == ("one",)
+    assert (result.archives_removed, result.metadata_directories_removed) == (1, 1)
+    assert result.reports_removed == 1
+    # library entry + enabledMods + modOrder + layerStates + root folder = 5
+    assert result.references_cleared == 5
+
+    # The removed mod is gone everywhere.
+    assert not (storage / "archives" / "one.fantome").exists()
+    assert not (storage / "mods" / "one").exists()
+    library = json.loads((storage / "library.json").read_text(encoding="utf-8"))
+    assert [mod["id"] for mod in library["mods"]] == ["two"]
+    profile = library["profiles"][0]
+    assert profile["enabledMods"] == ["two"]
+    assert profile["modOrder"] == ["two"]
+    assert profile["layerStates"] == {}
+    assert [folder["modIds"] for folder in library["folders"]] == [["two"], ["two"]]
+    reports = json.loads((storage / "wad-reports.json").read_text(encoding="utf-8"))
+    assert list(reports["reports"]) == ["two"]
+
+    # Everything belonging to the other mod survives untouched.
+    assert (storage / "archives" / "two.modpkg").exists()
+    assert (storage / "mods" / "two").exists()
+    assert (storage / "profiles" / "default").exists()
+    assert library["activeProfileId"] == "profile-id"
+    assert (storage / "settings.json").exists()
+
+
+def test_remove_mods_is_a_no_op_for_unknown_or_empty_input(tmp_path: Path) -> None:
+    storage = populated_storage(tmp_path)
+    before = (storage / "library.json").read_text(encoding="utf-8")
+    service = LtkSkinCleanupService(lambda: storage, ltk_is_running=lambda: False)
+
+    assert service.remove_mods([]).removed == 0
+    assert (storage / "library.json").read_text(encoding="utf-8") == before
+
+    result = service.remove_mods(["absent-mod"])
+
+    assert result.removed_ids == ("absent-mod",)
+    assert (result.archives_removed, result.metadata_directories_removed) == (0, 0)
+    library = json.loads((storage / "library.json").read_text(encoding="utf-8"))
+    assert [mod["id"] for mod in library["mods"]] == ["one", "two"]
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ["../escape", "with/slash", "with\\slash", "", "a" * 129, "has space"],
+)
+def test_remove_mods_rejects_unsafe_identifiers(tmp_path: Path, identifier: str) -> None:
+    storage = populated_storage(tmp_path)
+    service = LtkSkinCleanupService(lambda: storage, ltk_is_running=lambda: False)
+
+    with pytest.raises(LtkSkinCleanupError, match="Unsafe LTK mod identifier"):
+        service.remove_mods([identifier])
+
+    assert (storage / "archives" / "one.fantome").exists()
+
+
+def test_remove_mods_is_blocked_while_ltk_is_running(tmp_path: Path) -> None:
+    storage = populated_storage(tmp_path)
+    service = LtkSkinCleanupService(lambda: storage, ltk_is_running=lambda: True)
+
+    with pytest.raises(LtkSkinCleanupBlockedError, match="Close LTK Manager"):
+        service.remove_mods(["one"])
+
+    assert (storage / "archives" / "one.fantome").exists()
+
+
+def test_remove_mods_deduplicates_repeated_identifiers(tmp_path: Path) -> None:
+    storage = populated_storage(tmp_path)
+    service = LtkSkinCleanupService(lambda: storage, ltk_is_running=lambda: False)
+
+    result = service.remove_mods(["one", "one", "two"])
+
+    assert result.removed_ids == ("one", "two")
+    library = json.loads((storage / "library.json").read_text(encoding="utf-8"))
+    assert library["mods"] == []

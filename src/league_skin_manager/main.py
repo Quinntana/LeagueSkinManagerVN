@@ -21,7 +21,8 @@ from .config import (
     RuntimeConfig,
 )
 from .controller import AppController, AppState
-from .desktop_host import DesktopBoundary, DesktopHost
+from .cooldown_timer import CooldownTimerStore, CsvCooldownEventSink, SystemClock
+from .cooldown_window import CooldownBoard, create_cooldown_window
 from .installation import InstallationError, InstallLayout, is_installed_executable
 from .logging_setup import configure_logging
 from .ltk_cleanup import LtkSkinCleanupService
@@ -31,7 +32,8 @@ from .ltk_companion import (
     LtkReleaseClient,
     PowerShellAuthenticodeVerifier,
 )
-from .ltk_migration import LtkMigrationError, LtkMigrationService
+from .ltk_library import summarize_library
+from .ltk_migration import LtkMigrationService, LtkReconcileError
 from .ltk_tasks import LtkTaskCoordinator, wait_for_ltk_tasks
 from .manager_update import ManagerReleaseClient, ManagerUpdater
 from .operation_gate import OperationGate
@@ -43,16 +45,15 @@ from .uninstall import (
     launch_installed_uninstaller_after_exit,
     validated_installed_uninstaller,
 )
+from .window_host import WindowBoundary, WindowHost
 from .windows_integration import (
     InstanceActivationEvent,
     ProcessLauncher,
     SingleInstanceMutex,
     StartupRegistration,
-    copy_text_to_clipboard,
     open_path,
     running_executable,
 )
-from .windows_prompts import prompt_for_ltk_migration_source
 from .workflow import SynchronizationWorkflow
 
 
@@ -64,10 +65,10 @@ def _confirm_remove_all_ltk_skins(storage_dir: Path) -> bool:
     message = (
         "Permanently remove every skin from LTK Manager?\n\n"
         f"LTK skin storage: {storage_dir}\n\n"
-        "This removes all archives, extracted metadata, WAD reports, and generated profile "
-        "overlays in that LTK library, including skins not installed by LeagueSkinManagerVN.\n\n"
-        "LTK Manager itself, its settings, logs, and your named profile definitions are kept. "
-        "Close LTK Manager and its patcher before continuing. This cannot be undone."
+        "This removes every skin package, extracted metadata, WAD report, and generated "
+        "profile overlay in that LTK library, including any skin you added yourself.\n\n"
+        "LTK Manager itself, its settings, and its logs are kept. A later rebuild restores "
+        "the current skin set. Close LTK Manager and its patcher before continuing."
     )
     yes = 6
     yes_no = 0x00000004
@@ -82,26 +83,67 @@ def _confirm_remove_all_ltk_skins(storage_dir: Path) -> bool:
     return int(result) == yes
 
 
-def _confirm_reset_ltk_history() -> bool:
-    """Confirm a potentially surprising requeue operation with No as the default."""
+def _launch_preferred_manager(
+    *,
+    launcher: ProcessLauncher,
+    manager_dir: Path,
+    manager_executable: Path,
+    locate_ltk: Callable[[], object | None],
+    ltk_is_running: Callable[[], bool],
+    logger: logging.Logger,
+) -> bool:
+    """Start the preferred skin manager backend for a League session.
 
-    if sys.platform != "win32":
-        return False
-    yes = 6
-    yes_no = 0x00000004
-    warning = 0x00000030
-    default_no = 0x00000100
-    result = ctypes.windll.user32.MessageBoxW(
-        None,
-        (
-            "Reset LeagueSkinManagerVN's record of packages previously queued for LTK?\n\n"
-            "The next manual port may queue skins that are already installed in LTK. "
-            "No CSLOL or LTK files will be deleted."
-        ),
-        "Reset LTK port history",
-        yes_no | warning | default_no,
-    )
-    return int(result) == yes
+    The installed official LTK Manager is preferred; the app-owned CSLOL
+    Manager remains the fallback so the workflow keeps working before LTK has
+    been installed or if its executable cannot be started.
+    """
+
+    installation: object | None
+    try:
+        if ltk_is_running():
+            return True
+        installation = locate_ltk()
+    except Exception:
+        logger.exception("Could not inspect the LTK installation; using CSLOL Manager")
+        installation = None
+    if installation is not None:
+        executable = getattr(installation, "executable", None)
+        if isinstance(executable, Path) and launcher.launch(executable):
+            return True
+        logger.warning("Installed LTK Manager could not be started; using CSLOL Manager")
+    if launcher.is_running_under(manager_dir):
+        return True
+    return launcher.launch(manager_executable)
+
+
+class _LeagueExitObserver:
+    """Forward monitor callbacks and signal after the League client exits."""
+
+    def __init__(
+        self,
+        inner: LeagueProcessMonitor,
+        on_exit: Callable[[], object],
+        logger: logging.Logger,
+    ) -> None:
+        self._inner = inner
+        self._on_exit = on_exit
+        self._logger = logger
+
+    def run(
+        self,
+        stop_event: Event,
+        changed: Callable[[int | None], None],
+    ) -> None:
+        def observed(pid: int | None) -> None:
+            changed(pid)
+            if pid is None and not stop_event.is_set():
+                try:
+                    self._on_exit()
+                except Exception:
+                    self._logger.exception("League-exit follow-up work failed")
+
+        self._inner.run(stop_event, observed)
 
 
 def _wait_for_workers(
@@ -115,15 +157,15 @@ def _wait_for_workers(
         logger.warning("Background work is still stopping; retaining app resources and mutex")
 
 
-def _wait_for_desktop(
-    desktop_host: DesktopHost,
+def _wait_for_window(
+    window_host: WindowHost,
     timeout_seconds: float,
     logger: logging.Logger,
 ) -> None:
     """Retain process ownership until the optional non-daemon UI thread exits."""
 
-    while not desktop_host.stop(timeout_seconds):
-        logger.warning("Optional desktop is still stopping; retaining app resources and mutex")
+    while not window_host.stop(timeout_seconds):
+        logger.warning("Optional window is still stopping; retaining app resources and mutex")
 
 
 def _listen_for_activation(
@@ -148,44 +190,59 @@ def _listen_for_activation(
             logger.exception("Could not handle the application activation request")
 
 
-def _copy_cslol_manager_path(
-    manager_dir: Path,
-    clipboard_sink: Callable[[str], object],
-    notification_sink: Callable[[str, str], object],
-) -> str:
-    """Copy the CSLOL root beside the installed folder and return the copied text."""
-
-    manager_path = str(manager_dir)
-    clipboard_sink(manager_path)
-    notification_sink("CSLOL Manager folder copied", manager_path)
-    return manager_path
-
-
-def _refresh_ltk_port_status(
-    migration: LtkMigrationService,
-    installed_dir: Path,
+def _refresh_ltk_library_summary(
+    reconciler: LtkMigrationService,
     tray: TrayApplication,
+    ltk_is_installed: Callable[[], bool],
     logger: logging.Logger,
+    *,
+    with_drift: bool = True,
 ) -> None:
-    """Refresh the read-only VN-to-LTK handoff summary without changing either library."""
+    """Refresh the read-only LTK library summary without changing anything.
+
+    ``with_drift`` is False on the startup path so the tray becomes visible
+    without first comparing every package against LTK's storage.
+    """
 
     try:
-        status = migration.inspect_managed_port_status(installed_dir)
-    except (LtkMigrationError, ManagedStateError) as exc:
-        logger.warning("Could not inspect the VN-to-LTK handoff state: %s", exc)
-        tray.update_ltk_port_status(
-            pending=None,
-            total=None,
-            unavailable=True,
+        installed = ltk_is_installed()
+    except Exception:
+        logger.exception("Could not inspect the LTK installation state")
+        installed = False
+    if not installed:
+        tray.update_ltk_library(installed=False)
+        return
+    summary = summarize_library(reconciler.resolve_storage_dir())
+    if summary is None:
+        tray.update_ltk_library(installed=True)
+        return
+    if not with_drift:
+        tray.update_ltk_library(
+            installed=True,
+            in_library=summary.in_library,
+            enabled=summary.enabled,
         )
         return
-    tray.update_ltk_port_status(
-        pending=status.pending,
-        total=status.total,
+    try:
+        baseline = reconciler.inspect_baseline()
+    except (LtkReconcileError, ManagedStateError) as exc:
+        logger.warning("Could not compare LTK with the current skin set: %s", exc)
+        tray.update_ltk_library(
+            installed=True,
+            in_library=summary.in_library,
+            enabled=summary.enabled,
+        )
+        return
+    tray.update_ltk_library(
+        installed=True,
+        in_library=summary.in_library,
+        enabled=summary.enabled,
+        expected=baseline.expected,
+        pending=baseline.missing + baseline.extra,
     )
 
 
-def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
+def run(*, sync_on_start: bool = True) -> int:
     logger = logging.getLogger("league_skin_manager")
     if sys.platform != "win32":
         logger.error("LeagueSkinManagerVN is Windows-only")
@@ -218,7 +275,7 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
     ltk_companion: LtkCompanion | None = None
     ltk_tasks: LtkTaskCoordinator | None = None
     controller: AppController | None = None
-    desktop_host: DesktopHost | None = None
+    cooldown_host: WindowHost | None = None
     tray: TrayApplication | None = None
     activation_stop = Event()
     activation_thread: Thread | None = None
@@ -284,27 +341,47 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
         runtime_label = f"{'Installed' if installed_copy else 'Portable'} v{APP_VERSION}"
         logger.info("Runtime ownership: %s (%s)", runtime_label, executable)
 
-        def launch_manager() -> bool:
-            if launcher.is_running_under(paths.manager_dir):
-                return True
-            return launcher.launch(manager_executable)
-
         def ltk_is_running() -> bool:
             return launcher.is_any_running(LTK_PROCESS_NAMES)
 
         ltk_locator = LtkInstallLocator(excluded_roots=(paths.ltk_cache_dir,))
-        migration = LtkMigrationService(
+
+        def launch_manager() -> bool:
+            return _launch_preferred_manager(
+                launcher=launcher,
+                manager_dir=paths.manager_dir,
+                manager_executable=manager_executable,
+                locate_ltk=ltk_locator.locate,
+                ltk_is_running=ltk_is_running,
+                logger=logger.getChild("manager_launch"),
+            )
+
+        def ltk_is_installed() -> bool:
+            return ltk_locator.locate() is not None
+
+        # Both boundaries are late-bound on purpose: the cleanup service needs
+        # the reconciler's storage resolver, and these are only ever invoked
+        # from a reconcile long after composition has finished.
+        def remove_ltk_mods(mod_ids: tuple[str, ...]) -> object:
+            return cleanup.remove_mods(mod_ids)
+
+        def clear_ltk_toggles() -> int:
+            return cleanup.clear_enabled_mods()
+
+        reconciler = LtkMigrationService(
             paths.managed_manifest_file,
             paths.package_cache_dir,
             ltk_app_data_dir=paths.ltk_data_dir,
             report_dir=paths.migration_report_dir,
-            migration_state_path=paths.ltk_migration_state_file,
             archive_index_path=paths.ltk_archive_index_file,
+            package_index_path=paths.ltk_package_index_file,
             cslol_is_running=lambda: launcher.is_running_under(paths.manager_dir),
             ltk_is_running=ltk_is_running,
+            remove_ltk_mods=remove_ltk_mods,
+            clear_ltk_toggles=clear_ltk_toggles,
         )
         cleanup = LtkSkinCleanupService(
-            migration.resolve_storage_dir,
+            reconciler.resolve_storage_dir,
             ltk_is_running=ltk_is_running,
         )
 
@@ -330,14 +407,6 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
             open_path(paths.installed_dir)
             return True
 
-        def copy_cslol_manager_path() -> bool:
-            _copy_cslol_manager_path(
-                paths.manager_dir,
-                copy_text_to_clipboard,
-                notify_user,
-            )
-            return True
-
         def open_data() -> bool:
             open_path(paths.data_dir)
             return True
@@ -353,44 +422,29 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
             open_path(log_file)
             return True
 
-        def open_ltk_install() -> bool:
-            installation = ltk_locator.locate()
-            if installation is None:
+        def open_ltk_skins() -> bool:
+            storage_dir = reconciler.resolve_storage_dir()
+            archives_dir = storage_dir / "archives"
+            target = archives_dir if archives_dir.is_dir() else storage_dir
+            if not target.is_dir():
                 notify_user(
-                    "LTK Manager",
-                    "LTK Manager is not installed yet. Use Open or install LTK Manager first.",
-                )
-                return False
-            open_path(installation.executable.parent)
-            return True
-
-        def open_ltk_storage() -> bool:
-            storage_dir = migration.resolve_storage_dir()
-            if not storage_dir.is_dir():
-                notify_user(
-                    "LTK skin storage",
+                    "Skins in LTK",
                     "LTK has not created its skin storage yet. Open LTK Manager once first.",
                 )
                 return False
-            open_path(storage_dir)
+            open_path(target)
             return True
 
         def request_ltk_cleanup() -> bool:
-            storage_dir = migration.resolve_storage_dir()
+            storage_dir = reconciler.resolve_storage_dir()
             if not _confirm_remove_all_ltk_skins(storage_dir):
                 return False
             return active_ltk_tasks().request_cleanup()
 
-        def request_ltk_migration() -> bool:
-            source_dir = prompt_for_ltk_migration_source(paths.installed_dir)
-            if source_dir is None:
+        def open_cooldowns() -> bool:
+            if cooldown_host is None:
                 return False
-            return active_ltk_tasks().request_migration(source_dir)
-
-        def request_ltk_history_reset() -> bool:
-            if not _confirm_reset_ltk_history():
-                return False
-            return active_ltk_tasks().request_history_reset()
+            return cooldown_host.show()
 
         def active_controller() -> AppController:
             if controller is None:
@@ -406,8 +460,6 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
             controller_started = active_controller().start()
             if not active_ltk_tasks().start():
                 logger.error("LTK companion background worker could not be started")
-            if show_window and desktop_host is not None:
-                desktop_host.show()
             return controller_started
 
         def shutdown_services() -> bool:
@@ -417,20 +469,14 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
 
         def exit_from_tray() -> bool:
             result = shutdown_services()
-            if result and desktop_host is not None:
-                result = desktop_host.stop(runtime.shutdown_timeout_seconds)
+            if result and cooldown_host is not None:
+                result = cooldown_host.stop(runtime.shutdown_timeout_seconds)
                 if not result:
                     notify_user(
                         "LeagueSkinManagerVN",
-                        "The optional skin-library window is still closing. "
-                        "Close any open dialog, then try Exit again.",
+                        "The cooldown timer window is still closing. "
+                        "Close it, then try Exit again.",
                     )
-            return result
-
-        def exit_from_desktop() -> bool:
-            result = shutdown_services()
-            if result and tray is not None:
-                tray.stop()
             return result
 
         def uninstall_from_tray() -> bool:
@@ -452,10 +498,12 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
                 return False
             if not shutdown_services():
                 return False
-            if desktop_host is not None and not desktop_host.stop(runtime.shutdown_timeout_seconds):
+            if cooldown_host is not None and not cooldown_host.stop(
+                runtime.shutdown_timeout_seconds
+            ):
                 notify_user(
                     "Uninstall LeagueSkinManagerVN",
-                    "Close the optional skin-library window or any open dialog, then try again.",
+                    "Close the cooldown timer window, then try again.",
                 )
                 return False
             try:
@@ -470,52 +518,37 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
                 return False
             return True
 
-        def create_desktop() -> DesktopBoundary:
-            from .desktop import DesktopApplication
-
-            return DesktopApplication(
-                catalog_path=paths.managed_manifest_file,
-                installed_dir=paths.installed_dir,
-                data_dir=paths.data_dir,
-                log_file=paths.log_dir / "LeagueSkinManagerVN.log",
-                on_sync=lambda: active_controller().request_sync(),
-                on_start_manager=lambda: active_controller().start_manager(),
-                on_start_ltk=lambda: active_ltk_tasks().request_start(),
-                on_migrate_to_ltk=lambda source: active_ltk_tasks().request_migration(source),
-                on_cancel_ltk_migration=lambda: active_ltk_tasks().cancel_migration(),
-                on_reset_ltk_migration=lambda: active_ltk_tasks().request_history_reset(),
-                on_exit=exit_from_desktop,
-                startup_enabled=startup_enabled,
-                set_startup_enabled=set_startup_enabled,
-                path_opener=open_path,
-                logger=logger.getChild("desktop"),
+        def create_cooldowns() -> WindowBoundary:
+            sink = CsvCooldownEventSink(paths.cooldown_event_file)
+            board = CooldownBoard(
+                CooldownTimerStore(SystemClock(), sink),
+                flush=sink.flush,
+                logger=logger.getChild("cooldowns"),
             )
+            return create_cooldown_window(board, logger.getChild("cooldown_window"))
 
-        desktop_host = DesktopHost(
-            create_desktop,
+        cooldown_host = WindowHost(
+            create_cooldowns,
+            title="Enemy cooldown timers",
+            thread_name="cooldown-timer-ui",
             failure_sink=notify_user,
-            logger=logger.getChild("desktop_host"),
+            logger=logger.getChild("cooldown_host"),
         )
         tray = TrayApplication(
             on_start=start_services,
-            on_show=desktop_host.show,
             on_sync=lambda: active_controller().request_sync(),
-            on_start_manager=lambda: active_controller().start_manager(),
+            on_open_ltk=lambda: active_ltk_tasks().request_start(),
+            on_open_cooldowns=open_cooldowns,
+            on_open_ltk_skins=open_ltk_skins,
             on_open_cslol_skins=open_cslol_skins,
-            on_copy_cslol_manager_path=copy_cslol_manager_path,
-            on_start_ltk=lambda: active_ltk_tasks().request_start(),
-            on_open_ltk_install=open_ltk_install,
-            on_open_ltk_storage=open_ltk_storage,
-            on_migrate_to_ltk=request_ltk_migration,
-            on_cancel_ltk_migration=lambda: active_ltk_tasks().cancel_migration(),
-            on_reset_ltk_migration=request_ltk_history_reset,
-            on_remove_ltk_skins=request_ltk_cleanup,
             on_open_data=open_data,
             on_open_log=open_log,
-            startup_enabled=startup_enabled,
-            set_startup_enabled=set_startup_enabled,
+            on_rebuild_library=lambda: active_ltk_tasks().request_rebuild(),
+            on_remove_ltk_skins=request_ltk_cleanup,
             on_uninstall=uninstall_from_tray,
             on_exit=exit_from_tray,
+            startup_enabled=startup_enabled,
+            set_startup_enabled=set_startup_enabled,
             runtime_label=runtime_label,
             uninstall_available=installed_copy,
             startup_available=installed_copy or startup_enabled(),
@@ -540,24 +573,20 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
                 return
             tray.update_library(len(catalog.skins), catalog.patch)
 
-        def refresh_ltk_port_summary() -> None:
+        def refresh_ltk_library_summary(*, with_drift: bool = True) -> None:
             if tray is None:
                 return
-            _refresh_ltk_port_status(
-                migration,
-                paths.installed_dir,
+            _refresh_ltk_library_summary(
+                reconciler,
                 tray,
-                logger.getChild("ltk_port_status"),
+                ltk_is_installed,
+                logger.getChild("ltk_library"),
+                with_drift=with_drift,
             )
 
-        def update_ltk_status(detail: str, migration_active: bool) -> None:
+        def update_ltk_status(detail: str, rebuild_active: bool) -> None:
             if tray is not None:
-                tray.update_ltk_status(detail, migration_active=migration_active)
-            if desktop_host is not None:
-                desktop_host.update_ltk_status(
-                    detail,
-                    migration_active=migration_active,
-                )
+                tray.update_ltk_status(detail, rebuild_active=rebuild_active)
 
         def notify_from_ltk(title: str, message: str) -> None:
             if tray is not None:
@@ -565,40 +594,52 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
 
         ltk_tasks = LtkTaskCoordinator(
             companion=ltk_companion,
-            migration=migration,
+            reconciler=reconciler,
             cleanup=cleanup,
             operation_gate=operation_gate,
             ltk_is_running=ltk_is_running,
+            ltk_is_installed=ltk_is_installed,
             resume_cslol_launches=lambda: active_controller().resume_pending_manager_launches(),
             notify_sink=notify_from_ltk,
             status_sink=update_ltk_status,
-            port_state_changed_sink=refresh_ltk_port_summary,
+            library_state_changed_sink=refresh_ltk_library_summary,
             logger=logger.getChild("ltk_tasks"),
         )
 
         def update_status(state: AppState, detail: str) -> None:
             if tray is not None:
                 tray.update_status(state, detail)
-            if desktop_host is not None:
-                desktop_host.update_status(state, detail)
             if state in (AppState.READY, AppState.OFFLINE_READY):
                 refresh_catalog_summary()
-                refresh_ltk_port_summary()
+                refresh_ltk_library_summary()
+            if state is AppState.READY and ltk_tasks is not None:
+                # A successful sync is the event that can change the skin set,
+                # so it is also when LTK's library may have drifted from it.
+                ltk_tasks.request_rebuild(automatic=True)
 
         controller = AppController(
             sync=workflow,
             launcher=launch_manager,
-            monitor=monitor,
+            monitor=_LeagueExitObserver(
+                monitor,
+                # A deferred rebuild retries once the game session ends and its
+                # manager processes are expected to wind down.
+                lambda: active_ltk_tasks().retry_deferred_rebuild(),
+                logger.getChild("league_exit"),
+            ),
             status_sink=update_status,
             notify_sink=tray.notify,
             sync_on_start=sync_on_start,
             shutdown_timeout_seconds=runtime.shutdown_timeout_seconds,
             operation_gate=operation_gate,
+            manager_label="Skin manager",
             logger=logger.getChild("controller"),
         )
 
         refresh_catalog_summary()
-        refresh_ltk_port_summary()
+        # Drift is deliberately not computed here: the tray must become visible
+        # before anything inspects LTK's storage. The first rebuild publishes it.
+        refresh_ltk_library_summary(with_drift=False)
         logger.info("Application starting from %s", Path(sys.executable))
         if activation_event is not None:
             activation_thread = Thread(
@@ -609,7 +650,7 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
                     lambda: notify_user(
                         "LeagueSkinManagerVN",
                         "LeagueSkinManagerVN is already running in the system tray. "
-                        "Right-click its icon for sync, CSLOL, LTK, and maintenance tools.",
+                        "Right-click its icon to open LTK, sync skins, or find its folders.",
                     ),
                     logger.getChild("activation"),
                 ),
@@ -639,9 +680,9 @@ def run(*, sync_on_start: bool = True, show_window: bool = False) -> int:
             wait_for_ltk_tasks(ltk_tasks, runtime.shutdown_timeout_seconds, logger)
         if tray is not None:
             tray.stop()
-        if desktop_host is not None:
-            _wait_for_desktop(
-                desktop_host,
+        if cooldown_host is not None:
+            _wait_for_window(
+                cooldown_host,
                 runtime.shutdown_timeout_seconds,
                 logger,
             )
@@ -675,21 +716,13 @@ def main() -> None:
         action="store_true",
         help="Start from installed data without running the startup synchronization.",
     )
-    presentation = parser.add_mutually_exclusive_group()
-    presentation.add_argument(
-        "--show-window",
-        action="store_true",
-        help="Explicitly open the optional searchable skin-library window.",
-    )
-    presentation.add_argument(
+    parser.add_argument(
         "--background",
         action="store_true",
-        help="Legacy compatibility option; tray-only startup is now the default.",
+        help=(
+            "Accepted for compatibility with the Windows startup entry; the tray is "
+            "always the only interface."
+        ),
     )
     arguments = parser.parse_args()
-    raise SystemExit(
-        run(
-            sync_on_start=not arguments.no_sync,
-            show_window=arguments.show_window,
-        )
-    )
+    raise SystemExit(run(sync_on_start=not arguments.no_sync))

@@ -18,8 +18,8 @@ def test_paths_are_side_effect_free_until_ensured(tmp_path: Path) -> None:
     assert paths.data_dir == appdata.resolve() / APP_NAME
     assert paths.installed_dir == paths.manager_dir / "installed"
     assert paths.ltk_data_dir == appdata.resolve() / "dev.leaguetoolkit.manager"
-    assert paths.ltk_migration_state_file == paths.data_dir / "ltk_migration_state.json"
     assert paths.ltk_archive_index_file == paths.data_dir / "ltk_archive_index.json"
+    assert paths.ltk_package_index_file == paths.data_dir / "ltk_package_index.json"
     assert not paths.data_dir.exists()
 
     paths.ensure()

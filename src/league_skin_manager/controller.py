@@ -70,7 +70,7 @@ _DEFAULT_STATUS: dict[AppState, str] = {
 }
 
 _SYNC_GATE_OWNER = "skin synchronization"
-_MANAGER_GATE_OWNER = "CSLOL Manager launch"
+_DEFAULT_MANAGER_LABEL = "CSLOL Manager"
 
 
 class AppController:
@@ -87,11 +87,16 @@ class AppController:
         operation_gate: OperationGate | None = None,
         sync_on_start: bool = True,
         shutdown_timeout_seconds: float = 10.0,
+        manager_label: str = _DEFAULT_MANAGER_LABEL,
         logger: logging.Logger | None = None,
     ) -> None:
         if shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
+        if not manager_label.strip():
+            raise ValueError("manager_label must not be empty")
 
+        self._manager_label = manager_label.strip()
+        self._manager_gate_owner = f"{self._manager_label} launch"
         self._sync = sync
         self._launcher = launcher
         self._monitor = monitor
@@ -312,7 +317,7 @@ class AppController:
         return None
 
     def start_manager(self) -> bool:
-        """Launch CSLOL Manager, or safely queue it behind an active sync."""
+        """Launch the skin manager backend, or safely queue it behind an active sync."""
 
         with self._lock:
             if self._stop_event.is_set():
@@ -324,7 +329,7 @@ class AppController:
                 queued = False
         if queued:
             self._notify(
-                "CSLOL Manager",
+                self._manager_label,
                 "Manager launch queued until skin synchronization finishes.",
             )
             return True
@@ -352,7 +357,7 @@ class AppController:
                     owner = self._operation_gate.current_owner
                 owner_detail = owner or "another maintenance operation"
                 self._notify(
-                    "CSLOL Manager",
+                    self._manager_label,
                     f"Manager launch queued until {owner_detail} finishes.",
                 )
                 return True
@@ -407,18 +412,18 @@ class AppController:
     def _try_acquire_manager_gate(self) -> tuple[bool, OperationLease | None]:
         if self._operation_gate is None:
             return True, None
-        lease = self._operation_gate.try_acquire(_MANAGER_GATE_OWNER)
+        lease = self._operation_gate.try_acquire(self._manager_gate_owner)
         return lease is not None, lease
 
     def _call_launcher(self) -> bool:
         try:
             result = self._launcher()
         except Exception as exc:
-            self._logger.exception("CSLOL Manager launch failed")
-            self._notify("CSLOL Manager", f"Could not start manager: {exc}")
+            self._logger.exception("%s launch failed", self._manager_label)
+            self._notify(self._manager_label, f"Could not start manager: {exc}")
             return False
         if result is False:
-            self._notify("CSLOL Manager", "Could not start manager.")
+            self._notify(self._manager_label, "Could not start manager.")
             return False
         return True
 
@@ -599,8 +604,9 @@ class AppController:
         if not launched:
             launch_kind = "Deferred" if deferred else "Automatic"
             self._logger.warning(
-                "%s CSLOL Manager launch failed for League PID %s",
+                "%s %s launch failed for League PID %s",
                 launch_kind,
+                self._manager_label,
                 pid,
             )
         return launched

@@ -8,7 +8,7 @@ from threading import Event, Lock, current_thread
 import pytest
 
 from league_skin_manager.controller import AppController, AppState, SyncOutcome
-from league_skin_manager.operation_gate import OperationGate
+from league_skin_manager.operation_gate import OperationGate, OperationLease
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -717,3 +717,46 @@ def test_stopping_before_sync_thread_start_releases_gate() -> None:
     assert controller.request_sync() is False
     assert controller.sync_in_progress is False
     assert gate.current_owner is None
+
+
+def test_custom_manager_label_appears_in_notifications_and_gate_owner() -> None:
+    monitor = FakeMonitor()
+    notifications: list[tuple[str, str]] = []
+    owners: list[str] = []
+
+    class RecordingGate(OperationGate):
+        def try_acquire(self, owner: str) -> OperationLease | None:
+            owners.append(owner)
+            return super().try_acquire(owner)
+
+    def launcher() -> bool:
+        raise OSError("manager missing")
+
+    controller = AppController(
+        sync=lambda _stop: None,
+        launcher=launcher,
+        monitor=monitor,
+        notify_sink=lambda title, message: notifications.append((title, message)),
+        operation_gate=RecordingGate(),
+        sync_on_start=False,
+        manager_label="Skin manager",
+    )
+    controller.start()
+    assert monitor.started.wait(1)
+
+    monitor.emit(77)
+    assert notifications == [("Skin manager", "Could not start manager: manager missing")]
+    assert owners == ["Skin manager launch"]
+    assert controller.shutdown() is True
+
+
+def test_blank_manager_label_is_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="manager_label"):
+        AppController(
+            sync=lambda _stop: None,
+            launcher=lambda: True,
+            monitor=FakeMonitor(),
+            manager_label="   ",
+        )

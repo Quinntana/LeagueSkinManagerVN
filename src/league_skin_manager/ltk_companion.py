@@ -16,20 +16,25 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from threading import Event, RLock
+from threading import Event, Lock, RLock
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 import requests
 
+from .atomic import atomic_write_json
 from .config import APP_NAME, LTK_RELEASES_URL
 
 MAX_LTK_INSTALLER_BYTES = 256 * 1024 * 1024
+RELEASE_CHECK_TTL_SECONDS = 6 * 60 * 60
+RELEASE_CHECK_SCHEMA_VERSION = 1
+RELEASE_CHECK_FILENAME = "release-check.json"
 LTK_INSTALLER_SWITCHES = ("/P", "/R")
 LTK_EXECUTABLE_NAMES = ("LTK Manager.exe", "ltk-manager.exe")
 LTK_SIGNER_NAME = "Natoken LLC"
@@ -582,8 +587,42 @@ class LtkInstallLocator:
         self._excluded_roots = tuple(
             _absolute_path(path) for path in (*implicit_cache_roots, *excluded_roots)
         )
+        self._cache_lock = Lock()
+        self._cached: tuple[LtkInstallation, tuple[int, int, int]] | None = None
 
     def locate(self) -> LtkInstallation | None:
+        """Return the installed LTK, reusing a still-valid previous result.
+
+        A full lookup enumerates the uninstall registry and reads the
+        executable's file version, which spawns a helper process.  Callers such
+        as the automatic port check run after every synchronization, so the
+        previous result is reused whenever the exact executable is unchanged.
+        Any difference in size or modification time - including an LTK
+        self-update - falls through to a complete lookup.
+        """
+
+        with self._cache_lock:
+            cached = self._cached
+        if cached is not None:
+            cached_installation, cached_identity = cached
+            if _executable_identity(cached_installation.executable) == cached_identity:
+                return cached_installation
+        located = self._locate_uncached()
+        with self._cache_lock:
+            if located is None:
+                self._cached = None
+            else:
+                identity = _executable_identity(located.executable)
+                self._cached = None if identity is None else (located, identity)
+        return located
+
+    def invalidate(self) -> None:
+        """Drop any cached lookup, forcing the next call to rescan."""
+
+        with self._cache_lock:
+            self._cached = None
+
+    def _locate_uncached(self) -> LtkInstallation | None:
         try:
             entries = tuple(self._registry.entries())
         except OSError:
@@ -697,6 +736,7 @@ class LtkCompanion:
         self._locator = locator
         self._verifier = verifier
         self._cache_dir = _absolute_path(cache_dir)
+        self._release_cache_path = self._cache_dir / RELEASE_CHECK_FILENAME
         self._launcher = _launch_executable if launcher is None else launcher
         self._installer_launcher = (
             _launch_installer if installer_launcher is None else installer_launcher
@@ -777,7 +817,21 @@ class LtkCompanion:
         cancel_event: Event | None,
     ) -> LtkPreparationResult:
         _check_cancelled(cancel_event)
+        if installation is not None:
+            # An install that already satisfies a recent release check needs no
+            # network call at all. The cached release is only ever used to
+            # confirm this "already current" outcome, never to verify or
+            # download an installer, so a stale entry cannot weaken trust.
+            cached = self._recent_release()
+            if cached is not None and installation.version >= cached.version:
+                return LtkPreparationResult(
+                    LtkPreparationStatus.CURRENT_INSTALLED,
+                    cached,
+                    installation,
+                    None,
+                )
         release = self._client.latest()
+        self._remember_release(release)
         _check_cancelled(cancel_event)
         if installation is not None and installation.version >= release.version:
             return LtkPreparationResult(
@@ -870,6 +924,64 @@ class LtkCompanion:
         if identity_before != identity_after or path.is_symlink():
             raise LtkVerificationError("LTK installer changed during verification")
 
+    def _recent_release(self) -> LtkRelease | None:
+        """Return a recently observed release, or None when it must be refetched.
+
+        The cached payload is rebuilt through the same value objects that
+        validate live GitHub metadata, so a corrupted or tampered file simply
+        fails to reconstruct and falls back to a fresh network check.
+        """
+
+        path = self._release_cache_path
+        try:
+            if not _is_safe_regular_file(path):
+                return None
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, Mapping):
+                return None
+            checked_at = raw.get("checked_at")
+            if isinstance(checked_at, bool) or not isinstance(checked_at, (int, float)):
+                return None
+            age = time.time() - float(checked_at)
+            if not 0 <= age < RELEASE_CHECK_TTL_SECONDS:
+                return None
+            asset = raw.get("asset")
+            if not isinstance(asset, Mapping):
+                return None
+            return LtkRelease(
+                LtkVersion.parse(str(raw.get("version", ""))),
+                LtkReleaseAsset(
+                    str(asset.get("name", "")),
+                    str(asset.get("url", "")),
+                    int(asset.get("size", 0)),
+                    str(asset.get("digest", "")),
+                ),
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    def _remember_release(self, release: LtkRelease) -> None:
+        """Record the freshly observed release; failures are never fatal."""
+
+        try:
+            self._ensure_cache_directory()
+            atomic_write_json(
+                self._release_cache_path,
+                {
+                    "schema_version": RELEASE_CHECK_SCHEMA_VERSION,
+                    "checked_at": time.time(),
+                    "version": str(release.version),
+                    "asset": {
+                        "name": release.asset.name,
+                        "url": release.asset.url,
+                        "size": release.asset.size,
+                        "digest": release.asset.digest,
+                    },
+                },
+            )
+        except (LtkCompanionError, OSError, ValueError):
+            return
+
     def _ensure_cache_directory(self) -> None:
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -929,6 +1041,12 @@ class LtkCompanion:
             raise LtkLaunchError("Verified LTK installer could not be started") from error
         if started is False:
             raise LtkLaunchError("Verified LTK installer could not be started")
+        # The installer replaces LTK's executable, so any memoized lookup for
+        # the previous version must not be served afterwards.
+        invalidate = getattr(self._locator, "invalidate", None)
+        if callable(invalidate):
+            with suppress(Exception):
+                invalidate()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1139,6 +1257,26 @@ def _known_install_roots() -> tuple[Path, ...]:
         if value:
             roots.append(Path(value) / "LTK Manager")
     return tuple(roots)
+
+
+def _is_safe_regular_file(path: Path) -> bool:
+    try:
+        value = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(value.st_mode) and not path.is_symlink()
+
+
+def _executable_identity(path: Path) -> tuple[int, int, int] | None:
+    """Return a cheap identity for an executable, or None when unavailable."""
+
+    try:
+        value = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(value.st_mode):
+        return None
+    return (value.st_size, value.st_mtime_ns, value.st_ino)
 
 
 def _known_companion_cache_roots() -> tuple[Path, ...]:

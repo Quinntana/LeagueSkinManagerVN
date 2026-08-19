@@ -12,7 +12,7 @@ import os
 import shutil
 import stat
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,6 +55,22 @@ class LtkSkinCleanupResult:
         return self.archives + self.metadata_directories + self.profile_directories
 
 
+@dataclass(frozen=True, slots=True)
+class LtkModRemovalResult:
+    """Outcome of removing specific, individually identified LTK mods."""
+
+    storage_dir: Path
+    removed_ids: tuple[str, ...]
+    archives_removed: int
+    metadata_directories_removed: int
+    reports_removed: int
+    references_cleared: int
+
+    @property
+    def removed(self) -> int:
+        return len(self.removed_ids)
+
+
 class LtkSkinCleanupService:
     """Remove all LTK skin artifacts while preserving LTK itself and preferences."""
 
@@ -87,6 +103,142 @@ class LtkSkinCleanupService:
             return self._remove_all_locked()
         finally:
             self._lock.release()
+
+    def remove_mods(self, mod_ids: Collection[str]) -> LtkModRemovalResult:
+        """Remove specific mods from LTK's library, leaving every other mod intact.
+
+        This mirrors the exact artifact set LTK itself maintains per mod, as
+        observed from its own import/removal behaviour: the stored archive, the
+        extracted metadata directory, the ``library.json`` entry, every profile
+        and folder reference to that identifier, and its WAD report. The caller
+        must have established that each identifier belongs to content this
+        application queued; this method verifies only structure and safety.
+        """
+
+        identifiers = tuple(dict.fromkeys(mod_ids))
+        for identifier in identifiers:
+            if not _is_safe_mod_id(identifier):
+                raise LtkSkinCleanupError(f"Unsafe LTK mod identifier: {identifier!r}")
+        if not identifiers:
+            return LtkModRemovalResult(_absolute_path(self._storage_resolver()), (), 0, 0, 0, 0)
+        if not self._lock.acquire(blocking=False):
+            raise LtkSkinCleanupBusyError("An LTK skin cleanup is already in progress")
+        try:
+            return self._remove_mods_locked(identifiers)
+        finally:
+            self._lock.release()
+
+    def clear_enabled_mods(self) -> int:
+        """Reset every profile's enabled selections, keeping the library intact.
+
+        The managed baseline has nothing enabled, so this is the toggle half of
+        a rebuild.  Mod membership, profile definitions, and folder structure are
+        preserved; only the enabled/order/layer selections are emptied.
+        """
+
+        if not self._lock.acquire(blocking=False):
+            raise LtkSkinCleanupBusyError("An LTK skin cleanup is already in progress")
+        try:
+            self._ensure_ltk_stopped()
+            storage_dir = _absolute_path(self._storage_resolver())
+            library_path = storage_dir / LTK_LIBRARY_FILENAME
+            if not os.path.lexists(library_path):
+                return 0
+            _preflight_optional_file(library_path, "LTK library index")
+            library, _mods = self._load_library(library_path)
+            if library is None:
+                return 0
+            cleared, count = _library_without_selections(library)
+            if count:
+                self._ensure_ltk_stopped()
+                atomic_write_json(library_path, cleared)
+            return count
+        finally:
+            self._lock.release()
+
+    def _remove_mods_locked(self, identifiers: tuple[str, ...]) -> LtkModRemovalResult:
+        self._ensure_ltk_stopped()
+        storage_dir = _absolute_path(self._storage_resolver())
+        if not os.path.lexists(storage_dir):
+            return LtkModRemovalResult(storage_dir, (), 0, 0, 0, 0)
+        _require_safe_directory_path(storage_dir, "LTK storage directory")
+
+        archives_dir = storage_dir / "archives"
+        mods_dir = storage_dir / "mods"
+        library_path = storage_dir / LTK_LIBRARY_FILENAME
+        reports_path = storage_dir / LTK_REPORTS_FILENAME
+        _preflight_optional_file(library_path, "LTK library index")
+        _preflight_optional_file(reports_path, "LTK WAD report cache")
+
+        # Preflight every per-mod target before deleting any of them so a
+        # reparse point or unexpected object aborts with nothing removed.
+        targets: list[tuple[str, Path | None, Path | None]] = []
+        for identifier in identifiers:
+            archive_path = archives_dir / f"{identifier}.fantome"
+            metadata_path = mods_dir / identifier
+            archive: Path | None = None
+            metadata: Path | None = None
+            if os.path.lexists(archive_path):
+                _preflight_optional_file(archive_path, "LTK mod archive")
+                archive = archive_path
+            if os.path.lexists(metadata_path):
+                _preflight_optional_directory(metadata_path, "LTK mod metadata directory")
+                _preflight_tree(metadata_path, "LTK mod metadata directory")
+                metadata = metadata_path
+            targets.append((identifier, archive, metadata))
+
+        library, _mods = self._load_library(library_path)
+        self._ensure_ltk_stopped()
+
+        archives_removed = 0
+        metadata_removed = 0
+        for _identifier, archive, metadata in targets:
+            if archive is not None:
+                archive.unlink()
+                archives_removed += 1
+            if metadata is not None:
+                shutil.rmtree(metadata)
+                if os.path.lexists(metadata):
+                    raise LtkSkinCleanupError(f"LTK mod metadata still exists: {metadata}")
+                metadata_removed += 1
+
+        references_cleared = 0
+        if library is not None:
+            pruned, references_cleared = _library_without_mods(library, set(identifiers))
+            atomic_write_json(library_path, pruned)
+
+        reports_removed = self._remove_reports(reports_path, set(identifiers))
+        return LtkModRemovalResult(
+            storage_dir=storage_dir,
+            removed_ids=identifiers,
+            archives_removed=archives_removed,
+            metadata_directories_removed=metadata_removed,
+            reports_removed=reports_removed,
+            references_cleared=references_cleared,
+        )
+
+    def _remove_reports(self, reports_path: Path, identifiers: set[str]) -> int:
+        if not os.path.lexists(reports_path):
+            return 0
+        try:
+            before = reports_path.stat(follow_symlinks=False)
+            if before.st_size > self._max_library_bytes:
+                return 0
+            raw = json.loads(reports_path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return 0
+        if not isinstance(raw, dict):
+            return 0
+        reports = raw.get("reports")
+        if not isinstance(reports, dict):
+            return 0
+        removed = 0
+        for identifier in identifiers:
+            if reports.pop(identifier, None) is not None:
+                removed += 1
+        if removed:
+            atomic_write_json(reports_path, raw)
+        return removed
 
     def _remove_all_locked(self) -> LtkSkinCleanupResult:
         self._ensure_ltk_stopped()
@@ -187,6 +339,102 @@ class LtkSkinCleanupService:
             raise LtkSkinCleanupBlockedError(
                 "Close LTK Manager and its patcher before removing all LTK skins"
             )
+
+
+def _is_safe_mod_id(value: object) -> bool:
+    """Accept only the opaque identifier shape LTK uses for its own mods."""
+
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return False
+    return all(character.isalnum() or character in "-_" for character in value)
+
+
+def _library_without_mods(
+    library: Mapping[str, Any],
+    identifiers: set[str],
+) -> tuple[dict[str, Any], int]:
+    """Drop specific mods and every reference to them, keeping all other state."""
+
+    pruned = dict(library)
+    references = 0
+
+    mods = pruned.get("mods")
+    if isinstance(mods, list):
+        kept = [
+            mod for mod in mods if not (isinstance(mod, Mapping) and mod.get("id") in identifiers)
+        ]
+        references += len(mods) - len(kept)
+        pruned["mods"] = kept
+
+    profiles = pruned.get("profiles")
+    if isinstance(profiles, list):
+        clean_profiles: list[Any] = []
+        for profile in profiles:
+            if not isinstance(profile, Mapping):
+                clean_profiles.append(profile)
+                continue
+            clean = dict(profile)
+            for key in ("enabledMods", "modOrder"):
+                values = clean.get(key)
+                if isinstance(values, list):
+                    remaining = [value for value in values if value not in identifiers]
+                    references += len(values) - len(remaining)
+                    clean[key] = remaining
+            layers = clean.get("layerStates")
+            if isinstance(layers, Mapping):
+                remaining_layers = {
+                    key: value for key, value in layers.items() if key not in identifiers
+                }
+                references += len(layers) - len(remaining_layers)
+                clean["layerStates"] = remaining_layers
+            clean_profiles.append(clean)
+        pruned["profiles"] = clean_profiles
+
+    folders = pruned.get("folders")
+    if isinstance(folders, list):
+        clean_folders: list[Any] = []
+        for folder in folders:
+            if not isinstance(folder, Mapping):
+                clean_folders.append(folder)
+                continue
+            clean = dict(folder)
+            values = clean.get("modIds")
+            if isinstance(values, list):
+                remaining = [value for value in values if value not in identifiers]
+                references += len(values) - len(remaining)
+                clean["modIds"] = remaining
+            clean_folders.append(clean)
+        pruned["folders"] = clean_folders
+
+    return pruned, references
+
+
+def _library_without_selections(library: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+    """Empty every profile selection list, leaving mods and folders in place."""
+
+    cleared = dict(library)
+    removed = 0
+    profiles = cleared.get("profiles")
+    if not isinstance(profiles, list):
+        return cleared, 0
+    clean_profiles: list[Any] = []
+    for profile in profiles:
+        if not isinstance(profile, Mapping):
+            clean_profiles.append(profile)
+            continue
+        clean = dict(profile)
+        for key in ("enabledMods", "modOrder"):
+            values = clean.get(key)
+            if isinstance(values, list) and values:
+                removed += len(values)
+                clean[key] = []
+        layers = clean.get("layerStates")
+        if isinstance(layers, Mapping) and layers:
+            removed += len(layers)
+            clean["layerStates"] = {}
+        clean_profiles.append(clean)
+    cleared["profiles"] = clean_profiles
+    return cleared, removed
 
 
 def _sanitized_library(library: Mapping[str, Any]) -> dict[str, Any]:

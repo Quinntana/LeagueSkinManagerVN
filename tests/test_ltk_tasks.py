@@ -7,6 +7,8 @@ from pathlib import Path
 from threading import Event
 from typing import Any, cast
 
+import pytest
+
 from league_skin_manager.ltk_cleanup import (
     LtkSkinCleanupError,
     LtkSkinCleanupResult,
@@ -23,11 +25,13 @@ from league_skin_manager.ltk_companion import (
     LtkVersion,
 )
 from league_skin_manager.ltk_migration import (
-    LtkMigrationError,
+    BaselineStatus,
     LtkMigrationService,
-    MigrationIssue,
-    MigrationProgress,
-    MigrationResult,
+    LtkReconcileError,
+    ReconcileBlockedError,
+    ReconcileIssue,
+    ReconcileProgress,
+    ReconcileResult,
 )
 from league_skin_manager.ltk_tasks import LtkTaskCoordinator
 from league_skin_manager.operation_gate import OperationGate
@@ -88,46 +92,41 @@ class FakeCompanion:
         self.closed += 1
 
 
-class FakeMigration:
+class FakeReconciler:
     def __init__(self, tmp_path: Path) -> None:
-        self.tmp_path = tmp_path
-        self.calls: list[Path] = []
-        self.forget_calls = 0
-        self.migrate_error: LtkMigrationError | None = None
-        self.forget_error: LtkMigrationError | None = None
-        self.result = MigrationResult(
-            source_dir=tmp_path / "installed",
+        self.calls = 0
+        self.inspect_calls = 0
+        self.error: LtkReconcileError | None = None
+        self.baseline = BaselineStatus(expected=3, present=1, extra=0)
+        self.result = ReconcileResult(
             storage_dir=tmp_path / "ltk",
             archives_dir=tmp_path / "ltk" / "archives",
             report_path=tmp_path / "report.json",
             status="completed",
-            discovered=3,
-            queued=2,
-            skipped=1,
-            failed=0,
-            reused_cache=2,
-            packaged=1,
+            expected=3,
+            added=2,
+            removed=1,
+            unchanged=1,
+            toggles_cleared=4,
             issues=(),
         )
 
-    def migrate(
+    def reconcile(
         self,
-        source: Path,
         *,
         cancel_event: object | None = None,
         progress: Any = None,
-    ) -> MigrationResult:
-        self.calls.append(source)
-        if self.migrate_error is not None:
-            raise self.migrate_error
+    ) -> ReconcileResult:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
         if progress is not None:
-            progress(MigrationProgress("packaging", 1, 3, "Shaco"))
+            progress(ReconcileProgress("queueing", 1, 3, "Shaco"))
         return self.result
 
-    def forget_history(self) -> None:
-        self.forget_calls += 1
-        if self.forget_error is not None:
-            raise self.forget_error
+    def inspect_baseline(self) -> BaselineStatus:
+        self.inspect_calls += 1
+        return self.baseline
 
 
 class FakeCleanup:
@@ -163,57 +162,53 @@ def wait_until(predicate: Any, timeout: float = 2.0) -> None:
 def coordinator(
     tmp_path: Path,
     companion: FakeCompanion,
-    migration: FakeMigration,
+    reconciler: FakeReconciler,
     *,
     gate: OperationGate | None = None,
     running: Any = lambda: False,
+    installed: Any = lambda: True,
     cleanup: FakeCleanup | None = None,
-    port_state_changed: Any = None,
+    library_changed: Any = None,
 ) -> tuple[LtkTaskCoordinator, list[tuple[str, str]], list[tuple[str, bool]], list[str]]:
     notifications: list[tuple[str, str]] = []
     statuses: list[tuple[str, bool]] = []
     resumed: list[str] = []
     value = LtkTaskCoordinator(
         companion=cast(LtkCompanion, companion),
-        migration=cast(LtkMigrationService, migration),
+        reconciler=cast(LtkMigrationService, reconciler),
         cleanup=cast(LtkSkinCleanupService, cleanup or FakeCleanup(tmp_path)),
         operation_gate=gate or OperationGate(),
         ltk_is_running=running,
+        ltk_is_installed=installed,
         resume_cslol_launches=lambda: resumed.append("resume"),
         notify_sink=lambda title, message: notifications.append((title, message)),
         status_sink=lambda detail, active: statuses.append((detail, active)),
-        port_state_changed_sink=port_state_changed,
+        library_state_changed_sink=library_changed,
         logger=logging.getLogger("test.ltk_tasks"),
     )
     return value, notifications, statuses, resumed
 
 
-def test_start_prepares_latest_release_without_launching(tmp_path: Path) -> None:
+def test_start_checks_the_release_without_launching(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    value, _notifications, statuses, _resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-    )
+    reconciler = FakeReconciler(tmp_path)
+    value, _notifications, statuses, _resumed = coordinator(tmp_path, companion, reconciler)
 
     assert value.start() is True
     wait_until(lambda: companion.prepare_calls == 1 and "cached" in statuses[-1][0])
 
     assert companion.start_calls == 0
-    assert migration.calls == []
+    assert reconciler.calls == 0
     assert value.shutdown(1.0) is True
     assert companion.closed == 1
     assert value.shutdown(1.0) is True
     assert companion.closed == 1
 
 
-def test_explicit_start_is_coalesced_behind_automatic_prepare(tmp_path: Path) -> None:
+def test_explicit_start_is_coalesced_behind_the_release_check(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path, block_prepare=True)
     value, notifications, statuses, _resumed = coordinator(
-        tmp_path,
-        companion,
-        FakeMigration(tmp_path),
+        tmp_path, companion, FakeReconciler(tmp_path)
     )
     assert value.start()
     assert companion.prepare_started.wait(1.0)
@@ -228,12 +223,12 @@ def test_explicit_start_is_coalesced_behind_automatic_prepare(tmp_path: Path) ->
     assert value.shutdown(1.0)
 
 
-def test_running_legacy_or_official_ltk_blocks_a_duplicate_launch(tmp_path: Path) -> None:
+def test_running_ltk_blocks_a_duplicate_launch(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
     value, notifications, _statuses, _resumed = coordinator(
         tmp_path,
         companion,
-        FakeMigration(tmp_path),
+        FakeReconciler(tmp_path),
         running=lambda: True,
     )
     assert value.start()
@@ -242,323 +237,269 @@ def test_running_legacy_or_official_ltk_blocks_a_duplicate_launch(tmp_path: Path
     wait_until(lambda: bool(notifications))
 
     assert companion.start_calls == 0
-    assert "legacy LTK app" in notifications[-1][1]
+    assert "already running" in notifications[-1][1]
     assert value.shutdown(1.0)
 
 
-def test_prepare_completion_keeps_queued_migration_cancellable(tmp_path: Path) -> None:
-    companion = FakeCompanion(tmp_path, block_prepare=True)
-    migration = FakeMigration(tmp_path)
-    gate = OperationGate()
-    blocker = gate.try_acquire("skin synchronization")
-    assert blocker is not None
-    value, _notifications, statuses, _resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        gate=gate,
-    )
-    assert value.start()
-    assert companion.prepare_started.wait(1.0)
-    assert value.request_migration(tmp_path / "installed")
-
-    companion.prepare_release.set()
-    wait_until(lambda: any("cached" in detail for detail, _active in statuses))
-
-    cached_status = next(item for item in statuses if "cached" in item[0])
-    assert cached_status[1] is True
-    assert value.cancel_migration()
-    blocker.release()
-    assert value.shutdown(1.0)
-
-
-def test_migration_waits_for_gate_reports_progress_launches_ltk_and_resumes_cslol(
+def test_rebuild_waits_for_the_gate_reports_progress_and_resumes_cslol(
     tmp_path: Path,
 ) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
-    port_state_changes: list[str] = []
+    library_changes: list[str] = []
     value, notifications, statuses, resumed = coordinator(
         tmp_path,
         companion,
-        migration,
+        reconciler,
         gate=gate,
-        port_state_changed=lambda: port_state_changes.append("changed"),
+        library_changed=lambda: library_changes.append("changed"),
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
-    source = tmp_path / "cslol-manager"
-    assert value.request_migration(source)
+
+    assert value.request_rebuild()
     wait_until(lambda: any("waiting" in detail for detail, _active in statuses))
-    assert migration.calls == []
+    assert reconciler.calls == 0
 
     blocker.release()
-    wait_until(lambda: migration.calls == [source] and resumed == ["resume"])
+    wait_until(lambda: reconciler.calls == 1 and resumed == ["resume"])
 
-    assert companion.start_calls == 1
-    assert any("packaging 1/3 - Shaco" in detail for detail, _active in statuses)
-    assert notifications[-1][0] == "LTK migration complete"
-    assert "2 queued, 1 already queued, 0 failed" in notifications[-1][1]
-    assert port_state_changes == ["changed"]
-    assert value.migration_active is False
+    assert companion.start_calls == 0
+    assert any("queueing 1/3 - Shaco" in detail for detail, _active in statuses)
+    assert notifications[-1][0] == "LTK skin library updated"
+    assert "2 queued" in notifications[-1][1]
+    assert "1 removed" in notifications[-1][1]
+    assert library_changes == ["changed"]
+    assert value.reconcile_active is False
     assert value.shutdown(1.0)
 
 
-def test_cancel_queued_migration_leaves_gate_and_service_untouched(tmp_path: Path) -> None:
+def test_automatic_rebuild_is_skipped_when_ltk_is_not_installed(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    gate = OperationGate()
-    blocker = gate.try_acquire("skin synchronization")
-    assert blocker is not None
-    port_state_changes: list[str] = []
-    value, _notifications, statuses, resumed = coordinator(
+    reconciler = FakeReconciler(tmp_path)
+    value, notifications, statuses, _resumed = coordinator(
         tmp_path,
         companion,
-        migration,
-        gate=gate,
-        port_state_changed=lambda: port_state_changes.append("changed"),
+        reconciler,
+        installed=lambda: False,
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: value.migration_active)
-    assert value.cancel_migration() is True
-    wait_until(lambda: any("cancelled before" in detail for detail, _active in statuses))
 
-    assert migration.calls == []
-    assert port_state_changes == []
+    assert value.request_rebuild(automatic=True)
+    wait_until(lambda: any("LTK is not installed" in detail for detail, _a in statuses))
+
+    assert reconciler.calls == 0
+    assert notifications == []
+    assert value.shutdown(1.0)
+
+
+def test_an_unchanged_automatic_rebuild_stays_quiet(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.result = replace(
+        reconciler.result, added=0, removed=0, toggles_cleared=0, unchanged=3
+    )
+    value, notifications, statuses, resumed = coordinator(tmp_path, companion, reconciler)
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild(automatic=True)
+    wait_until(lambda: resumed == ["resume"])
+
+    assert reconciler.calls == 1
+    assert notifications == []
+    assert any("already current" in detail for detail, _active in statuses)
+    assert value.shutdown(1.0)
+
+
+def test_a_manual_rebuild_always_reports_even_when_unchanged(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.result = replace(
+        reconciler.result, added=0, removed=0, toggles_cleared=0, unchanged=3
+    )
+    value, notifications, _statuses, resumed = coordinator(tmp_path, companion, reconciler)
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild()
+    wait_until(lambda: resumed == ["resume"])
+
+    assert notifications[-1][0] == "LTK skin library updated"
+    assert value.shutdown(1.0)
+
+
+def test_a_blocked_rebuild_defers_quietly_and_retries_later(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.error = ReconcileBlockedError("Close LTK Manager before rebuilding")
+    value, notifications, statuses, resumed = coordinator(tmp_path, companion, reconciler)
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild(automatic=True)
+    wait_until(lambda: any("rebuild deferred" in detail for detail, _a in statuses))
+    wait_until(lambda: resumed == ["resume"])
+
+    assert notifications == []
+    assert reconciler.calls == 1
+
+    reconciler.error = None
+    assert value.retry_deferred_rebuild() is True
+    wait_until(lambda: reconciler.calls == 2 and len(resumed) == 2)
+
+    assert value.retry_deferred_rebuild() is False
+    assert value.shutdown(1.0)
+
+
+def test_a_blocked_result_also_marks_the_rebuild_deferred(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.result = replace(
+        reconciler.result,
+        status="blocked",
+        issues=(ReconcileIssue(reason="Close LTK Manager before rebuilding"),),
+    )
+    value, _notifications, statuses, resumed = coordinator(tmp_path, companion, reconciler)
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild(automatic=True)
+    wait_until(lambda: resumed == ["resume"])
+    wait_until(lambda: any("rebuild deferred" in detail for detail, _a in statuses))
+
+    reconciler.result = replace(reconciler.result, status="completed", issues=())
+    assert value.retry_deferred_rebuild() is True
+    assert value.shutdown(1.0)
+
+
+def test_a_failed_rebuild_is_status_only_when_automatic(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.error = LtkReconcileError("package cache unavailable")
+    value, notifications, statuses, resumed = coordinator(tmp_path, companion, reconciler)
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild(automatic=True)
+    wait_until(lambda: resumed == ["resume"])
+    wait_until(lambda: any("rebuild failed" in detail for detail, _a in statuses))
+
+    assert notifications == []
+    assert value.retry_deferred_rebuild() is False
+    assert value.shutdown(1.0)
+
+
+def test_a_cancelled_rebuild_reports_a_partial_result(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.result = replace(reconciler.result, status="cancelled")
+    library_changes: list[str] = []
+    value, notifications, statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        reconciler,
+        library_changed=lambda: library_changes.append("changed"),
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild()
+    wait_until(lambda: resumed == ["resume"])
+
+    assert any("rebuild cancelled" in detail for detail, _active in statuses)
+    assert notifications == []
+    assert library_changes == ["changed"]
+    assert value.shutdown(1.0)
+
+
+def test_cancel_a_queued_rebuild_leaves_the_service_untouched(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    gate = OperationGate()
+    blocker = gate.try_acquire("skin synchronization")
+    assert blocker is not None
+    value, _notifications, statuses, resumed = coordinator(
+        tmp_path, companion, reconciler, gate=gate
+    )
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+    assert value.request_rebuild()
+    wait_until(lambda: value.reconcile_active)
+
+    assert value.cancel_rebuild() is True
+    wait_until(lambda: any("cancelled before" in detail for detail, _a in statuses))
+
+    assert reconciler.calls == 0
     assert resumed == []
     blocker.release()
     assert value.shutdown(1.0)
 
 
-def test_blocked_partial_migration_does_not_launch_ltk(tmp_path: Path) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    migration.result = MigrationResult(
-        source_dir=tmp_path / "installed",
-        storage_dir=tmp_path / "ltk",
-        archives_dir=tmp_path / "ltk" / "archives",
-        report_path=tmp_path / "blocked-report.json",
-        status="blocked",
-        discovered=3,
-        queued=1,
-        skipped=0,
-        failed=0,
-        reused_cache=1,
-        packaged=0,
-        issues=(
-            MigrationIssue(
-                source=tmp_path / "installed",
-                reason="Close LTK Manager before migrating skins",
-            ),
-        ),
-    )
-    port_state_changes: list[str] = []
-    value, notifications, statuses, resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        port_state_changed=lambda: port_state_changes.append("changed"),
-    )
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: bool(resumed))
-
-    assert companion.start_calls == 0
-    assert "Close LTK Manager" in notifications[-1][1]
-    assert statuses[-1][1] is False
-    assert port_state_changes == ["changed"]
-    assert value.shutdown(1.0)
-
-
-def test_returned_cancelled_migration_publishes_port_state_change(tmp_path: Path) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    migration.result = replace(
-        migration.result,
-        status="cancelled",
-        queued=1,
-        skipped=0,
-    )
-    port_state_changes: list[str] = []
-    value, notifications, _statuses, resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        port_state_changed=lambda: port_state_changes.append("changed"),
-    )
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: resumed == ["resume"])
-
-    assert companion.start_calls == 0
-    assert notifications[-1][0] == "LTK migration cancelled"
-    assert port_state_changes == ["changed"]
-    assert value.shutdown(1.0)
-
-
-def test_migration_report_failure_is_visible_without_hiding_handoff(
-    tmp_path: Path,
-) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    migration.result = replace(migration.result, report_error="report disk full")
-    port_state_changes: list[str] = []
-    value, notifications, statuses, resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        port_state_changed=lambda: port_state_changes.append("changed"),
-    )
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: resumed == ["resume"])
-
-    assert port_state_changes == ["changed"]
-    assert "Audit report unavailable: report disk full" in notifications[-1][1]
-    assert "audit report unavailable" in statuses[-1][0]
-    assert value.shutdown(1.0)
-
-
-def test_migration_error_before_result_does_not_publish_port_state_change(
-    tmp_path: Path,
-) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    migration.migrate_error = LtkMigrationError("invalid source")
-    port_state_changes: list[str] = []
-    value, notifications, _statuses, resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        port_state_changed=lambda: port_state_changes.append("changed"),
-    )
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: resumed == ["resume"])
-
-    assert notifications[-1] == ("LTK migration", "invalid source")
-    assert port_state_changes == []
-    assert value.shutdown(1.0)
-
-
-def test_cancel_without_migration_and_invalid_shutdown_timeout(tmp_path: Path) -> None:
-    import pytest
-
+def test_cancel_without_a_rebuild_and_invalid_shutdown_timeout(tmp_path: Path) -> None:
     value, _notifications, _statuses, _resumed = coordinator(
-        tmp_path,
-        FakeCompanion(tmp_path),
-        FakeMigration(tmp_path),
+        tmp_path, FakeCompanion(tmp_path), FakeReconciler(tmp_path)
     )
-    assert value.cancel_migration() is False
+    assert value.cancel_rebuild() is False
     with pytest.raises(ValueError, match="positive"):
         value.shutdown(0)
     assert value.shutdown(1.0)
 
 
-def test_explicit_history_reset_is_serialized_and_notified(tmp_path: Path) -> None:
+def test_a_duplicate_automatic_rebuild_is_rejected(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    port_state_changes: list[str] = []
-    value, notifications, statuses, _resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        port_state_changed=lambda: port_state_changes.append("changed"),
-    )
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-
-    assert value.request_history_reset()
-    assert value.request_history_reset()
-    wait_until(lambda: any("packages may be requeued" in item[0] for item in statuses))
-
-    assert "packages may be requeued" in statuses[-1][0]
-    assert notifications[-1][0] == "LTK migration history"
-    assert port_state_changes == ["changed"]
-    assert value.shutdown(1.0)
-
-
-def test_port_state_sink_failure_does_not_change_history_reset_outcome(
-    tmp_path: Path,
-    caplog: Any,
-) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-
-    def fail_refresh() -> None:
-        raise RuntimeError("refresh failed")
-
-    value, notifications, statuses, _resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        port_state_changed=fail_refresh,
-    )
-    caplog.set_level(logging.ERROR, logger="test.ltk_tasks")
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-
-    assert value.request_history_reset()
-    wait_until(lambda: any("packages may be requeued" in item[0] for item in statuses))
-
-    assert notifications[-1][0] == "LTK migration history"
-    assert "LTK port-state change sink failed" in caplog.text
-    assert value.shutdown(1.0)
-
-
-def test_history_reset_is_rejected_while_migration_is_waiting(tmp_path: Path) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
-    value, notifications, _statuses, _resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        gate=gate,
+    value, _notifications, _statuses, _resumed = coordinator(
+        tmp_path, companion, FakeReconciler(tmp_path), gate=gate
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: value.migration_active)
+    assert value.request_rebuild()
+    wait_until(lambda: value.reconcile_active)
 
-    assert value.request_history_reset() is False
-    assert "active migration" in notifications[-1][1]
-    assert value.cancel_migration()
+    assert value.request_rebuild(automatic=True) is False
+
+    assert value.cancel_rebuild()
     blocker.release()
     assert value.shutdown(1.0)
 
 
-def test_explicit_cleanup_waits_for_gate_clears_history_and_resumes_cslol(
-    tmp_path: Path,
-) -> None:
+def test_report_failure_is_surfaced_without_hiding_the_outcome(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
+    reconciler = FakeReconciler(tmp_path)
+    reconciler.result = replace(reconciler.result, report_error="report disk full")
+    value, notifications, statuses, resumed = coordinator(tmp_path, companion, reconciler)
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild()
+    wait_until(lambda: resumed == ["resume"])
+
+    assert any("report unavailable" in detail for detail, _active in statuses)
+    assert notifications[-1][0] == "LTK skin library updated"
+    assert value.shutdown(1.0)
+
+
+def test_cleanup_waits_for_the_gate_and_resumes_cslol(tmp_path: Path) -> None:
+    companion = FakeCompanion(tmp_path)
     cleanup = FakeCleanup(tmp_path)
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
-    port_state_changes: list[str] = []
+    library_changes: list[str] = []
     value, notifications, statuses, resumed = coordinator(
         tmp_path,
         companion,
-        migration,
+        FakeReconciler(tmp_path),
         gate=gate,
         cleanup=cleanup,
-        port_state_changed=lambda: port_state_changes.append("changed"),
+        library_changed=lambda: library_changes.append("changed"),
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
@@ -569,59 +510,22 @@ def test_explicit_cleanup_waits_for_gate_clears_history_and_resumes_cslol(
     assert cleanup.calls == 0
 
     blocker.release()
-    wait_until(lambda: any("removed all LTK skins" in item[0] for item in statuses))
+    wait_until(lambda: any("removed every skin" in detail for detail, _a in statuses))
 
     assert resumed == ["resume"]
     assert value.cleanup_active is False
-    assert any("removed all LTK skins (7 package(s))" in item[0] for item in statuses)
-    assert notifications[-1][0] == "All LTK skins removed"
-    assert "LTK application were preserved" in notifications[-1][1]
-    assert port_state_changes == ["changed"]
+    assert notifications[-1][0] == "All skins removed from LTK"
+    assert "next rebuild will restore" in notifications[-1][1]
+    assert library_changes == ["changed"]
     assert value.shutdown(1.0)
 
 
-def test_cleanup_history_failure_leaves_ltk_library_untouched(
-    tmp_path: Path,
-) -> None:
+def test_cleanup_failure_is_reported(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    migration.forget_error = LtkMigrationError("ledger is locked")
-    cleanup = FakeCleanup(tmp_path)
-    port_state_changes: list[str] = []
-    value, notifications, statuses, resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        cleanup=cleanup,
-        port_state_changed=lambda: port_state_changes.append("changed"),
-    )
-    assert value.start()
-    wait_until(lambda: companion.prepare_calls == 1)
-
-    assert value.request_cleanup()
-    wait_until(lambda: resumed == ["resume"])
-
-    assert cleanup.calls == 0
-    assert "No LTK skins were removed" in notifications[-1][1]
-    assert statuses[-1][0] == "LTK cleanup not started; port-history reset failed"
-    assert port_state_changes == []
-    assert value.shutdown(1.0)
-
-
-def test_cleanup_failure_after_history_reset_remains_conservatively_pending(
-    tmp_path: Path,
-) -> None:
-    companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
     cleanup = FakeCleanup(tmp_path)
     cleanup.error = LtkSkinCleanupError("cleanup transaction failed")
-    port_state_changes: list[str] = []
     value, notifications, statuses, resumed = coordinator(
-        tmp_path,
-        companion,
-        migration,
-        cleanup=cleanup,
-        port_state_changed=lambda: port_state_changes.append("changed"),
+        tmp_path, companion, FakeReconciler(tmp_path), cleanup=cleanup
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
@@ -629,37 +533,59 @@ def test_cleanup_failure_after_history_reset_remains_conservatively_pending(
     assert value.request_cleanup()
     wait_until(lambda: resumed == ["resume"])
 
-    assert migration.forget_calls == 1
     assert cleanup.calls == 1
-    assert port_state_changes == ["changed"]
-    assert notifications[-1][0] == "Remove all LTK skins"
-    assert "Port history was already reset" in notifications[-1][1]
-    assert statuses[-1][0] == "LTK skin cleanup not completed: cleanup transaction failed"
+    assert notifications[-1][0] == "Remove all skins from LTK"
+    assert any("skin removal not completed" in detail for detail, _a in statuses)
     assert value.shutdown(1.0)
 
 
-def test_cleanup_and_migration_requests_reject_each_other(tmp_path: Path) -> None:
+def test_cleanup_and_rebuild_reject_each_other(tmp_path: Path) -> None:
     companion = FakeCompanion(tmp_path)
-    migration = FakeMigration(tmp_path)
-    cleanup = FakeCleanup(tmp_path)
     gate = OperationGate()
     blocker = gate.try_acquire("skin synchronization")
     assert blocker is not None
     value, notifications, _statuses, _resumed = coordinator(
         tmp_path,
         companion,
-        migration,
+        FakeReconciler(tmp_path),
         gate=gate,
-        cleanup=cleanup,
+        cleanup=FakeCleanup(tmp_path),
     )
     assert value.start()
     wait_until(lambda: companion.prepare_calls == 1)
-    assert value.request_migration(tmp_path / "installed")
-    wait_until(lambda: value.migration_active)
+    assert value.request_rebuild()
+    wait_until(lambda: value.reconcile_active)
 
     assert value.request_cleanup() is False
-    assert "active CSLOL-to-LTK port" in notifications[-1][1]
-    assert value.cancel_migration()
+    assert "library rebuild" in notifications[-1][1]
+
+    assert value.cancel_rebuild()
     blocker.release()
-    wait_until(lambda: not value.migration_active)
+    wait_until(lambda: not value.reconcile_active)
+    assert value.shutdown(1.0)
+
+
+def test_library_state_sink_failure_does_not_change_the_outcome(
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    def fail_refresh() -> None:
+        raise RuntimeError("refresh failed")
+
+    companion = FakeCompanion(tmp_path)
+    value, notifications, _statuses, resumed = coordinator(
+        tmp_path,
+        companion,
+        FakeReconciler(tmp_path),
+        library_changed=fail_refresh,
+    )
+    caplog.set_level(logging.ERROR, logger="test.ltk_tasks")
+    assert value.start()
+    wait_until(lambda: companion.prepare_calls == 1)
+
+    assert value.request_rebuild()
+    wait_until(lambda: resumed == ["resume"])
+
+    assert notifications[-1][0] == "LTK skin library updated"
+    assert "LTK library-state change sink failed" in caplog.text
     assert value.shutdown(1.0)

@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import subprocess
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -15,6 +16,8 @@ import pytest
 from league_skin_manager import ltk_companion as ltk_module
 from league_skin_manager.ltk_companion import (
     MAX_LTK_INSTALLER_BYTES,
+    RELEASE_CHECK_FILENAME,
+    RELEASE_CHECK_TTL_SECONDS,
     AuthenticodeSignature,
     LtkCancelled,
     LtkClosedError,
@@ -1195,3 +1198,193 @@ def test_path_comparisons_use_absolute_cache_destination(tmp_path: Path) -> None
     assert prepared.installer_path is not None
     assert prepared.installer_path.is_absolute()
     assert os.path.samefile(prepared.installer_path.parent, cache)
+
+
+class CountingRegistry:
+    def __init__(self, entry: RegistryUninstallEntry) -> None:
+        self.entry = entry
+        self.scans = 0
+
+    def entries(self) -> tuple[RegistryUninstallEntry, ...]:
+        self.scans += 1
+        return (self.entry,)
+
+
+def counting_locator(tmp_path: Path, executable: Path) -> tuple[Any, CountingRegistry]:
+    registry = CountingRegistry(
+        RegistryUninstallEntry(
+            display_name="LTK Manager",
+            display_version="1.2.3",
+            display_icon=f'"{executable}",0',
+        )
+    )
+    return (
+        LtkInstallLocator(registry, fallbacks=(), temp_root=tmp_path / "Temp"),
+        registry,
+    )
+
+
+def test_locator_reuses_its_result_while_the_executable_is_unchanged(tmp_path: Path) -> None:
+    executable = tmp_path / "Installed" / "ltk-manager.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"ltk")
+    locator, registry = counting_locator(tmp_path, executable)
+
+    first = locator.locate()
+    for _ in range(5):
+        assert locator.locate() == first
+
+    assert first == LtkInstallation(executable, LtkVersion(1, 2, 3))
+    assert registry.scans == 1
+
+
+def test_locator_rescans_after_the_executable_changes(tmp_path: Path) -> None:
+    executable = tmp_path / "Installed" / "ltk-manager.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"ltk")
+    locator, registry = counting_locator(tmp_path, executable)
+
+    assert locator.locate() is not None
+    assert registry.scans == 1
+
+    # An LTK self-update rewrites the executable with different content.
+    executable.write_bytes(b"ltk-updated-build")
+    registry.entry = RegistryUninstallEntry(
+        display_name="LTK Manager",
+        display_version="1.3.0",
+        display_icon=f'"{executable}",0',
+    )
+
+    assert locator.locate() == LtkInstallation(executable, LtkVersion(1, 3, 0))
+    assert registry.scans == 2
+
+
+def test_locator_rescans_after_the_executable_disappears(tmp_path: Path) -> None:
+    executable = tmp_path / "Installed" / "ltk-manager.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"ltk")
+    locator, registry = counting_locator(tmp_path, executable)
+
+    assert locator.locate() is not None
+    executable.unlink()
+
+    assert locator.locate() is None
+    assert registry.scans == 2
+
+
+def test_locator_invalidate_forces_a_fresh_lookup(tmp_path: Path) -> None:
+    executable = tmp_path / "Installed" / "ltk-manager.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"ltk")
+    locator, registry = counting_locator(tmp_path, executable)
+
+    assert locator.locate() is not None
+    locator.invalidate()
+    assert locator.locate() is not None
+
+    assert registry.scans == 2
+
+
+def test_missing_install_is_not_cached_as_a_negative_result(tmp_path: Path) -> None:
+    executable = tmp_path / "Installed" / "ltk-manager.exe"
+    executable.parent.mkdir()
+    locator, registry = counting_locator(tmp_path, executable)
+
+    assert locator.locate() is None
+    executable.write_bytes(b"ltk")
+
+    assert locator.locate() == LtkInstallation(executable, LtkVersion(1, 2, 3))
+    assert registry.scans == 2
+
+
+def test_current_install_skips_the_release_check_on_a_later_run(tmp_path: Path) -> None:
+    data = b"signed"
+    cache_dir = tmp_path / "cache-root"
+    client = FakeClient(release_for(data), data)
+    current = installation(tmp_path, "2.0.0")
+    companion = make_companion(client, FakeLocator(current), FakeVerifier(), cache_dir, [], [])
+
+    first = companion.prepare()
+    assert first.status is LtkPreparationStatus.CURRENT_INSTALLED
+    assert client.latest_calls == 1
+    assert (cache_dir / RELEASE_CHECK_FILENAME).is_file()
+
+    # A fresh process re-reads the persisted check instead of calling GitHub.
+    later_client = FakeClient(release_for(data), data)
+    later = make_companion(later_client, FakeLocator(current), FakeVerifier(), cache_dir, [], [])
+    result = later.prepare()
+
+    assert result.status is LtkPreparationStatus.CURRENT_INSTALLED
+    assert result.release.version == first.release.version
+    assert later_client.latest_calls == 0
+
+
+def test_expired_release_check_is_refetched(tmp_path: Path) -> None:
+    data = b"signed"
+    cache_dir = tmp_path / "cache-root"
+    current = installation(tmp_path, "2.0.0")
+    warm = FakeClient(release_for(data), data)
+    make_companion(warm, FakeLocator(current), FakeVerifier(), cache_dir, [], []).prepare()
+
+    stored = json.loads((cache_dir / RELEASE_CHECK_FILENAME).read_text(encoding="utf-8"))
+    stored["checked_at"] = time.time() - RELEASE_CHECK_TTL_SECONDS - 1
+    (cache_dir / RELEASE_CHECK_FILENAME).write_text(json.dumps(stored), encoding="utf-8")
+
+    client = FakeClient(release_for(data), data)
+    companion = make_companion(client, FakeLocator(current), FakeVerifier(), cache_dir, [], [])
+
+    assert companion.prepare().status is LtkPreparationStatus.CURRENT_INSTALLED
+    assert client.latest_calls == 1
+
+
+def test_outdated_install_always_performs_a_fresh_release_check(tmp_path: Path) -> None:
+    data = b"signed"
+    cache_dir = tmp_path / "cache-root"
+    current = installation(tmp_path, "2.0.0")
+    warm = FakeClient(release_for(data), data)
+    make_companion(warm, FakeLocator(current), FakeVerifier(), cache_dir, [], []).prepare()
+
+    # The cache says 1.2.3 is current, but this install is older, so the
+    # download/verify path must never run on cached metadata.
+    older = installation(tmp_path, "1.0.0")
+    client = FakeClient(release_for(data), data)
+    companion = make_companion(client, FakeLocator(older), FakeVerifier(), cache_dir, [], [])
+
+    result = companion.prepare()
+
+    assert result.status is LtkPreparationStatus.INSTALLER_READY
+    assert client.latest_calls == 1
+
+
+def test_missing_install_always_performs_a_fresh_release_check(tmp_path: Path) -> None:
+    data = b"signed"
+    cache_dir = tmp_path / "cache-root"
+    current = installation(tmp_path, "2.0.0")
+    warm = FakeClient(release_for(data), data)
+    make_companion(warm, FakeLocator(current), FakeVerifier(), cache_dir, [], []).prepare()
+
+    client = FakeClient(release_for(data), data)
+    companion = make_companion(client, FakeLocator(None), FakeVerifier(), cache_dir, [], [])
+
+    assert companion.prepare().status is LtkPreparationStatus.INSTALLER_READY
+    assert client.latest_calls == 1
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["not json at all", '{"checked_at": "soon"}', '{"schema_version": 1}', "{}"],
+)
+def test_corrupt_release_check_falls_back_to_the_network(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    data = b"signed"
+    cache_dir = tmp_path / "cache-root"
+    cache_dir.mkdir()
+    (cache_dir / RELEASE_CHECK_FILENAME).write_text(corruption, encoding="utf-8")
+    client = FakeClient(release_for(data), data)
+    current = installation(tmp_path, "2.0.0")
+    companion = make_companion(client, FakeLocator(current), FakeVerifier(), cache_dir, [], [])
+
+    assert companion.prepare().status is LtkPreparationStatus.CURRENT_INSTALLED
+    assert client.latest_calls == 1

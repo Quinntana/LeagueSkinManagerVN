@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 
 from league_skin_manager.controller import AppState
-from league_skin_manager.tray import TrayApplication
+from league_skin_manager.tray import MENU_TEXT_LIMIT, TITLE_LIMIT, TrayApplication
+
+SEPARATOR = object()
 
 
 @dataclass
@@ -19,17 +21,20 @@ class FakeMenuItem:
 
 @dataclass
 class FakeMenu:
-    items: tuple[FakeMenuItem, ...]
+    items: tuple[object, ...]
+
+
+class FakeMenuFactory:
+    """Callable menu factory that also carries pystray's SEPARATOR sentinel."""
+
+    SEPARATOR = SEPARATOR
+
+    def __call__(self, *items: object) -> FakeMenu:
+        return FakeMenu(tuple(items))
 
 
 class FakeIcon:
-    def __init__(
-        self,
-        name: str,
-        image: object,
-        title: str,
-        menu: FakeMenu,
-    ) -> None:
+    def __init__(self, name: str, image: object, title: str, menu: FakeMenu) -> None:
         self.name = name
         self.icon = image
         self.title = title
@@ -62,96 +67,70 @@ class FakeIcon:
 class FakeBackend:
     def __init__(self) -> None:
         self.icon: FakeIcon | None = None
+        self.Menu = FakeMenuFactory()
 
-    def Icon(
-        self,
-        name: str,
-        image: object,
-        title: str,
-        menu: object,
-    ) -> FakeIcon:
+    def Icon(self, name: str, image: object, title: str, menu: object) -> FakeIcon:
         assert isinstance(menu, FakeMenu)
         self.icon = FakeIcon(name, image, title, menu)
         return self.icon
 
-    def Menu(self, *items: object) -> FakeMenu:
-        assert all(isinstance(item, FakeMenuItem) for item in items)
-        return FakeMenu(tuple(items))  # type: ignore[arg-type]
-
-    def MenuItem(
-        self,
-        text: str,
-        action: object | None,
-        **options: Any,
-    ) -> FakeMenuItem:
+    def MenuItem(self, text: str, action: object | None, **options: Any) -> FakeMenuItem:
         return FakeMenuItem(text, action, options)
 
 
-def make_tray(
-    backend: FakeBackend,
-    **overrides: Any,
-) -> TrayApplication:
+def make_tray(backend: FakeBackend, **overrides: Any) -> TrayApplication:
     callbacks: dict[str, Any] = {
         "on_start": lambda: None,
-        "on_show": lambda: None,
         "on_sync": lambda: None,
-        "on_start_manager": lambda: None,
+        "on_open_ltk": lambda: None,
+        "on_open_cooldowns": lambda: None,
+        "on_open_ltk_skins": lambda: None,
         "on_open_cslol_skins": lambda: None,
-        "on_copy_cslol_manager_path": lambda: None,
-        "on_start_ltk": lambda: None,
-        "on_open_ltk_install": lambda: None,
-        "on_open_ltk_storage": lambda: None,
-        "on_migrate_to_ltk": lambda: None,
-        "on_cancel_ltk_migration": lambda: None,
-        "on_reset_ltk_migration": lambda: None,
-        "on_remove_ltk_skins": lambda: None,
         "on_open_data": lambda: None,
         "on_open_log": lambda: None,
-        "startup_enabled": lambda: False,
-        "set_startup_enabled": lambda _enabled: None,
+        "on_rebuild_library": lambda: None,
+        "on_remove_ltk_skins": lambda: None,
         "on_uninstall": lambda: None,
         "on_exit": lambda: None,
+        "startup_enabled": lambda: False,
+        "set_startup_enabled": lambda _enabled: None,
         "runtime_label": "Installed v9.9.9",
         "uninstall_available": True,
         "startup_available": True,
         "backend": backend,
         "image_factory": lambda state: f"image:{state.name}",
-        "app_name": "Test Skin Manager",
+        "app_name": "TestApp",
     }
     callbacks.update(overrides)
     return TrayApplication(**callbacks)
 
 
-def menu_items(tray: TrayApplication) -> tuple[FakeMenuItem, ...]:
+def rows(tray: TrayApplication) -> tuple[object, ...]:
     menu = tray.native_icon.menu
     assert isinstance(menu, FakeMenu)
     return menu.items
 
 
-def find_item(items: Iterable[FakeMenuItem], text: str) -> FakeMenuItem:
-    matches = [item for item in items if item.text == text]
+def labels(items: Iterable[object]) -> list[str]:
+    return [item.text if isinstance(item, FakeMenuItem) else "---" for item in items]
+
+
+def find_item(items: Iterable[object], text: str) -> FakeMenuItem:
+    matches = [item for item in items if isinstance(item, FakeMenuItem) and item.text == text]
     assert len(matches) == 1, f"expected exactly one menu item named {text!r}"
     return matches[0]
 
 
-def find_prefixed_item(
-    items: Iterable[FakeMenuItem],
-    prefix: str,
-) -> FakeMenuItem:
-    matches = [item for item in items if item.text.startswith(prefix)]
-    assert len(matches) == 1, f"expected exactly one menu item starting with {prefix!r}"
+def find_prefixed(items: Iterable[object], prefix: str) -> FakeMenuItem:
+    matches = [
+        item for item in items if isinstance(item, FakeMenuItem) and item.text.startswith(prefix)
+    ]
+    assert len(matches) == 1, f"expected exactly one item starting with {prefix!r}"
     return matches[0]
 
 
-def root_item(tray: TrayApplication, text: str) -> FakeMenuItem:
-    return find_item(menu_items(tray), text)
-
-
-def submenu_items(
-    tray: TrayApplication,
-    text: str,
-) -> tuple[FakeMenuItem, ...]:
-    action = root_item(tray, text).action
+def submenu(tray: TrayApplication, text: str) -> tuple[object, ...]:
+    action = find_item(rows(tray), text).action
     assert isinstance(action, FakeMenu)
     return action.items
 
@@ -167,414 +146,326 @@ def click(tray: TrayApplication, item: FakeMenuItem) -> None:
     item.action(tray.native_icon, item)
 
 
-def test_tray_is_visible_before_startup_callback_and_has_expected_menu() -> None:
+def test_tray_is_visible_before_startup_and_has_the_expected_menu() -> None:
     backend = FakeBackend()
-    callback_visibility: list[bool] = []
+    visibility: list[bool] = []
 
-    def record_visibility() -> None:
+    def record() -> None:
         assert backend.icon is not None
-        callback_visibility.append(backend.icon.visible)
+        visibility.append(backend.icon.visible)
 
-    tray = make_tray(backend, on_start=record_visibility)
+    tray = make_tray(backend, on_start=record)
 
     tray.run()
 
-    assert callback_visibility == [True]
+    assert visibility == [True]
     assert fake_icon(tray).visible is True
-    assert [item.text for item in menu_items(tray)] == [
-        "Browse/search VN skin library...",
-        "Sync: Starting",
-        "Library: reading local catalog",
+    assert labels(rows(tray)) == [
+        "Starting - reading local catalog",
         "LTK: checking the latest official release",
-        "LTK port: checking VN handoff state",
-        "Runtime: Installed v9.9.9",
-        "Sync VN skins now",
-        "CSLOL Manager",
-        "LTK Manager",
-        "Maintenance",
+        "---",
+        "Open LTK Manager",
+        "Sync skins now",
+        "Enemy cooldown timers...",
+        "---",
+        "Folders",
+        "Advanced",
+        "---",
         "Start with Windows",
         "Exit",
     ]
-    assert [item.text for item in submenu_items(tray, "CSLOL Manager")] == [
-        "Open CSLOL Manager",
-        "Open installed skins folder",
-        "Copy CSLOL Manager folder path",
+    assert labels(submenu(tray, "Folders")) == [
+        "Skins in LTK",
+        "Skins in CSLOL",
+        "App data",
+        "Diagnostics log",
     ]
-    assert [item.text for item in submenu_items(tray, "LTK Manager")] == [
-        "Open or install LTK Manager",
-        "Open LTK application folder",
-        "Open LTK skin storage folder",
-        "Port CSLOL skins to LTK now...",
-        "Cancel active LTK port",
+    assert labels(submenu(tray, "Advanced")) == [
+        "Rebuild LTK library now",
+        "---",
+        "Remove all skins from LTK...",
+        "Uninstall TestApp...",
     ]
-    assert [item.text for item in submenu_items(tray, "Maintenance")] == [
-        "Open LeagueSkinManagerVN data folder",
-        "Open diagnostics log",
-        "Reset LTK port history...",
-        "Remove all LTK skins...",
-        "Uninstall LeagueSkinManagerVN...",
-    ]
-    assert root_item(tray, "Browse/search VN skin library...").options["default"] is True
-    for prefix in ("Sync:", "Library:", "LTK:", "LTK port:", "Runtime:"):
-        assert find_prefixed_item(menu_items(tray), prefix).options["enabled"] is False
+    assert find_item(rows(tray), "Open LTK Manager").options["default"] is True
+    for prefix in ("Starting", "LTK:"):
+        assert find_prefixed(rows(tray), prefix).options["enabled"] is False
 
 
-def test_status_catalog_ltk_and_runtime_labels_refresh_independently() -> None:
-    backend = FakeBackend()
-    tray = make_tray(backend)
+def test_the_menu_carries_no_removed_vocabulary() -> None:
+    tray = make_tray(FakeBackend())
+    tray.update_ltk_library(installed=True, in_library=3, enabled=1)
 
-    tray.update_status(AppState.READY, "Catalog is current")
+    text = " ".join(
+        labels(rows(tray)) + labels(submenu(tray, "Folders")) + labels(submenu(tray, "Advanced"))
+    ).casefold()
+
+    for gone in ("port", "handoff", "browse", "search", "cslol manager", "migrat"):
+        assert gone not in text
+
+
+def test_status_rows_report_sync_state_counts_and_patch() -> None:
+    tray = make_tray(FakeBackend())
+
+    tray.update_status(AppState.READY, "Ready - 1907 skins")
     tray.update_library(1907, "25.14")
-    tray.update_ltk_status("v1.11 installed")
 
+    assert find_prefixed(rows(tray), "Ready").text == "Ready - 1,907 skins - patch 25.14"
     assert tray.state is AppState.READY
-    assert tray.detail == "Catalog is current"
-    assert tray.native_icon.title == ("Test Skin Manager | Catalog is current | 1,907 skins")
-    assert tray.native_icon.icon == "image:READY"
-    assert find_prefixed_item(menu_items(tray), "Sync:").text == "Sync: Catalog is current"
-    assert find_prefixed_item(menu_items(tray), "Library:").text == (
-        "Library: 1,907 VN skins | patch 25.14"
-    )
-    assert find_prefixed_item(menu_items(tray), "LTK:").text == "LTK: v1.11 installed"
-    assert find_prefixed_item(menu_items(tray), "Runtime:").text == ("Runtime: Installed v9.9.9")
-    assert fake_icon(tray).menu_updates == 3
+    assert fake_icon(tray).icon == "image:READY"
 
 
-def test_tooltip_and_dynamic_menu_labels_stay_within_platform_bounds() -> None:
-    backend = FakeBackend()
-    tray = make_tray(backend)
+def test_an_error_state_shows_the_diagnostic_detail() -> None:
+    tray = make_tray(FakeBackend())
+    tray.update_library(10, "25.14")
 
-    tray.update_library(1907, "25.14")
-    tray.update_status(AppState.READY, "download complete " * 20)
-    tray.update_ltk_status("port status " * 20)
+    tray.update_status(AppState.ERROR, "Sync failed: disk full")
 
-    assert len(tray.native_icon.title) <= 127
-    assert tray.native_icon.title.endswith("...")
-    assert len(find_prefixed_item(menu_items(tray), "Sync:").text) <= 96
-    assert len(find_prefixed_item(menu_items(tray), "LTK:").text) <= 96
-
-
-def test_ltk_port_status_advertises_only_an_explicit_manual_handoff() -> None:
-    backend = FakeBackend()
-    tray = make_tray(backend)
-
-    tray.update_ltk_port_status(pending=12, total=1907)
-
-    assert find_prefixed_item(menu_items(tray), "LTK port:").text == (
-        "LTK port: 12 of 1,907 VN skins need manual port"
-    )
-    assert find_item(
-        submenu_items(tray, "LTK Manager"),
-        "Port CSLOL skins to LTK now (12 pending)...",
-    )
-    assert "LTK port recommended" in tray.native_icon.title
-
-    tray.update_ltk_port_status(pending=0, total=1907)
-    assert find_prefixed_item(menu_items(tray), "LTK port:").text == (
-        "LTK port: all 1,907 current VN skins were queued"
-    )
-    assert find_item(
-        submenu_items(tray, "LTK Manager"),
-        "Port CSLOL skins to LTK now...",
-    )
-    assert "LTK port recommended" not in tray.native_icon.title
-
-    tray.update_ltk_port_status(pending=0, total=0)
-    assert find_prefixed_item(menu_items(tray), "LTK port:").text == (
-        "LTK port: no VN-managed skins to port"
-    )
-
-    tray.update_ltk_port_status(pending=None, total=None, unavailable=True)
-    assert find_prefixed_item(menu_items(tray), "LTK port:").text == (
-        "LTK port: status unavailable; check diagnostics"
-    )
+    assert find_prefixed(rows(tray), "Error:").text == "Error: Sync failed: disk full"
 
 
 @pytest.mark.parametrize(
-    ("pending", "total", "unavailable"),
+    ("state", "word"),
     [
-        (None, 1, False),
-        (1, None, False),
-        (-1, 1, False),
-        (2, 1, False),
-        (True, 1, False),
-        (0, 1, True),
+        (AppState.OFFLINE_READY, "Offline"),
+        (AppState.SYNCING, "Syncing"),
+        (AppState.STOPPING, "Stopping"),
     ],
 )
-def test_ltk_port_status_rejects_inconsistent_counts(
-    pending: int | None,
-    total: int | None,
-    unavailable: bool,
-) -> None:
+def test_each_state_has_a_short_word(state: AppState, word: str) -> None:
+    tray = make_tray(FakeBackend())
+    tray.update_library(5, None)
+
+    tray.update_status(state, "detail")
+
+    assert find_prefixed(rows(tray), word).text == f"{word} - 5 skins"
+
+
+def test_ltk_row_reports_library_counts_and_enabled_skins() -> None:
     tray = make_tray(FakeBackend())
 
-    with pytest.raises(ValueError):
-        tray.update_ltk_port_status(
-            pending=pending,
-            total=total,
-            unavailable=unavailable,
-        )
+    tray.update_ltk_library(installed=True, in_library=1922, enabled=0, expected=1922, pending=0)
+
+    assert find_prefixed(rows(tray), "LTK:").text == "LTK: 1,922 skins - 0 enabled"
 
 
-def test_sync_and_cancel_actions_track_operational_state() -> None:
-    backend = FakeBackend()
-    tray = make_tray(backend)
+def test_ltk_row_reports_drift_when_a_rebuild_is_needed() -> None:
+    tray = make_tray(FakeBackend())
 
-    sync = root_item(tray, "Sync VN skins now")
-    cancel = find_item(submenu_items(tray, "LTK Manager"), "Cancel active LTK port")
-    assert sync.options["enabled"] is False
-    assert cancel.options["enabled"] is False
+    tray.update_ltk_library(installed=True, in_library=1900, enabled=2, expected=1927, pending=27)
+
+    assert find_prefixed(rows(tray), "LTK:").text == "LTK: 1,900 of 1,927 skins - 27 to rebuild"
+    assert "rebuild pending" in fake_icon(tray).title
+
+
+def test_ltk_row_reports_a_missing_install_and_offers_to_install() -> None:
+    tray = make_tray(FakeBackend())
+
+    tray.update_ltk_library(installed=False)
+
+    assert find_prefixed(rows(tray), "LTK:").text == "LTK: not installed"
+    assert find_item(rows(tray), "Install LTK Manager...").options["default"] is True
+
+
+def test_ltk_row_reports_an_unreadable_library() -> None:
+    tray = make_tray(FakeBackend())
+    tray.update_ltk_status("idle", rebuild_active=False)
+
+    tray.update_ltk_library(installed=True)
+
+    assert find_prefixed(rows(tray), "LTK:").text == "LTK: idle"
+
+
+def test_active_rebuild_activity_replaces_the_library_summary() -> None:
+    tray = make_tray(FakeBackend())
+    tray.update_ltk_library(installed=True, in_library=5, enabled=0)
+
+    tray.update_ltk_status("queueing 12/1927 - Ahri", rebuild_active=True)
+
+    assert find_prefixed(rows(tray), "LTK:").text == "LTK: queueing 12/1927 - Ahri"
+
+    tray.update_ltk_status("done", rebuild_active=False)
+
+    assert find_prefixed(rows(tray), "LTK:").text == "LTK: 5 skins - 0 enabled"
+
+
+@pytest.mark.parametrize("value", [-1, True])
+def test_ltk_library_counts_must_be_non_negative_integers(value: Any) -> None:
+    tray = make_tray(FakeBackend())
+
+    with pytest.raises(ValueError, match="non-negative"):
+        tray.update_ltk_library(installed=True, in_library=value)
+
+
+def test_negative_skin_counts_are_rejected() -> None:
+    tray = make_tray(FakeBackend())
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        tray.update_library(-1, None)
+
+
+def test_blank_runtime_label_is_rejected() -> None:
+    with pytest.raises(ValueError, match="runtime_label"):
+        make_tray(FakeBackend(), runtime_label="  ")
+
+
+def test_tooltip_and_menu_rows_stay_within_platform_bounds() -> None:
+    tray = make_tray(FakeBackend(), runtime_label="Installed v9.9.9")
+
+    tray.update_status(AppState.ERROR, "x" * 400)
+    tray.update_ltk_status("y" * 400, rebuild_active=True)
+    tray.update_library(1234567, "z" * 200)
+
+    assert len(fake_icon(tray).title) <= TITLE_LIMIT
+    for item in rows(tray):
+        if isinstance(item, FakeMenuItem):
+            assert len(item.text) <= MENU_TEXT_LIMIT
+
+
+def test_sync_is_disabled_while_busy() -> None:
+    tray = make_tray(FakeBackend())
+
+    for state in (AppState.STARTING, AppState.SYNCING, AppState.STOPPING):
+        tray.update_status(state, "busy")
+        assert find_item(rows(tray), "Sync skins now").options["enabled"] is False
 
     tray.update_status(AppState.READY, "Ready")
-    assert root_item(tray, "Sync VN skins now").options["enabled"] is True
-
-    tray.update_status(AppState.SYNCING, "Downloading")
-    assert root_item(tray, "Sync VN skins now").options["enabled"] is False
-
-    tray.update_ltk_status("Porting 4 of 20", migration_active=True)
-    assert (
-        find_item(
-            submenu_items(tray, "LTK Manager"),
-            "Cancel active LTK port",
-        ).options["enabled"]
-        is True
-    )
-
-    tray.update_ltk_status("Port cancelled", migration_active=False)
-    assert (
-        find_item(
-            submenu_items(tray, "LTK Manager"),
-            "Cancel active LTK port",
-        ).options["enabled"]
-        is False
-    )
-
-    tray.update_status(AppState.STOPPING, "Stopping")
-    assert root_item(tray, "Sync VN skins now").options["enabled"] is False
+    assert find_item(rows(tray), "Sync skins now").options["enabled"] is True
 
 
 def test_portable_runtime_disables_install_owned_actions() -> None:
-    backend = FakeBackend()
     tray = make_tray(
-        backend,
-        runtime_label="Portable v2.7.0",
+        FakeBackend(),
+        runtime_label="Portable v9.9.9",
         uninstall_available=False,
         startup_available=False,
     )
 
-    assert root_item(tray, "Runtime: Portable v2.7.0").options["enabled"] is False
-    assert root_item(tray, "Start with Windows").options["enabled"] is False
-    assert (
-        find_item(
-            submenu_items(tray, "Maintenance"),
-            "Uninstall LeagueSkinManagerVN...",
-        ).options["enabled"]
-        is False
-    )
+    assert find_item(submenu(tray, "Advanced"), "Uninstall TestApp...").options["enabled"] is False
+    assert find_item(rows(tray), "Start with Windows").options["enabled"] is False
+    assert "Portable v9.9.9" in fake_icon(tray).title
 
 
-def test_each_non_shutdown_menu_action_dispatches_only_its_callback() -> None:
-    backend = FakeBackend()
+def test_each_action_dispatches_only_its_own_callback() -> None:
     calls: list[str] = []
     tray = make_tray(
-        backend,
-        on_show=lambda: calls.append("show"),
+        FakeBackend(),
         on_sync=lambda: calls.append("sync"),
-        on_start_manager=lambda: calls.append("manager"),
+        on_open_ltk=lambda: calls.append("ltk"),
+        on_open_cooldowns=lambda: calls.append("cooldowns"),
+        on_open_ltk_skins=lambda: calls.append("ltk-skins"),
         on_open_cslol_skins=lambda: calls.append("cslol-skins"),
-        on_copy_cslol_manager_path=lambda: calls.append("copy-cslol-root"),
-        on_start_ltk=lambda: calls.append("ltk"),
-        on_open_ltk_install=lambda: calls.append("ltk-app-folder"),
-        on_open_ltk_storage=lambda: calls.append("ltk-storage"),
-        on_migrate_to_ltk=lambda: calls.append("port"),
-        on_cancel_ltk_migration=lambda: calls.append("cancel-port"),
         on_open_data=lambda: calls.append("data"),
         on_open_log=lambda: calls.append("log"),
-        on_reset_ltk_migration=lambda: calls.append("reset-port"),
-        on_remove_ltk_skins=lambda: calls.append("clean-ltk"),
+        on_rebuild_library=lambda: calls.append("rebuild"),
+        on_remove_ltk_skins=lambda: calls.append("remove"),
     )
     tray.update_status(AppState.READY, "Ready")
-    tray.update_ltk_status("Porting", migration_active=True)
-    actions = [
-        (menu_items(tray), "Browse/search VN skin library...", "show"),
-        (menu_items(tray), "Sync VN skins now", "sync"),
-        (submenu_items(tray, "CSLOL Manager"), "Open CSLOL Manager", "manager"),
-        (
-            submenu_items(tray, "CSLOL Manager"),
-            "Open installed skins folder",
-            "cslol-skins",
-        ),
-        (
-            submenu_items(tray, "CSLOL Manager"),
-            "Copy CSLOL Manager folder path",
-            "copy-cslol-root",
-        ),
-        (submenu_items(tray, "LTK Manager"), "Open or install LTK Manager", "ltk"),
-        (
-            submenu_items(tray, "LTK Manager"),
-            "Open LTK application folder",
-            "ltk-app-folder",
-        ),
-        (
-            submenu_items(tray, "LTK Manager"),
-            "Open LTK skin storage folder",
-            "ltk-storage",
-        ),
-        (
-            submenu_items(tray, "LTK Manager"),
-            "Port CSLOL skins to LTK now...",
-            "port",
-        ),
-        (
-            submenu_items(tray, "LTK Manager"),
-            "Cancel active LTK port",
-            "cancel-port",
-        ),
-        (
-            submenu_items(tray, "Maintenance"),
-            "Open LeagueSkinManagerVN data folder",
-            "data",
-        ),
-        (submenu_items(tray, "Maintenance"), "Open diagnostics log", "log"),
-        (
-            submenu_items(tray, "Maintenance"),
-            "Reset LTK port history...",
-            "reset-port",
-        ),
-        (
-            submenu_items(tray, "Maintenance"),
-            "Remove all LTK skins...",
-            "clean-ltk",
-        ),
-    ]
 
-    expected_calls: list[str] = []
-    for items, label, expected_call in actions:
-        click(tray, find_item(items, label))
-        expected_calls.append(expected_call)
-        assert calls == expected_calls
+    actions = [
+        (rows(tray), "Open LTK Manager", "ltk"),
+        (rows(tray), "Sync skins now", "sync"),
+        (rows(tray), "Enemy cooldown timers...", "cooldowns"),
+        (submenu(tray, "Folders"), "Skins in LTK", "ltk-skins"),
+        (submenu(tray, "Folders"), "Skins in CSLOL", "cslol-skins"),
+        (submenu(tray, "Folders"), "App data", "data"),
+        (submenu(tray, "Folders"), "Diagnostics log", "log"),
+        (submenu(tray, "Advanced"), "Rebuild LTK library now", "rebuild"),
+        (submenu(tray, "Advanced"), "Remove all skins from LTK...", "remove"),
+    ]
+    for items, text, expected in actions:
+        calls.clear()
+        click(tray, find_item(items, text))
+        assert calls == [expected], f"{text} dispatched {calls}"
 
 
 def test_callback_errors_are_contained_and_reported() -> None:
-    backend = FakeBackend()
+    def explode() -> None:
+        raise RuntimeError("boom")
 
-    def fail() -> None:
-        raise RuntimeError("sync exploded")
+    tray = make_tray(FakeBackend(), on_sync=explode)
+    tray.update_status(AppState.READY, "Ready")
 
-    tray = make_tray(backend, on_sync=fail)
+    click(tray, find_item(rows(tray), "Sync skins now"))
 
-    click(tray, root_item(tray, "Sync VN skins now"))
-
-    assert fake_icon(tray).notifications == [
-        (
-            "LeagueSkinManagerVN",
-            "Could not complete skin sync: sync exploded",
-        )
-    ]
+    title, message = fake_icon(tray).notifications[-1]
+    assert title == "TestApp"
+    assert "boom" in message
 
 
 def test_startup_toggle_refreshes_checked_state() -> None:
-    backend = FakeBackend()
-    calls: list[bool] = []
-    startup = {"enabled": False}
-
-    def set_startup(enabled: bool) -> bool:
-        startup["enabled"] = enabled
-        calls.append(enabled)
-        return True
-
+    enabled = {"value": False}
     tray = make_tray(
-        backend,
-        startup_enabled=lambda: startup["enabled"],
-        set_startup_enabled=set_startup,
+        FakeBackend(),
+        startup_enabled=lambda: enabled["value"],
+        set_startup_enabled=lambda desired: enabled.__setitem__("value", desired),
     )
 
-    click(tray, root_item(tray, "Start with Windows"))
+    item = find_item(rows(tray), "Start with Windows")
+    assert item.options["checked"](item) is False
+    click(tray, item)
 
-    refreshed = root_item(tray, "Start with Windows")
-    checked = refreshed.options["checked"]
-    assert callable(checked)
-    assert checked(refreshed) is True
-    assert calls == [True]
+    assert enabled["value"] is True
+    refreshed = find_item(rows(tray), "Start with Windows")
+    assert refreshed.options["checked"](refreshed) is True
 
 
-def test_failed_startup_toggle_keeps_existing_state_and_notifies() -> None:
-    backend = FakeBackend()
+def test_a_refused_startup_toggle_notifies_without_changing_state() -> None:
     tray = make_tray(
-        backend,
+        FakeBackend(),
         startup_enabled=lambda: False,
-        set_startup_enabled=lambda _enabled: False,
+        set_startup_enabled=lambda _desired: False,
     )
 
-    click(tray, root_item(tray, "Start with Windows"))
+    click(tray, find_item(rows(tray), "Start with Windows"))
 
-    assert fake_icon(tray).notifications == [
-        ("Start with Windows", "The startup setting could not be updated.")
-    ]
+    title, message = fake_icon(tray).notifications[-1]
+    assert title == "Start with Windows"
+    assert "could not be updated" in message
 
 
-def test_timed_out_shutdown_keeps_tray_active_and_allows_retry() -> None:
-    backend = FakeBackend()
-    outcomes = iter((False, True))
-    exit_calls = 0
+def test_a_timed_out_shutdown_keeps_the_tray_active_and_allows_retry() -> None:
+    results = iter((False, True))
+    tray = make_tray(FakeBackend(), on_exit=lambda: next(results))
 
-    def exit_app() -> bool:
-        nonlocal exit_calls
-        exit_calls += 1
-        return next(outcomes)
+    click(tray, find_item(rows(tray), "Exit"))
 
-    tray = make_tray(backend, on_exit=exit_app)
-
-    click(tray, root_item(tray, "Exit"))
-    assert exit_calls == 1
     assert fake_icon(tray).stop_calls == 0
-    assert fake_icon(tray).notifications == [
-        (
-            "Action not completed",
-            "Background work is still stopping. The app remains active; try Exit again.",
-        )
-    ]
+    assert "try Exit again" in fake_icon(tray).notifications[-1][1]
 
-    click(tray, root_item(tray, "Exit"))
-    assert exit_calls == 2
+    click(tray, find_item(rows(tray), "Exit"))
+
     assert fake_icon(tray).stop_calls == 1
 
 
-def test_shutdown_callback_error_does_not_stop_tray() -> None:
-    backend = FakeBackend()
+def test_a_shutdown_callback_error_does_not_stop_the_tray() -> None:
+    def explode() -> bool:
+        raise RuntimeError("shutdown failed")
 
-    def fail_exit() -> bool:
-        raise RuntimeError("worker state unavailable")
+    tray = make_tray(FakeBackend(), on_exit=explode)
 
-    tray = make_tray(backend, on_exit=fail_exit)
-
-    click(tray, root_item(tray, "Exit"))
+    click(tray, find_item(rows(tray), "Exit"))
 
     assert fake_icon(tray).stop_calls == 0
-    assert fake_icon(tray).notifications == [
-        (
-            "LeagueSkinManagerVN",
-            "Could not complete application shutdown: worker state unavailable",
-        )
-    ]
+    assert "shutdown failed" in fake_icon(tray).notifications[-1][1]
 
 
-def test_tray_uninstall_uses_the_same_bounded_shutdown_path() -> None:
-    backend = FakeBackend()
+def test_uninstall_uses_the_same_bounded_shutdown_path() -> None:
     calls: list[str] = []
-
-    def uninstall() -> bool:
-        calls.append("uninstall")
-        return True
-
-    tray = make_tray(backend, on_uninstall=uninstall)
-    uninstall_item = find_item(
-        submenu_items(tray, "Maintenance"),
-        "Uninstall LeagueSkinManagerVN...",
+    tray = make_tray(
+        FakeBackend(),
+        on_uninstall=lambda: calls.append("uninstall") or True,
     )
 
-    click(tray, uninstall_item)
-    click(tray, uninstall_item)
+    click(tray, find_item(submenu(tray, "Advanced"), "Uninstall TestApp..."))
 
     assert calls == ["uninstall"]
+    assert fake_icon(tray).stop_calls == 1
+
+
+def test_stop_is_idempotent() -> None:
+    tray = make_tray(FakeBackend())
+
+    tray.stop()
+    tray.stop()
+
     assert fake_icon(tray).stop_calls == 1

@@ -9,7 +9,7 @@ from pathlib import Path
 
 APP_NAME = "LeagueSkinManagerVN"
 APP_DISPLAY_NAME = "League Skin Manager VN"
-APP_VERSION = "2.7.0"
+APP_VERSION = "3.0.0"
 APP_PUBLISHER = "Quinntana"
 APP_INFO_URL = "https://github.com/Quinntana/LeagueSkinManagerVN"
 UNINSTALL_APP_NAME = "LeagueSkinManagerVNUninstall"
@@ -42,12 +42,13 @@ class AppPaths:
     package_cache_dir: Path
     ltk_cache_dir: Path
     migration_report_dir: Path
-    ltk_migration_state_file: Path
     ltk_archive_index_file: Path
+    ltk_package_index_file: Path
     ltk_data_dir: Path
     log_dir: Path
     managed_manifest_file: Path
     manager_version_file: Path
+    cooldown_event_file: Path
 
     @classmethod
     def discover(
@@ -78,12 +79,13 @@ class AppPaths:
             package_cache_dir=cache_dir / "packages",
             ltk_cache_dir=cache_dir / "ltk",
             migration_report_dir=data_dir / "migration-reports",
-            ltk_migration_state_file=data_dir / "ltk_migration_state.json",
             ltk_archive_index_file=data_dir / "ltk_archive_index.json",
+            ltk_package_index_file=data_dir / "ltk_package_index.json",
             ltk_data_dir=data_dir.parent / "dev.leaguetoolkit.manager",
             log_dir=data_dir / "logs",
             managed_manifest_file=data_dir / "managed_skins.json",
             manager_version_file=manager_dir / "version.txt",
+            cooldown_event_file=data_dir / "cooldown-events.csv",
         )
 
     def ensure(self) -> None:

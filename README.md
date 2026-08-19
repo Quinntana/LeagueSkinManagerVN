@@ -1,28 +1,46 @@
 # LeagueSkinManagerVN
 
-A native Windows tray application with an optional searchable library that keeps a CSLOL Manager
-installation and an application-owned set of League skin mods synchronized,
-while also providing a verified official LTK Manager companion and a safe
-CSLOL-to-LTK migration path. User mods, profiles, and CSLOL originals are not
-overwritten.
+A native Windows **system-tray** application that keeps an application-owned set of
+League skin mods synchronized and keeps LTK Manager's skin library equal to that set.
+It installs and verifies the official LTK Manager, and uses CSLOL Manager as the
+fallback backend.
 
-## Optional skin library
+## The tray is the only interface
 
-Normal launches stay in the system tray and do not construct or run Tk. Choose
-**Browse/search VN skin library...** only when you want the optional window backed by
-the validated offline manifest:
+There is no application window and no skin browser. Every action lives in the tray
+menu, which stays deliberately small:
 
-- Instant accent- and punctuation-tolerant search across champion and skin names.
-- Champion filtering and sortable Champion, Skin, and Package size columns.
-- Installed skin, champion, patch, and source-commit statistics.
-- Selected-mod details plus shortcuts for the installed folder, AppData, and logs.
-- `Sync VN skins`, CSLOL and LTK launch controls, a guided LTK migration tool,
-  background startup, refresh, and clean exit controls.
+```text
+Ready - 1,927 skins - patch 16.14.1        (status, not clickable)
+LTK: 1,927 skins - 0 enabled               (status, not clickable)
+-------------------------------------------
+Open LTK Manager                            <- left-click default
+Sync skins now
+Enemy cooldown timers...
+-------------------------------------------
+Folders   >   Skins in LTK | Skins in CSLOL | App data | Diagnostics log
+Advanced  >   Rebuild LTK library now
+              Remove all skins from LTK... | Uninstall LeagueSkinManagerVN...
+-------------------------------------------
+Start with Windows                      [x]
+Exit
+```
 
-Closing the window keeps the core service available in the tray. The tray owns the
-application lifetime; a presentation failure does not stop synchronization, process
-monitoring, CSLOL, or LTK tasks. `--background` remains a compatibility option, while
-`--show-window` is the only startup option that explicitly opens the optional window.
+The second row reports the honest end-to-end state: how many skins LTK actually
+holds, and **how many are switched on**. A skin present in LTK but not enabled does
+nothing in game, so that count is shown rather than implied. When LTK has drifted from
+the current set the row reads `LTK: 1,900 of 1,927 skins - 27 to rebuild`; when LTK is
+absent it reads `LTK: not installed` and the first action becomes
+**Install LTK Manager...**.
+
+**Enemy cooldown timers...** opens the one optional window: a manual timer board that
+reads nothing from the game or the network. Click a slot to start or restart it,
+right-click to cancel. Each row has an editable name, an ultimate duration in seconds,
+and two summoner-spell presets; transitions are appended to `cooldown-events.csv`.
+It owns its own event loop, so closing or crashing it cannot disturb the tray.
+
+`--no-sync` starts without the initial synchronization. `--background` is accepted for
+compatibility with the Windows startup entry and does nothing.
 
 ## Important notice
 
@@ -63,79 +81,112 @@ installer and updater manage the external application.
    corruption, same-size tampering, symlinks, or junctions force a rebuild from the
    verified package cache. Per-file, aggregate, and free-space limits fail before a
    source can exhaust the machine during normal staging.
-8. A low-overhead native Windows process monitor starts CSLOL Manager once for each
-   League Client process. If League starts during synchronization, launch is deferred
-   until the transaction finishes.
+8. A low-overhead native Windows process monitor starts the preferred skin manager
+   backend once for each League Client process: the installed official LTK Manager
+   when present, otherwise CSLOL Manager. If League starts during synchronization,
+   launch is deferred until the transaction finishes. The tray's explicit launch
+   action uses the same preference.
 9. Synchronization is paused while CSLOL Manager or any helper executable inside its
    owned directory is running, avoiding live mod-directory mutation.
-10. In a separate background task, the latest official LTK Manager release metadata is
-    checked. When LTK is missing or outdated, its exact x64 NSIS installer is downloaded
+10. In a separate background task, the installed LTK version is compared against the
+    latest official release. That comparison is what decides everything below, and it
+    is deliberately cheap to repeat: the located installation is reused while LTK's
+    executable is unchanged (an update, move, or removal forces a fresh lookup), and a
+    successful release check is cached for six hours. An install that already satisfies
+    a recent check therefore needs no network request at all. The cache is only ever
+    used to confirm that outcome - whenever an installer might actually be downloaded,
+    the release metadata is refetched, so verification never runs on cached data.
+    When LTK is missing or outdated, its exact x64 NSIS installer is downloaded
     from `LeagueToolkit/ltk-manager`, checked against GitHub's release size and SHA-256,
     and required to have a valid Windows Authenticode signature from `Natoken LLC`.
     Verification failures are never downgraded to warnings. Downloading does not run the
-    installer; an explicit **Open / install LTK** or confirmed migration action does.
-    LeagueSkinManagerVN does not change LTK's content-enforcement or safety settings and
-    does not pass flags intended to disable them.
-11. The port chooser accepts either a CSLOL Manager root or its direct `installed`
-    folder. Porting is **manual only**: startup, automatic LTK release preparation, and
-    `Sync now` never scan or copy CSLOL mods into LTK. Files are considered only after the
-    user presses **Port CSLOL skins to LTK now...** and confirms the selected folder. Both
-    CSLOL and LTK (including the legacy LeagueSkinManagerLTK app/patcher) must be closed.
-    Valid mods are queued only through LTK's supported `archives` inbox; normal porting
-    never edits LTK's library, profiles, or indexes directly.
-12. A separate tray summary compares every current VN-managed mod's exact installed path
-    and content SHA-256 with the durable migration ledger. After a skin update it reports
-    how many current VN skins need a manual port and marks the port action with the pending
-    count. A zero count means those exact packages were queued or previously observed in
-    LTK's archive inbox; it does not claim that LTK imported or activated them. This check
-    is read-only, survives restarts, refreshes after successful sync/port/history actions,
-    and never starts a port by itself.
-13. Migration reuses the verified package cache when an extracted mod still matches its
-    manifest fingerprint and deterministically repackages changed or user-owned mods.
-    WAD-heavy packages use ZIP's no-recompression mode, avoiding expensive level-9
-    deflate for data that is already compressed. Packages are SHA-256 deduplicated across
-    both the current inbox and bounded VN-owned content/archive indexes. Unchanged repeat
-    ports skip packaging and full LTK archive scans even after LTK consumes its inbox.
-    Writes still use fsynced temporary files, atomic renames, cancellation, resource
-    limits, and an audit report. Legacy migration history is read compatibly and upgraded
-    without requeueing unchanged packages.
+    installer; only an explicit **Open / Install LTK Manager** click does.
+    LeagueSkinManagerVN never writes LTK's `settings.json`, so its content-enforcement
+    and safety settings are left exactly as you set them, and no flags intended to
+    disable them are ever passed.
+11. **LTK's skin library is managed, not shared.** Because this application installs
+    and controls LTK, its library is treated as a reproducible mirror of the current
+    skin set rather than as user-owned data. The baseline is: *LTK holds exactly one
+    package per current skin, nothing else, and nothing enabled.*
+12. Reconciliation to that baseline is declarative and idempotent. The desired set is
+    derived from the managed manifest and the verified package cache; the actual set is
+    read from LTK's storage. Anything present but not desired is removed, anything
+    desired but absent is queued, and every profile's enabled selections are cleared.
+    This works because LTK stores an imported package byte-for-byte under its own
+    identifier, so a package's SHA-256 is a stable identity across import.
+13. It is differential, not a wipe: a normal update touches only the difference, and a
+    repeat pass is a no-op. Packages come **straight from the verified package cache** -
+    the manifest records each skin's upstream byte count and Git blob SHA-1 and the
+    cached `.fantome` is revalidated against both - so no CSLOL extraction is read,
+    walked, or hashed, and a rebuild works even with an empty CSLOL folder.
+14. A rebuild runs after every successful sync, and can be started by hand with
+    **Rebuild LTK library now**. It requires both CSLOL and LTK to be closed, so a pass
+    that finds either running defers without a popup and retries after the League client
+    exits or after the next sync. An unchanged automatic pass stays silent.
+15. **What this means for you:** skins you import into LTK yourself, and which skins you
+    switched on, are *not* preserved - the next rebuild resets both. LTK Manager itself,
+    its `settings.json`, and its logs are never touched. If you want a skin active,
+    enable it in LTK after a rebuild.
+## How LTK import works
 
-If the network or source is unavailable, a valid existing manager/mod installation
-remains usable and the tray reports `Ready offline`. A first run with nothing cached
-reports an actionable error instead of destroying or partially installing content.
+This behaviour was established empirically against LTK Manager v1.13.0 by importing a
+package and removing it again, and it is what the automatic port relies on. Re-verify
+it before trusting these guarantees against a much newer LTK release.
 
-CSLOL Manager's maintainers now describe it as being in maintenance/deprecation mode
-while development moves to LTK Manager. CSLOL remains the automatic backend started for
-League in this release, preserving the existing workflow. LTK is an independent,
-explicitly launched companion: no LTK DLL or injection core is bundled, copied, or
-invoked directly by LeagueSkinManagerVN.
+- LTK runs a **library watcher** over its `archives` and `mods` directories and also
+  reconciles once at startup. A `.fantome` file placed in `archives` by another
+  application is adopted: LTK logs `Discovered and registered archive: <name> as
+  <mod-id>`. Dropping a complete package into `archives` is therefore a supported
+  ingestion path, not a hopeful guess.
+- On import LTK copies the package to `archives/<mod-id>.fantome`, extracts derived
+  metadata to `mods/<mod-id>/mod.config.json`, appends `{id, installedAt, format}` to
+  `library.json`, and registers the identifier in its folder structure. The originally
+  dropped file is then deleted.
+- **The stored copy is byte-for-byte identical to the file that was handed over.** A
+  package's SHA-256 is therefore stable across import, which is what lets
+  LeagueSkinManagerVN recognise its own previously queued content inside LTK using
+  nothing but its existing ledger and archive-hash index. Filenames and LTK's logs are
+  *not* usable for this: the file is renamed on import, and LTK deletes logs older than
+  the current session on startup.
+- Removing one mod means removing exactly that set of artifacts: the archive, the
+  metadata directory, the `library.json` entry, every profile `enabledMods`,
+  `modOrder`, and `layerStates` reference, the folder `modIds` reference, and the
+  `wad-reports.json` entry. LTK accepts such an externally performed removal silently
+  on its next start, with no orphan or repair warnings.
+- LTK persists its configuration **only when something actually changes**. A complete
+  open-and-close session with no user action left `settings.json`, `library.json`,
+  `wad-reports.json`, and `.window-state.json` byte-identical, with unchanged
+  modification times. LTK therefore does not hold these files in memory and flush them
+  on exit, so an external edit made while LTK is closed cannot be silently reverted by
+  stale in-process state. `library.json` is also written with the same two-space
+  indentation this application uses. Editing LTK-owned files nonetheless remains
+  gated on LTK being stopped, because the watcher reconciles live changes.
+
+Because a superseded package can be located exactly, VN removes only its own outdated
+skins and leaves every other mod in the library untouched. The all-or-nothing **Remove
+all LTK skins** action remains available as a separate, explicitly confirmed reset.
 
 ## Tray controls
 
-- Disabled summary rows show current sync detail, VN skin count and patch, LTK companion
-  state, exact pending manual-port count, and whether this executable is the installed or
-  portable build.
-- `Sync VN skins now`: starts one manual update and is disabled while a sync or shutdown
-  is active. Sync never starts the manual LTK port action.
-- `CSLOL Manager`: opens CSLOL, opens its direct `installed` skins folder, or copies
-  the manager root path (for example
-  `%APPDATA%\LeagueSkinManagerVN\cslol-manager`) without appending `installed`.
-- `LTK Manager`: opens/installs LTK, opens its application or skin-storage folder,
-  starts the explicit port tool, or cancels an active port. When current VN-managed
-  content is not in the port ledger, the action shows the pending count.
-- `Port CSLOL skins to LTK now...`: the only action that can begin a port. It opens a
-  small folder chooser only after the click, defaults its confirmation to No, and does
-  not open or depend on the custom skin-library window.
-- `Maintenance`: opens AppData or the rotating diagnostics log, resets LTK port
-  history, removes LTK skins, or launches the installed uninstaller.
-- `Remove all LTK skins...`: a default-No destructive confirmation. With LTK and its
-  patcher closed, it first resets the VN port history and then removes every archive
-  (including non-VN skins), extracted metadata, WAD report, and generated profile overlay
-  from LTK's configured storage. If history cannot be reset safely, cleanup does not
-  start. LTK itself, settings, logs, and named profile definitions are preserved. A later
-  explicit port can intentionally add skins again.
-- `Reset LTK port history...`: an explicit default-No recovery action
-  for intentionally requeuing content removed from LTK. It deletes no CSLOL or LTK data.
+- The two status rows are not clickable. The first shows sync state, skin count, and
+  patch (or the error detail when something failed); the second shows LTK's library
+  count and how many skins are enabled, any drift from the current set, or live rebuild
+  progress. Whether this is the installed or portable build is in the hover tooltip.
+- `Open LTK Manager` (left-click default): opens LTK, or verifies and starts its
+  official installer when LTK is absent, in which case the row reads
+  **Install LTK Manager...**.
+- `Sync skins now`: starts one manual update; disabled while a sync or shutdown is
+  active. A successful sync is followed by the quiet automatic rebuild.
+- `Enemy cooldown timers...`: opens the manual timer window.
+- `Folders`: opens LTK's skin storage, CSLOL's `installed` folder, this app's data
+  folder, or the rotating diagnostics log.
+- `Rebuild LTK library now`: reconciles LTK to the baseline on demand. Requires CSLOL
+  and LTK to be closed; otherwise it defers and retries later.
+- `Remove all skins from LTK...`: a default-No destructive confirmation. With LTK and
+  its patcher closed, it removes every skin package, extracted metadata, WAD report, and
+  generated profile overlay from LTK's configured storage - including skins you added
+  yourself. LTK itself, its settings, and its logs are preserved, and the next rebuild
+  restores the current skin set.
 - `Start with Windows`: explicit per-user HKCU toggle; disabled by default. A portable
   copy cannot take startup ownership from the installed copy.
 - `Uninstall LeagueSkinManagerVN...`: stops bounded background work, starts the exact
@@ -151,19 +202,25 @@ All mutable data is under `%APPDATA%\LeagueSkinManagerVN`:
 - `cslol-manager/`: manager files, user profiles, and installed mods.
 - `cache/packages/`: content-addressed verified `.fantome` cache.
 - `cache/ltk/`: the current verified official LTK NSIS installer; old exact-version
-  installer files are pruned safely.
+  installer files are pruned safely. `release-check.json` records the last successful
+  release check so a current install can skip the network on later launches.
 - `managed_skins.json`: app-owned install manifest and transaction identity.
-- `ltk_migration_state.json`: bounded SHA-256 history for cross-run migration dedupe.
-- `ltk_archive_index.json`: VN-owned file-identity/hash cache that avoids repeatedly
-  hashing an unchanged large LTK archive library.
-- `migration-reports/`: timestamped migration results and per-mod failures.
+- `ltk_archive_index.json` and `ltk_package_index.json`: file-identity/digest caches
+  so repeat rebuilds stat unchanged packages instead of rehashing them.
+- `migration-reports/`: timestamped rebuild results and per-skin failures.
+- `cooldown-events.csv`: append-only log of manual cooldown-panel transitions.
 - `logs/LeagueSkinManagerVN.log`: rotating diagnostics.
 
-LTK itself remains external. Its normal data root is
-`%APPDATA%\dev.leaguetoolkit.manager`, or the absolute `modStoragePath` selected in LTK's
-own settings. LeagueSkinManagerVN writes only complete packages to that root's
-`archives` directory after port confirmation. Only the separate, explicitly confirmed
-**Remove all LTK skins** action clears LTK-owned skin artifacts.
+LTK's application files remain external and untouched. Its normal data root is
+`%APPDATA%\dev.leaguetoolkit.manager`, or the absolute `modStoragePath` selected in
+LTK's own settings.
+
+**This application manages the skin library under that root.** A rebuild writes complete
+packages into `archives`, deletes packages that are not part of the current skin set -
+including any you imported yourself - removes the matching `mods/<id>` metadata and
+`wad-reports.json` entry, and clears every profile's enabled selections in
+`library.json`. LTK's `settings.json`, its logs, and the LTK application itself are
+never modified.
 
 The per-user setup installs program files under
 `%LOCALAPPDATA%\Programs\LeagueSkinManagerVN` and registers **League Skin Manager VN**
@@ -183,8 +240,8 @@ CSLOL profiles, other application data, and installed program files. Portable
 executables outside the fixed per-user install directory are never deleted. The
 separately installed official LTK Manager and its application data are also never
 removed by the LeagueSkinManagerVN uninstaller; only this app's cached installer,
-migration ledger, archive index, and reports are removed with its AppData. Removing LTK
-skins is always a separate explicit action and is never part of app uninstall.
+digest indexes, and reports are removed with its AppData. Removing skins from LTK is
+always a separate explicit action and is never part of app uninstall.
 
 ## Development
 
