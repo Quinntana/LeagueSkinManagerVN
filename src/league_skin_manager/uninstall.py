@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,14 +125,36 @@ def _remove_tree(path: Path) -> bool:
     return True
 
 
-def _run_ltk_uninstaller() -> bool:
-    """Start LTK's own uninstaller, which is the only supported way to remove it."""
+def _run_ltk_uninstaller(timeout_seconds: float = 20.0) -> bool:
+    """Run LTK's own uninstaller and wait for it to finish.
+
+    Passes /S because the user already confirmed in this application's own
+    dialog; without it LTK's uninstaller waits on a window it cannot show,
+    since the process is spawned with CREATE_NO_WINDOW, and silently does
+    nothing.
+
+    Waits rather than reporting on launch alone. Starting a detached process
+    says nothing about whether it succeeded, and reporting "removed LTK
+    Manager" when the directory is still there is worse than reporting a
+    failure.
+    """
 
     uninstaller = ltk.uninstaller()
     if uninstaller is None:
         LOGGER.info("LTK Manager's uninstaller was not found; nothing to run")
         return False
-    return windows.launch_detached(uninstaller)
+    install_dir = uninstaller.parent
+    if not windows.launch_detached(uninstaller, ("/S",)):
+        return False
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not install_dir.exists():
+            LOGGER.info("LTK Manager was removed by its own uninstaller")
+            return True
+        time.sleep(0.5)
+    LOGGER.warning("LTK Manager's uninstaller did not finish within %.0fs", timeout_seconds)
+    return False
 
 
 def _shutdown_logging() -> None:

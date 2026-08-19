@@ -12,7 +12,7 @@ from league_skin_manager.uninstall import UninstallReport, uninstall
 
 
 @pytest.fixture
-def stubbed(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def stubbed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Replace every OS-touching call with a recorder."""
 
     calls: dict[str, Any] = {"startup": [], "shortcut": 0, "launched": [], "ltk_data": []}
@@ -27,12 +27,22 @@ def stubbed(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "remove_start_menu_shortcut",
         lambda: calls.__setitem__("shortcut", calls["shortcut"] + 1) or True,
     )
+
+    def launch(path: Path, arguments: Any = ()) -> bool:
+        calls["launched"].append((path, tuple(arguments)))
+        # A real uninstaller removes its own directory; mimic that so the
+        # wait loop terminates.
+        parent = path.parent
+        if parent.is_dir():
+            import shutil as _shutil
+
+            _shutil.rmtree(parent, ignore_errors=True)
+        return True
+
+    monkeypatch.setattr(uninstall_module.windows, "launch_detached", launch)
     monkeypatch.setattr(
-        uninstall_module.windows,
-        "launch_detached",
-        lambda path, *a: calls["launched"].append(path) or True,
+        uninstall_module.ltk, "uninstaller", lambda: tmp_path / "LTK Manager" / "uninstall.exe"
     )
-    monkeypatch.setattr(uninstall_module.ltk, "uninstaller", lambda: Path("uninstall.exe"))
 
     def remove_data(path: Path | None = None) -> bool:
         calls["ltk_data"].append(path)
@@ -98,6 +108,8 @@ def test_ltk_is_untouched_when_we_did_not_install_it(
 
 
 def test_ltk_is_removed_when_we_installed_it(tmp_path: Path, stubbed: dict[str, Any]) -> None:
+    (tmp_path / "LTK Manager").mkdir()
+    (tmp_path / "LTK Manager" / "uninstall.exe").write_bytes(b"exe")
     data = make_tree(tmp_path, "app")
     ltk_data = make_tree(tmp_path, "ltk")
     report = uninstall(
@@ -108,7 +120,7 @@ def test_ltk_is_removed_when_we_installed_it(tmp_path: Path, stubbed: dict[str, 
         close_logging=False,
     )
     assert not ltk_data.exists()
-    assert stubbed["launched"] == [Path("uninstall.exe")]
+    assert stubbed["launched"] == [(tmp_path / "LTK Manager" / "uninstall.exe", ("/S",))]
     assert report.ltk_app is True
     assert report.ltk_data is True
 
@@ -177,3 +189,33 @@ def test_an_empty_summary_says_so() -> None:
 def test_failures_mark_the_report_unsuccessful() -> None:
     assert UninstallReport().succeeded is True
     assert UninstallReport(failures=("something",)).succeeded is False
+
+
+def test_the_ltk_uninstaller_runs_silently(tmp_path: Path, stubbed: dict[str, Any]) -> None:
+    """The user already confirmed in our dialog; without /S the uninstaller
+    waits on a window it cannot show, because we spawn it with
+    CREATE_NO_WINDOW, and silently removes nothing."""
+
+    (tmp_path / "LTK Manager").mkdir()
+    (tmp_path / "LTK Manager" / "uninstall.exe").write_bytes(b"exe")
+    uninstall(
+        data_dir=make_tree(tmp_path, "app"),
+        executable=tmp_path / "app.exe",
+        remove_ltk=True,
+        ltk_data_dir=tmp_path / "ltk",
+        close_logging=False,
+    )
+    assert stubbed["launched"][0][1] == ("/S",)
+
+
+def test_a_stalled_uninstaller_is_reported_as_a_failure(
+    tmp_path: Path, stubbed: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting a detached process says nothing about whether it worked."""
+
+    root = tmp_path / "LTK Manager"
+    root.mkdir()
+    (root / "uninstall.exe").write_bytes(b"exe")
+    monkeypatch.setattr(uninstall_module.windows, "launch_detached", lambda *_a: True)
+    assert uninstall_module._run_ltk_uninstaller(timeout_seconds=1.0) is False
+    assert root.exists()
