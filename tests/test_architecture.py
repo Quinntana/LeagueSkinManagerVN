@@ -220,3 +220,29 @@ def test_the_domain_layer_stays_free_of_application_imports() -> None:
             continue
         for imported in local_imports(path):
             assert LAYERS[imported] <= 1, f"{own} imports {imported} from a higher layer"
+
+
+# --- specifications --------------------------------------------------------
+
+
+def test_every_capability_has_a_spec() -> None:
+    """Specs live in the repo, not in chat history, so any assistant can read
+    them. A capability without one is undocumented behaviour."""
+
+    root = PACKAGE.parents[1] / "openspec"
+    assert (root / "project.md").is_file()
+    assert (root / "AGENTS.md").is_file()
+    for capability in ("skin-sync", "ltk-integration", "cooldown-board", "tray-lifecycle"):
+        spec = root / "specs" / capability / "spec.md"
+        assert spec.is_file(), f"missing spec for {capability}"
+        assert "## Requirement:" in spec.read_text(encoding="utf-8")
+
+
+def test_the_ltk_spec_records_what_was_measured() -> None:
+    """The measured findings are the part that cannot be re-derived by reading."""
+
+    spec = (PACKAGE.parents[1] / "openspec" / "specs" / "ltk-integration" / "spec.md").read_text(
+        encoding="utf-8"
+    )
+    for finding in ("firstRunComplete", "watcherEnabled", "orphaned mod entry", "Natoken LLC"):
+        assert finding in spec, f"the spec omits the measured finding: {finding}"

@@ -238,6 +238,28 @@ Adding an external tool means one module and one entry in the tray's action
 list; nothing existing moves. Changing where skins come from touches
 `github.py` alone.
 
+## Specifications
+
+`openspec/` holds the behaviour specs in plain Markdown, following the
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) convention so any assistant
+can read them without this repository's chat history:
+
+```text
+openspec/
+  project.md                      context, stack, architecture, conventions
+  AGENTS.md                       how to work on this codebase
+  specs/skin-sync/spec.md         the pipeline and its guarantees
+  specs/ltk-integration/spec.md   the measured LTK contract
+  specs/cooldown-board/spec.md    roster, rank rules, isolation
+  specs/tray-lifecycle/spec.md    tray, first run, ownership, platform
+  changes/                        in-flight proposals; archive/ when shipped
+```
+
+The LTK spec is the important one. Every claim in it was established by
+experiment, and four decisions reached by reasoning alone were disproved by
+those experiments. Do not relax a requirement there without re-running the
+corresponding test against a copy of the LTK data root.
+
 ## Development
 
 Python 3.10 through 3.14.
