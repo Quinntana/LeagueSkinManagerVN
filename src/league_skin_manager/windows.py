@@ -29,8 +29,28 @@ from .hashing import is_real_file
 
 LOGGER = logging.getLogger(__name__)
 
-MUTEX_NAME = rf"Global\{APP_NAME}-singleton"
+MUTEX_NAME = rf"Local\{APP_NAME}-singleton"
+"""Session-local, not Global.
+
+This is a per-user application, so a machine-wide mutex would stop two
+logged-in users each running their own copy, and creating Global objects
+can require a privilege this process has no reason to hold.
+"""
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+SHORTCUT_PATH_ENV = "LSMVN_SHORTCUT_PATH"
+SHORTCUT_TARGET_ENV = "LSMVN_SHORTCUT_TARGET"
+SHORTCUT_WORKDIR_ENV = "LSMVN_SHORTCUT_WORKDIR"
+SHORTCUT_NAME_ENV = "LSMVN_SHORTCUT_NAME"
+
+_SHORTCUT_SCRIPT = (
+    "$ErrorActionPreference='Stop';"
+    "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:LSMVN_SHORTCUT_PATH);"
+    "$s.TargetPath=$env:LSMVN_SHORTCUT_TARGET;"
+    "$s.WorkingDirectory=$env:LSMVN_SHORTCUT_WORKDIR;"
+    "$s.Description=$env:LSMVN_SHORTCUT_NAME;"
+    "$s.Save()"
+)
 ERROR_ALREADY_EXISTS = 183
 
 
@@ -151,19 +171,19 @@ def create_start_menu_shortcut(executable: Path, *, runner: Any = None) -> bool:
         return False
     shortcut = start_menu_shortcut()
     target = Path(os.path.abspath(executable))
-    script = (
-        "$ErrorActionPreference='Stop';"
-        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
-        f"'{shortcut}');"
-        f"$s.TargetPath='{target}';"
-        f"$s.WorkingDirectory='{target.parent}';"
-        f"$s.Description='{APP_DISPLAY_NAME}';"
-        "$s.Save()"
-    )
+    # Paths are passed through the environment rather than interpolated into
+    # the script. A single quote in a path -- "C:\Users\Bob's PC" is an
+    # ordinary folder name -- would otherwise close the PowerShell string and
+    # have the remainder executed as code.
+    environment = dict(os.environ)
+    environment[SHORTCUT_PATH_ENV] = str(shortcut)
+    environment[SHORTCUT_TARGET_ENV] = str(target)
+    environment[SHORTCUT_WORKDIR_ENV] = str(target.parent)
+    environment[SHORTCUT_NAME_ENV] = APP_DISPLAY_NAME
     try:
         shortcut.parent.mkdir(parents=True, exist_ok=True)
         run = runner or _run_powershell
-        completed = run(script)
+        completed = run(_SHORTCUT_SCRIPT, environment)
     except (OSError, subprocess.SubprocessError):
         LOGGER.warning("Could not create the Start Menu shortcut", exc_info=True)
         return False
@@ -182,10 +202,34 @@ def remove_start_menu_shortcut() -> bool:
     return True
 
 
-def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
+def system_powershell() -> Path:
+    """Resolve the OS copy of PowerShell without trusting PATH or environment.
+
+    ltk.py hardens its Authenticode check this way; there is no reason for a
+    second, weaker standard elsewhere in the same application.
+    """
+
+    if os.name != "nt":
+        return Path("powershell.exe")
+    buffer = ctypes.create_unicode_buffer(32_768)
+    try:
+        length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
+    except (AttributeError, OSError):
+        length = 0
+    root = (
+        Path(buffer.value)
+        if isinstance(length, int) and 0 < length < len(buffer)
+        else Path(r"C:\Windows")
+    )
+    return root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+
+
+def _run_powershell(
+    script: str, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
-            "powershell.exe",
+            str(system_powershell()),
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
@@ -198,6 +242,7 @@ def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
         timeout=30,
+        env=environment,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 

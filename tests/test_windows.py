@@ -125,29 +125,74 @@ def test_the_shortcut_lives_in_the_start_menu_programs_folder() -> None:
     assert shortcut.stem == APP_DISPLAY_NAME
 
 
-def test_the_shortcut_script_targets_the_executable(tmp_path: Path) -> None:
-    captured: list[str] = []
+def capture_runner(returncode: int = 0) -> tuple[Any, list[tuple[str, dict[str, str]]]]:
+    seen: list[tuple[str, dict[str, str]]] = []
 
-    def runner(script: str) -> subprocess.CompletedProcess[str]:
-        captured.append(script)
-        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    def runner(script: str, environment: dict[str, str] | None = None) -> Any:
+        seen.append((script, environment or {}))
+        return subprocess.CompletedProcess([], returncode, stdout="", stderr="denied")
 
+    return runner, seen
+
+
+def test_the_shortcut_targets_the_executable(tmp_path: Path) -> None:
+    runner, seen = capture_runner()
     executable = tmp_path / "LeagueSkinManagerVN.exe"
     executable.write_bytes(b"exe")
+
     windows.create_start_menu_shortcut(executable, runner=runner)
 
-    assert captured, "no PowerShell script was produced"
-    script = captured[0]
+    assert seen, "no PowerShell invocation was produced"
+    script, environment = seen[0]
     assert "WScript.Shell" in script
-    assert str(executable) in script
     assert "$s.Save()" in script
+    assert environment[windows.SHORTCUT_TARGET_ENV] == str(executable)
+    assert environment[windows.SHORTCUT_WORKDIR_ENV] == str(executable.parent)
+
+
+def test_paths_never_reach_the_script_body(tmp_path: Path) -> None:
+    """A quote in a path would otherwise close the string and run as code."""
+
+    awkward = tmp_path / "Bob's PC"
+    awkward.mkdir()
+    executable = awkward / "app.exe"
+    executable.write_bytes(b"exe")
+
+    runner, seen = capture_runner()
+    windows.create_start_menu_shortcut(executable, runner=runner)
+
+    script, environment = seen[0]
+    assert str(executable) not in script, "the path must not be interpolated"
+    assert "Bob" not in script
+    assert environment[windows.SHORTCUT_TARGET_ENV] == str(executable)
+
+
+def test_the_script_is_a_fixed_constant(tmp_path: Path) -> None:
+    runner, seen = capture_runner()
+    windows.create_start_menu_shortcut(tmp_path / "a.exe", runner=runner)
+    windows.create_start_menu_shortcut(tmp_path / "b.exe", runner=runner)
+    assert seen[0][0] == seen[1][0] == windows._SHORTCUT_SCRIPT
 
 
 def test_a_failed_shortcut_creation_reports_false(tmp_path: Path) -> None:
-    def runner(_script: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess([], 1, stdout="", stderr="denied")
-
+    runner, _seen = capture_runner(returncode=1)
     assert windows.create_start_menu_shortcut(tmp_path / "app.exe", runner=runner) is False
+
+
+def test_powershell_is_resolved_from_the_system_directory() -> None:
+    """PATH must not decide which PowerShell verifies or writes anything."""
+
+    resolved = windows.system_powershell()
+    assert resolved.name == "powershell.exe"
+    assert resolved.parent.name == "v1.0"
+    assert "System32" in str(resolved)
+
+
+def test_the_mutex_is_session_local_not_machine_wide() -> None:
+    """Global would block a second logged-in user from running their own copy."""
+
+    assert windows.MUTEX_NAME.startswith("Local\\")
+    assert not windows.MUTEX_NAME.startswith("Global")
 
 
 # --- processes ------------------------------------------------------------
