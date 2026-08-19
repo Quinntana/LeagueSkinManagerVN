@@ -53,8 +53,7 @@ addopts = "-q --cov=league_skin_manager --cov-report=term-missing --cov-fail-und
 [tool.coverage.run]
 omit = [
     "src/league_skin_manager/__main__.py",
-    # The composition root and the Tk panel are exercised by running the
-    # application, not by unit tests; everything they wire is covered.
-    "src/league_skin_manager/app.py",
+    # The Tk panel is exercised by running the application, not by unit
+    # tests; the composition root's sequencing decisions are covered.
     "src/league_skin_manager/cooldown/panel.py",
 ]
