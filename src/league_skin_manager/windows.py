@@ -127,6 +127,35 @@ def startup_enabled(executable: Path) -> bool:
     return str(value) == startup_command(executable)
 
 
+def repair_startup_path(executable: Path) -> bool:
+    """Re-point an existing Run entry at the current executable.
+
+    The entry stores an absolute path, so moving a portable executable leaves
+    it pointing at nothing: Windows silently fails to launch at login and the
+    tray reports the toggle as off, with no explanation. The Start Menu
+    shortcut is rewritten on every launch for the same reason; this keeps the
+    two consistent.
+
+    Only ever rewrites an entry that already exists. An absent entry means the
+    user did not ask for startup, and that stays true.
+    """
+
+    if os.name != "nt":
+        return False
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            current, _kind = winreg.QueryValueEx(key, APP_NAME)
+    except OSError:
+        return False
+    wanted = startup_command(executable)
+    if str(current) == wanted:
+        return False
+    LOGGER.info("Repointing the Windows startup entry at %s", executable)
+    return set_startup_enabled(executable, True)
+
+
 def set_startup_enabled(executable: Path, enabled: bool) -> bool:
     """Add or remove this application's HKCU Run entry."""
 
@@ -337,6 +366,7 @@ __all__ = [
     "open_path",
     "open_url",
     "remove_start_menu_shortcut",
+    "repair_startup_path",
     "running_executable",
     "set_startup_enabled",
     "start_menu_shortcut",

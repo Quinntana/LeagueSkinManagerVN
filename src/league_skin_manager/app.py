@@ -86,6 +86,7 @@ class App:
     def run(self) -> int:
         self.logger.info("%s starting from %s", APP_DISPLAY_NAME, self.executable)
         windows.create_start_menu_shortcut(self.executable)
+        windows.repair_startup_path(self.executable)
         self.watcher.start()
         self._start_worker(self._startup)
         try:

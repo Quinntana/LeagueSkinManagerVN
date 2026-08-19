@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -259,3 +260,34 @@ def test_porofessor_exposes_nothing_but_the_page() -> None:
 
 def test_the_app_name_is_stable() -> None:
     assert APP_NAME == "LeagueSkinManagerVN"
+
+
+# --- startup self-healing after a move ------------------------------------
+
+
+def test_repair_is_a_no_op_when_startup_was_never_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absent entry means the user did not ask for startup. Keep it that way."""
+
+    monkeypatch.setattr(windows, "startup_enabled", lambda _e: False)
+    calls: list[Any] = []
+    monkeypatch.setattr(windows, "set_startup_enabled", lambda e, v: calls.append((e, v)) or True)
+    monkeypatch.setattr(os, "name", "posix")  # forces the early return path
+    assert windows.repair_startup_path(tmp_path / "app.exe") is False
+    assert calls == []
+
+
+def test_the_startup_command_encodes_the_full_path(tmp_path: Path) -> None:
+    """This is why moving the executable orphans the entry."""
+
+    first = windows.startup_command(tmp_path / "a" / "app.exe")
+    second = windows.startup_command(tmp_path / "b" / "app.exe")
+    assert first != second
+
+
+def test_startup_reports_disabled_after_a_move(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored value is compared against the current path, so a move mismatches."""
+
+    stored = windows.startup_command(Path(r"C:\old\app.exe"))
+    assert stored != windows.startup_command(Path(r"C:\new\app.exe"))
