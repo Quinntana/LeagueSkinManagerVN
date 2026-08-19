@@ -294,6 +294,7 @@ class App:
         with _logged(self.logger, "opening the cooldown panel"):
             self._cooldown_open = bool(
                 open_panel(
+                    cache_dir=self.paths.ltk_cache_dir.parent / "cooldowns",
                     opacity=self.settings.cooldown_opacity,
                     scale=self.settings.cooldown_scale,
                     on_closed=self._on_cooldowns_closed,

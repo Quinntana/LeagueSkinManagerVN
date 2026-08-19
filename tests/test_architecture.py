@@ -179,7 +179,7 @@ def test_the_cooldown_package_exposes_only_its_public_functions() -> None:
 
 
 def test_nothing_outside_cooldown_imports_its_internals() -> None:
-    internals = {"timer", "panel", "host", "live", "catalog", "roster"}
+    internals = {"timer", "panel", "host", "live", "catalog", "roster", "board"}
     for path in module_files():
         if _is_subpackage(path):
             continue
@@ -188,6 +188,27 @@ def test_nothing_outside_cooldown_imports_its_internals() -> None:
             assert f"from .cooldown.{name}" not in source, (
                 f"{path.name} reaches past the cooldown package boundary"
             )
+
+
+def test_the_cooldown_board_is_wired_to_its_data_sources() -> None:
+    """Ported modules must be reachable, not merely present.
+
+    live.py and catalog.py were once fully written, tested, and validated
+    against the real APIs while nothing imported them, so the board still
+    required durations to be typed in. Every other test passed.
+    """
+
+    package = PACKAGE / "cooldown"
+    wiring = (package / "__init__.py").read_text(encoding="utf-8")
+    for module, symbol in (("live", "LiveClient"), ("catalog", "CooldownCatalog")):
+        assert f"from .{module} import" in wiring, f"cooldown/{module}.py is never imported"
+        assert symbol in wiring, f"{symbol} is imported but never constructed"
+
+    board = (package / "board.py").read_text(encoding="utf-8")
+    assert "roster" in board and "resolve" in board, "the board must join both sources"
+
+    panel = (package / "panel.py").read_text(encoding="utf-8")
+    assert "manual_definition" not in panel, "the panel must not fall back to typed durations"
 
 
 def test_the_domain_layer_stays_free_of_application_imports() -> None:

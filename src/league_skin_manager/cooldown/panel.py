@@ -1,459 +1,290 @@
-"""Manual enemy cooldown panel, opened on demand from the tray.
+"""The enemy cooldown window.
 
-This is the user-facing half of the cooldown-timer port from
-LOL_Minimap_Tracker. The original PyQt5 panel was fed by live-game data;
-this adaptation keeps the identical manual interaction model (click to
-start/restart, right-click to cancel) but sources durations from fixed
-summoner-spell presets and a per-row ultimate seconds entry, so it stays
-free of network and game-client integrations.
+Layout inherited from LOL_Minimap_Tracker's Qt panel, redrawn in Tk: one
+compact row per enemy, each holding a champion cell and three squares for the
+ultimate and both summoner spells.  It is deliberately small -- it sits over a
+live game -- so opacity and scale are chosen from the tray rather than from
+controls that would cost screen space here.
+
+Left click only. Idle -> counting -> cancel -> counting again, as a fresh
+timer rather than a resumed one.
 """
 
 from __future__ import annotations
 
 import logging
-import math
-from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
-from .timer import (
-    CooldownDefinition,
-    CooldownKey,
-    CooldownSlot,
-    CooldownSnapshot,
-    CooldownTimerStore,
-)
+from .board import MAX_ROWS, SLOTS, CooldownBoard, RowView
 
-ROLE_LABELS = ("Top", "Jungle", "Mid", "Bot", "Support")
-DEFAULT_ULTIMATE_SECONDS = 120
-MIN_MANUAL_SECONDS = 5
-MAX_MANUAL_SECONDS = 3600
+LOGGER = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class SpellPreset:
-    """One selectable summoner spell with its flat base cooldown."""
-
-    label: str
-    identifier: str
-    seconds: float
-
-
-SUMMONER_SPELL_PRESETS: tuple[SpellPreset, ...] = (
-    SpellPreset("Flash 300s", "SummonerFlash", 300.0),
-    SpellPreset("Teleport 360s", "SummonerTeleport", 360.0),
-    SpellPreset("Ignite 180s", "SummonerDot", 180.0),
-    SpellPreset("Heal 240s", "SummonerHeal", 240.0),
-    SpellPreset("Barrier 180s", "SummonerBarrier", 180.0),
-    SpellPreset("Exhaust 210s", "SummonerExhaust", 210.0),
-    SpellPreset("Cleanse 210s", "SummonerBoost", 210.0),
-    SpellPreset("Ghost 210s", "SummonerHaste", 210.0),
-    SpellPreset("Smite 90s", "SummonerSmite", 90.0),
-)
-
-
-def preset_by_label(label: str) -> SpellPreset | None:
-    """Return the preset matching one combobox label, if any."""
-
-    for preset in SUMMONER_SPELL_PRESETS:
-        if preset.label == label:
-            return preset
-    return None
-
-
-def manual_definition(identifier: str, display_name: str, seconds: float) -> CooldownDefinition:
-    """Build a one-rank definition for a caller-chosen flat cooldown."""
-
-    if (
-        isinstance(seconds, bool)
-        or not math.isfinite(seconds)
-        or not MIN_MANUAL_SECONDS <= seconds <= MAX_MANUAL_SECONDS
-    ):
-        raise ValueError(f"seconds must be between {MIN_MANUAL_SECONDS} and {MAX_MANUAL_SECONDS}")
-    return CooldownDefinition(
-        identifier=identifier,
-        display_name=display_name,
-        icon_path=None,
-        cooldowns=(float(seconds),),
-        max_rank=1,
-        unsupported_reason=None,
-    )
-
-
-def format_slot_text(base: str, snapshot: CooldownSnapshot | None) -> str:
-    """Render one slot button caption from its current timer state."""
-
-    if snapshot is None:
-        return base
-    if snapshot.is_ready:
-        return f"{base} - ready"
-    return f"{base} - {math.ceil(snapshot.remaining):d}s"
-
-
-class CooldownBoard:
-    """UI-free interaction model over the ported timer store.
-
-    Rows are stable board positions (one per enemy role); champion names are
-    free text captured at press time purely for the research event log.
-    """
-
-    def __init__(
-        self,
-        store: CooldownTimerStore,
-        *,
-        flush: Callable[[], None] | None = None,
-        logger: logging.Logger | None = None,
-    ) -> None:
-        self._store = store
-        self._flush = flush
-        self._logger = logger or logging.getLogger(__name__)
-
-    @staticmethod
-    def key_for(row: int, slot: CooldownSlot) -> CooldownKey:
-        return CooldownKey(f"row-{row}", slot)
-
-    def press(
-        self,
-        row: int,
-        slot: CooldownSlot,
-        *,
-        identifier: str,
-        display_name: str,
-        seconds: float,
-        champion: str,
-    ) -> CooldownSnapshot | None:
-        """Start or restart the timer behind one clicked slot."""
-
-        definition = manual_definition(identifier, display_name, seconds)
-        snapshot = self._store.start(
-            self.key_for(row, slot),
-            champion.strip() or ROLE_LABELS[row % len(ROLE_LABELS)],
-            definition,
-            1,
-        )
-        self._flush_events()
-        return snapshot
-
-    def clear(self, row: int, slot: CooldownSlot) -> bool:
-        """Cancel the timer behind one right-clicked slot."""
-
-        cleared = self._store.clear(self.key_for(row, slot))
-        if cleared:
-            self._flush_events()
-        return cleared
-
-    def clear_all(self) -> int:
-        """Cancel every timer on the board."""
-
-        cleared = self._store.clear_all()
-        if cleared:
-            self._flush_events()
-        return cleared
-
-    def text(self, row: int, slot: CooldownSlot, base: str) -> str:
-        """Return the current caption for one slot button."""
-
-        return format_slot_text(base, self._store.snapshot(self.key_for(row, slot)))
-
-    def _flush_events(self) -> None:
-        if self._flush is None:
-            return
-        try:
-            self._flush()
-        except OSError as error:
-            self._logger.warning("Could not persist cooldown events: %s", error)
-
-
+# Palette carried over from the Qt panel so the board looks the same.
 BACKGROUND = "#0b1220"
-PANEL = "#121c30"
+SURFACE = "#111827"
+BORDER = "#5d6980"
 FOREGROUND = "#e8eefc"
-MUTED = "#9fb0d0"
-ACCENT = "#1f2f4d"
+MUTED = "#bcc4d3"
+READY = "#4ade80"
+DISABLED = "#39415a"
 
-
-def apply_styles(ttk: Any, root: Any) -> None:
-    """Register the dark ttk styles this window uses on its own root."""
-
-    style = ttk.Style(root)
-    with suppress(Exception):
-        style.theme_use("clam")
-    style.configure("Panel.TFrame", background=PANEL)
-    style.configure("Panel.TLabel", background=PANEL, foreground=MUTED)
-    style.configure(
-        "Secondary.TButton",
-        background=ACCENT,
-        foreground=FOREGROUND,
-        borderwidth=0,
-        padding=(10, 5),
-    )
-    style.map(
-        "Secondary.TButton",
-        background=[("active", "#2b3f66"), ("disabled", "#16203a")],
-        foreground=[("disabled", MUTED)],
-    )
+CELL = 34
+ICON = 30
+ROW_HEIGHT = 38
+REFRESH_MILLISECONDS = 250
+ROSTER_SECONDS = 5.0
 
 
 class CooldownWindow:
-    """Standalone Tk window bound to a :class:`CooldownBoard`.
+    """A standalone Tk window bound to a :class:`CooldownBoard`.
 
-    It owns its own Tk root and event loop so it can be opened straight from
-    the tray without any other window existing.  Closing it only hides it;
-    running timers continue in the board's store until the app stops.
+    It owns its own Tk root and event loop so it can open straight from the
+    tray with no other window in existence, and so a failure here cannot reach
+    the tray's loop.
     """
-
-    REFRESH_MILLISECONDS = 250
 
     def __init__(
         self,
         board: CooldownBoard,
-        logger: logging.Logger | None = None,
+        *,
+        opacity: float = 0.85,
+        scale: float = 1.0,
+        on_closed: Any = None,
+        logger: logging.Logger = LOGGER,
     ) -> None:
         self._board = board
-        self._logger = logger or logging.getLogger(__name__)
-        self._champion_vars: list[Any] = []
-        self._ultimate_vars: list[Any] = []
-        self._spell_vars: dict[tuple[int, CooldownSlot], Any] = {}
-        self._slot_buttons: dict[tuple[int, CooldownSlot], Any] = {}
-        self._closing = False
+        self._opacity = opacity
+        self._scale = scale
+        self._on_closed = on_closed
+        self._logger = logger
         self._lock = Lock()
         self._window: Any | None = None
+        self._closing = False
+        self._cells: list[dict[str, Any]] = []
+        self._ticks = 0
+
+    # -- lifecycle -------------------------------------------------------
 
     def run(self) -> None:
-        """Create the window and run its event loop on the calling thread.
+        """Build and drive the window on the calling thread.
 
-        Tk requires the interpreter to be created and driven by the same
-        thread, so construction deliberately happens here rather than in
-        ``__init__`` - the host builds the object on the tray thread and runs
-        it on its own.
+        Tk requires the interpreter to be created and driven by one thread, so
+        construction happens here rather than in ``__init__``.
         """
 
         import tkinter as tk
-        from tkinter import ttk
 
         window: Any | None = None
         try:
             window = tk.Tk()
             with self._lock:
                 self._window = window
-            self._build(window, tk, ttk)
+            self._build(window, tk)
             self._refresh()
             window.mainloop()
+        except Exception:  # noqa: BLE001 - never propagate into the host thread
+            self._logger.exception("The cooldown window failed")
         finally:
             self._closing = True
             with self._lock:
                 self._window = None
-            # Release every Tk variable and widget reference while still on the
-            # thread that owns the interpreter. Letting them reach the garbage
-            # collector afterwards finalizes them from another thread, which Tk
-            # reports as "main thread is not in main loop" / Tcl_AsyncDelete.
-            self._champion_vars.clear()
-            self._ultimate_vars.clear()
-            self._spell_vars.clear()
-            self._slot_buttons.clear()
+            # Drop widget references while still on the thread that owns the
+            # interpreter; finalizing them elsewhere makes Tk complain about
+            # "main thread is not in main loop".
+            self._cells.clear()
             if window is not None:
                 with suppress(Exception):
                     window.destroy()
+            self._notify_closed()
 
-    def _build(self, window: Any, tk: Any, ttk: Any) -> None:
-        window.title("Enemy cooldown timers")
+    def show(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        with suppress(Exception):
+            window.deiconify()
+            window.lift()
+
+    def stop(self) -> None:
+        self._closing = True
+        window = self._window
+        if window is not None:
+            with suppress(Exception):
+                window.after(0, window.quit)
+
+    def hide(self) -> None:
+        """The window's close button: stop, so the app can suppress re-opening."""
+
+        self.stop()
+
+    def set_display(self, *, opacity: float, scale: float) -> None:
+        """Apply tray-chosen display settings to a live window."""
+
+        self._opacity = opacity
+        self._scale = scale
+        window = self._window
+        if window is None:
+            return
+        with suppress(Exception):
+            window.after(0, self._apply_display)
+
+    def _apply_display(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        with suppress(Exception):
+            window.attributes("-alpha", max(0.2, min(1.0, self._opacity)))
+        with suppress(Exception):
+            window.tk.call("tk", "scaling", max(0.5, min(3.0, self._scale)) * 1.3333)
+
+    # -- construction ----------------------------------------------------
+
+    def _build(self, window: Any, tk: Any) -> None:
+        window.title("Enemy cooldowns")
         window.configure(background=BACKGROUND)
         window.resizable(False, False)
         window.protocol("WM_DELETE_WINDOW", self.hide)
-        apply_styles(ttk, window)
+        with suppress(Exception):
+            window.attributes("-topmost", True)
+        self._apply_display()
 
-        outer = ttk.Frame(window, style="Panel.TFrame", padding=14)
+        outer = tk.Frame(window, background=BACKGROUND, padx=6, pady=6)
         outer.pack(fill="both", expand=True)
-        ttk.Label(
-            outer,
-            text="Click starts or restarts a timer; right-click cancels it.",
-            style="Panel.TLabel",
-        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 10))
 
-        spell_labels = tuple(preset.label for preset in SUMMONER_SPELL_PRESETS)
-        for index, role in enumerate(ROLE_LABELS):
-            grid_row = index + 1
-            champion_var = tk.StringVar(value=role)
-            self._champion_vars.append(champion_var)
-            ttk.Entry(outer, textvariable=champion_var, width=14).grid(
-                row=grid_row, column=0, padx=(0, 8), pady=3, sticky="w"
+        for row in range(MAX_ROWS):
+            line = tk.Frame(outer, background=BACKGROUND, height=ROW_HEIGHT)
+            line.pack(fill="x", pady=1)
+
+            champion = tk.Label(
+                line,
+                text="?",
+                width=9,
+                anchor="w",
+                background=SURFACE,
+                foreground=MUTED,
+                font=("Segoe UI", 8),
+                padx=6,
+                pady=4,
             )
+            champion.pack(side="left", padx=(0, 4))
 
-            ultimate_var = tk.StringVar(value=str(DEFAULT_ULTIMATE_SECONDS))
-            self._ultimate_vars.append(ultimate_var)
-            ttk.Spinbox(
-                outer,
-                from_=MIN_MANUAL_SECONDS,
-                to=MAX_MANUAL_SECONDS,
-                textvariable=ultimate_var,
-                width=5,
-            ).grid(row=grid_row, column=1, padx=(0, 4), pady=3)
-            self._add_slot_button(outer, ttk, grid_row, 2, index, CooldownSlot.ULTIMATE, "Ult")
-
-            for column, (slot, default_label) in enumerate(
-                (
-                    (CooldownSlot.SPELL_ONE, spell_labels[0]),
-                    (CooldownSlot.SPELL_TWO, spell_labels[2]),
-                ),
-                start=3,
-            ):
-                spell_var = tk.StringVar(value=default_label)
-                self._spell_vars[(index, slot)] = spell_var
-                cell = ttk.Frame(outer, style="Panel.TFrame")
-                cell.grid(row=grid_row, column=column, padx=(8, 0), pady=3, sticky="w")
-                ttk.Combobox(
-                    cell,
-                    textvariable=spell_var,
-                    values=spell_labels,
-                    state="readonly",
-                    width=13,
-                ).pack(side="left", padx=(0, 4))
-                self._add_slot_button(cell, ttk, None, None, index, slot, "Start")
-
-        footer = ttk.Frame(outer, style="Panel.TFrame")
-        footer.grid(row=len(ROLE_LABELS) + 1, column=0, columnspan=5, sticky="ew", pady=(12, 0))
-        ttk.Button(
-            footer,
-            text="Reset all timers",
-            style="Secondary.TButton",
-            command=self._board.clear_all,
-        ).pack(side="right")
-
-    def show(self) -> None:
-        """Raise the window from another thread, if it has been created yet."""
-
-        window = self._active_window()
-        if window is None:
-            # Not built yet; ``run`` shows it as soon as it exists.
-            return
-        with suppress(Exception):
-            window.after(0, self._show_now)
-
-    def stop(self) -> None:
-        """Ask the event loop to end so the hosting thread can join."""
-
-        self._closing = True
-        window = self._active_window()
-        if window is None:
-            return
-        with suppress(Exception):
-            window.after(0, window.quit)
-
-    def hide(self) -> None:
-        window = self._active_window()
-        if window is not None:
-            window.withdraw()
-
-    def _active_window(self) -> Any | None:
-        with self._lock:
-            return self._window
-
-    def _show_now(self) -> None:
-        window = self._active_window()
-        if window is None:
-            return
-        window.deiconify()
-        window.lift()
-
-    @property
-    def exists(self) -> bool:
-        window = self._active_window()
-        if window is None:
-            return False
-        try:
-            return bool(window.winfo_exists())
-        except Exception:
-            return False
-
-    def _add_slot_button(
-        self,
-        parent: Any,
-        ttk: Any,
-        grid_row: int | None,
-        grid_column: int | None,
-        row: int,
-        slot: CooldownSlot,
-        base: str,
-    ) -> None:
-        button = ttk.Button(
-            parent,
-            text=base,
-            style="Secondary.TButton",
-            width=14,
-            command=lambda: self._pressed(row, slot),
-        )
-        if grid_row is None:
-            button.pack(side="left")
-        else:
-            button.grid(row=grid_row, column=grid_column, pady=3, sticky="w")
-        button.bind("<Button-3>", lambda _event: self._board.clear(row, slot))
-        self._slot_buttons[(row, slot)] = button
-
-    def _pressed(self, row: int, slot: CooldownSlot) -> None:
-        try:
-            champion = str(self._champion_vars[row].get())
-            if slot is CooldownSlot.ULTIMATE:
-                seconds = float(str(self._ultimate_vars[row].get()).strip())
-                self._board.press(
-                    row,
-                    slot,
-                    identifier="ManualUltimate",
-                    display_name="Ultimate",
-                    seconds=seconds,
-                    champion=champion,
+            buttons: dict[Any, Any] = {}
+            for slot in SLOTS:
+                button = tk.Label(
+                    line,
+                    text="-",
+                    width=4,
+                    background=SURFACE,
+                    foreground=MUTED,
+                    font=("Segoe UI Semibold", 9),
+                    pady=4,
+                    highlightthickness=1,
+                    highlightbackground=BORDER,
                 )
-                return
-            preset = preset_by_label(str(self._spell_vars[(row, slot)].get()))
-            if preset is None:
-                return
-            self._board.press(
-                row,
-                slot,
-                identifier=preset.identifier,
-                display_name=preset.label,
-                seconds=preset.seconds,
-                champion=champion,
-            )
-        except ValueError as error:
-            self._logger.warning("Cooldown timer was not started: %s", error)
+                button.pack(side="left", padx=1)
+                button.bind(
+                    "<Button-1>",
+                    lambda _event, r=row, s=slot: self._pressed(r, s),
+                )
+                buttons[slot] = button
+            self._cells.append({"champion": champion, "buttons": buttons})
+
+    # -- interaction -----------------------------------------------------
+
+    def _pressed(self, row: int, slot: Any) -> None:
+        try:
+            self._board.press(row, slot)
+        except Exception:  # noqa: BLE001 - a click must never kill the loop
+            self._logger.exception("Cooldown press failed")
+        self._paint()
+
+    # -- refresh ---------------------------------------------------------
 
     def _refresh(self) -> None:
-        window = self._active_window()
-        if self._closing or window is None or not self.exists:
+        if self._closing:
             return
-        for (row, slot), button in self._slot_buttons.items():
-            base = "Ult" if slot is CooldownSlot.ULTIMATE else "Start"
-            try:
-                button.configure(text=self._board.text(row, slot, base))
-            except Exception:
-                self._logger.exception("Could not refresh a cooldown slot button")
-                return
-        window.after(self.REFRESH_MILLISECONDS, self._refresh)
+        window = self._window
+        if window is None:
+            return
+
+        # Roster polling is far slower than repainting: identities change once
+        # a match, remaining seconds change four times a second.
+        self._ticks += 1
+        if self._ticks % max(1, int(ROSTER_SECONDS * 1000 / REFRESH_MILLISECONDS)) == 1:
+            self._board.refresh()
+
+        self._paint()
+        with suppress(Exception):
+            window.after(REFRESH_MILLISECONDS, self._refresh)
+
+    def _paint(self) -> None:
+        try:
+            rows = self._board.rows()
+        except Exception:  # noqa: BLE001
+            self._logger.exception("Could not read the cooldown board")
+            return
+        for index, view in enumerate(rows[: len(self._cells)]):
+            self._paint_row(self._cells[index], view)
+
+    def _paint_row(self, cell: dict[str, Any], view: RowView) -> None:
+        label = view.champion or "?"
+        if view.level is not None:
+            label = f"{label} {view.level}"
+        with suppress(Exception):
+            cell["champion"].configure(
+                text=label[:12],
+                foreground=MUTED if view.is_placeholder else FOREGROUND,
+            )
+
+        for slot_view in view.slots:
+            button = cell["buttons"].get(slot_view.slot)
+            if button is None:
+                continue
+            if slot_view.counting:
+                foreground, border = FOREGROUND, BORDER
+            elif slot_view.is_ready:
+                foreground, border = READY, READY
+            elif slot_view.enabled:
+                foreground, border = MUTED, BORDER
+            else:
+                foreground, border = DISABLED, DISABLED
+            with suppress(Exception):
+                button.configure(
+                    text=slot_view.caption,
+                    foreground=foreground,
+                    highlightbackground=border,
+                    cursor="hand2" if slot_view.enabled else "arrow",
+                )
+
+    def _notify_closed(self) -> None:
+        if self._on_closed is None:
+            return
+        try:
+            self._on_closed()
+        except Exception:  # noqa: BLE001
+            self._logger.debug("Cooldown close observer failed", exc_info=True)
 
 
 def create_cooldown_window(
     board: CooldownBoard,
-    logger: logging.Logger | None = None,
+    *,
+    opacity: float = 0.85,
+    scale: float = 1.0,
+    on_closed: Any = None,
+    logger: logging.Logger = LOGGER,
 ) -> CooldownWindow:
     """Build the window object; Tk itself is created when ``run`` is called."""
 
-    return CooldownWindow(board, logger)
+    return CooldownWindow(board, opacity=opacity, scale=scale, on_closed=on_closed, logger=logger)
 
 
 __all__ = [
     "BACKGROUND",
-    "DEFAULT_ULTIMATE_SECONDS",
-    "MAX_MANUAL_SECONDS",
-    "MIN_MANUAL_SECONDS",
-    "ROLE_LABELS",
-    "SUMMONER_SPELL_PRESETS",
-    "CooldownBoard",
+    "READY",
+    "REFRESH_MILLISECONDS",
+    "ROSTER_SECONDS",
     "CooldownWindow",
-    "SpellPreset",
-    "apply_styles",
     "create_cooldown_window",
-    "format_slot_text",
-    "manual_definition",
-    "preset_by_label",
 ]
