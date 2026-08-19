@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from league_skin_manager.cooldown_timer import (
+from league_skin_manager.cooldown.timer import (
     CooldownAction,
     CooldownDefinition,
     CooldownEvent,

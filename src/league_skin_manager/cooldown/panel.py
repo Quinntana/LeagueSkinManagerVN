@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
-from .cooldown_timer import (
+from .timer import (
     CooldownDefinition,
     CooldownKey,
     CooldownSlot,

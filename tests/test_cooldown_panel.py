@@ -7,14 +7,7 @@ from typing import Any
 
 import pytest
 
-from league_skin_manager.cooldown_timer import (
-    CooldownKey,
-    CooldownSlot,
-    CooldownSnapshot,
-    CooldownTimerStore,
-    CsvCooldownEventSink,
-)
-from league_skin_manager.cooldown_window import (
+from league_skin_manager.cooldown.panel import (
     MAX_MANUAL_SECONDS,
     MIN_MANUAL_SECONDS,
     ROLE_LABELS,
@@ -23,6 +16,13 @@ from league_skin_manager.cooldown_window import (
     format_slot_text,
     manual_definition,
     preset_by_label,
+)
+from league_skin_manager.cooldown.timer import (
+    CooldownKey,
+    CooldownSlot,
+    CooldownSnapshot,
+    CooldownTimerStore,
+    CsvCooldownEventSink,
 )
 
 

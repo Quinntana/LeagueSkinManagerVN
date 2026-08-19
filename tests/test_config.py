@@ -1,56 +1,113 @@
+"""Tests for configuration and path discovery."""
+
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import pytest
 
-from league_skin_manager.atomic import read_json
-from league_skin_manager.config import APP_NAME, AppPaths, RuntimeConfig
-from league_skin_manager.logging_setup import configure_logging
+from league_skin_manager.config import (
+    APP_NAME,
+    LEAGUE_GAME_PROCESS_NAME,
+    LTK_BUNDLE_IDENTIFIER,
+    LTK_PROCESS_NAMES,
+    AppPaths,
+    RuntimeConfig,
+)
 
 
-def test_paths_are_side_effect_free_until_ensured(tmp_path: Path) -> None:
-    appdata = tmp_path / "roaming"
-    project = tmp_path / "project"
-    paths = AppPaths.discover(appdata=appdata, project_root=project)
-
-    assert paths.data_dir == appdata.resolve() / APP_NAME
-    assert paths.installed_dir == paths.manager_dir / "installed"
-    assert paths.ltk_data_dir == appdata.resolve() / "dev.leaguetoolkit.manager"
-    assert paths.ltk_archive_index_file == paths.data_dir / "ltk_archive_index.json"
-    assert paths.ltk_package_index_file == paths.data_dir / "ltk_package_index.json"
+def test_discovery_is_side_effect_free_until_ensured(tmp_path: Path) -> None:
+    paths = AppPaths.discover(appdata=tmp_path)
     assert not paths.data_dir.exists()
+    assert not paths.log_dir.exists()
 
     paths.ensure()
-    assert paths.installed_dir.is_dir()
+
+    assert paths.data_dir.is_dir()
     assert paths.package_cache_dir.is_dir()
     assert paths.ltk_cache_dir.is_dir()
-    assert paths.migration_report_dir.is_dir()
-    assert not paths.ltk_data_dir.exists()
     assert paths.log_dir.is_dir()
 
 
-def test_runtime_config_rejects_unsafe_values() -> None:
-    with pytest.raises(ValueError, match="positive"):
-        RuntimeConfig(process_poll_seconds=0)
-    with pytest.raises(ValueError, match="between"):
-        RuntimeConfig(download_workers=17)
-    with pytest.raises(ValueError, match="positive"):
-        RuntimeConfig(download_attempts=0)
+def test_ensure_is_idempotent(tmp_path: Path) -> None:
+    paths = AppPaths.discover(appdata=tmp_path)
+    paths.ensure()
+    paths.ensure()
+    assert paths.data_dir.is_dir()
 
 
-def test_read_json_uses_fallback_for_malformed_content(tmp_path: Path) -> None:
-    path = tmp_path / "settings.json"
-    path.write_text("not-json", encoding="utf-8")
+def test_application_data_lives_under_the_app_name(tmp_path: Path) -> None:
+    paths = AppPaths.discover(appdata=tmp_path)
+    assert paths.data_dir == tmp_path / APP_NAME
+    assert paths.settings_file == paths.data_dir / "settings.json"
 
-    assert read_json(path, {"fallback": True}) == {"fallback": True}
+
+def test_ltk_data_is_a_sibling_not_a_child(tmp_path: Path) -> None:
+    """LTK's root is its own; we never nest it inside ours."""
+
+    paths = AppPaths.discover(appdata=tmp_path)
+    assert paths.ltk_data_dir == tmp_path / LTK_BUNDLE_IDENTIFIER
+    assert paths.data_dir not in paths.ltk_data_dir.parents
 
 
-def test_logging_configuration_is_idempotent(tmp_path: Path) -> None:
-    logger = logging.getLogger("league_skin_manager")
-    logger.handlers.clear()
-    first = configure_logging(tmp_path)
-    second = configure_logging(tmp_path)
-    assert first is second
-    assert len(first.handlers) == 2
+def test_ltk_storage_is_not_created_by_ensure(tmp_path: Path) -> None:
+    """LTK owns its own directory; the seeder creates it only when seeding."""
+
+    paths = AppPaths.discover(appdata=tmp_path)
+    paths.ensure()
+    assert not paths.ltk_data_dir.exists()
+
+
+def test_the_cache_holds_packages_and_the_ltk_installer(tmp_path: Path) -> None:
+    paths = AppPaths.discover(appdata=tmp_path)
+    assert paths.package_cache_dir.parent == paths.cache_dir
+    assert paths.ltk_cache_dir.parent == paths.cache_dir
+
+
+def test_no_cslol_paths_remain(tmp_path: Path) -> None:
+    """The manager, installed tree, profiles, manifest and indexes are gone."""
+
+    paths = AppPaths.discover(appdata=tmp_path)
+    fields = set(paths.__dataclass_fields__)
+    assert not fields & {
+        "manager_dir",
+        "installed_dir",
+        "profiles_dir",
+        "manager_version_file",
+        "managed_manifest_file",
+        "ltk_archive_index_file",
+        "ltk_package_index_file",
+        "migration_report_dir",
+        "cooldown_event_file",
+    }
+
+
+def test_the_watched_process_is_the_game_not_the_client() -> None:
+    assert LEAGUE_GAME_PROCESS_NAME == "League of Legends.exe"
+    assert LEAGUE_GAME_PROCESS_NAME != "LeagueClient.exe"
+
+
+def test_ltk_process_names_cover_the_manager_and_its_patcher() -> None:
+    assert "ltk-manager.exe" in LTK_PROCESS_NAMES
+    assert "ltk_patcher_host.exe" in LTK_PROCESS_NAMES
+
+
+def test_runtime_defaults_are_valid() -> None:
+    config = RuntimeConfig()
+    assert 1 <= config.download_workers <= 16
+    assert config.poll_seconds > 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"download_workers": 0},
+        {"download_workers": 17},
+        {"poll_seconds": 0},
+        {"poll_seconds": -1},
+        {"shutdown_timeout_seconds": 0},
+    ],
+)
+def test_runtime_config_rejects_unsafe_values(changes: dict[str, float]) -> None:
+    with pytest.raises(ValueError):
+        RuntimeConfig(**changes)  # type: ignore[arg-type]

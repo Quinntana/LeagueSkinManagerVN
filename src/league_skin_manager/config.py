@@ -9,27 +9,21 @@ from pathlib import Path
 
 APP_NAME = "LeagueSkinManagerVN"
 APP_DISPLAY_NAME = "League Skin Manager VN"
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"
 APP_PUBLISHER = "Quinntana"
 APP_INFO_URL = "https://github.com/Quinntana/LeagueSkinManagerVN"
-UNINSTALL_APP_NAME = "LeagueSkinManagerVNUninstall"
-SETUP_APP_NAME = "LeagueSkinManagerVNSetup"
-MANAGER_PROCESS_NAME = "cslol-manager.exe"
-MANAGER_PROCESS_NAMES = (MANAGER_PROCESS_NAME, "mod-tools.exe")
+
 LTK_PROCESS_NAMES = (
     "ltk-manager.exe",
     "LTK Manager.exe",
     "ltk_patcher_host.exe",
-    "LeagueSkinManagerLTK.exe",
 )
-LEAGUE_PROCESS_NAME = "LeagueClient.exe"
 
-# The in-game process, not the client.  Only the cooldown panel watches for a
-# process at all now: LTK starts its own patcher, so nothing here needs to
-# react to the client launching.
+# The in-game process, not the client. Only the cooldown panel watches for a
+# process at all: LTK starts its own patcher, so nothing here needs to react
+# to the League client launching.
 LEAGUE_GAME_PROCESS_NAME = "League of Legends.exe"
 
-CSLOL_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/cslol-manager/releases/latest"
 LTK_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/ltk-manager/releases/latest"
 SKIN_SOURCE_OWNER = "bettie9"
 SKIN_SOURCE_REPOSITORY = "LeagueSkins"
@@ -40,80 +34,57 @@ SKIN_SOURCE_BRANCH = "main"
 POROFESSOR_DOWNLOAD_URL = "https://porofessor.gg/download"
 
 # LTK derives its data root from its Tauri bundle identifier, which is fixed
-# per Windows user.  An LTK install can relocate mod storage via its own
+# per Windows user. An LTK install can relocate mod storage through its own
 # modStoragePath setting, so this is only the default starting point.
 LTK_BUNDLE_IDENTIFIER = "dev.leaguetoolkit.manager"
 
 
 @dataclass(frozen=True, slots=True)
 class AppPaths:
-    project_root: Path
+    """Every path this application owns.
+
+    Short because the application owns little: a package cache, an installer
+    cache, a settings file, and a log. The previous design also owned a CSLOL
+    installation, an extracted mod tree, profiles, a 743 KB manifest, two
+    digest indexes, migration reports, and a cooldown event log.
+    """
+
     data_dir: Path
-    manager_dir: Path
-    installed_dir: Path
-    profiles_dir: Path
     cache_dir: Path
     package_cache_dir: Path
     ltk_cache_dir: Path
-    migration_report_dir: Path
-    ltk_archive_index_file: Path
-    ltk_package_index_file: Path
     ltk_data_dir: Path
     log_dir: Path
     settings_file: Path
-    managed_manifest_file: Path
-    manager_version_file: Path
-    cooldown_event_file: Path
 
     @classmethod
-    def discover(
-        cls,
-        *,
-        appdata: str | Path | None = None,
-        project_root: str | Path | None = None,
-    ) -> AppPaths:
-        if project_root is None:
-            if getattr(sys, "frozen", False):
-                root = Path(sys.executable).resolve().parent
-            else:
-                root = Path(__file__).resolve().parents[2]
+    def discover(cls, appdata: str | Path | None = None) -> AppPaths:
+        raw = appdata if appdata is not None else os.environ.get("APPDATA")
+        if raw:
+            root = Path(raw).resolve()
+        elif getattr(sys, "frozen", False):
+            root = Path(sys.executable).resolve().parent
         else:
-            root = Path(project_root).resolve()
+            root = Path(__file__).resolve().parents[2]
 
-        appdata_value = appdata if appdata is not None else os.environ.get("APPDATA")
-        data_dir = Path(appdata_value).resolve() / APP_NAME if appdata_value else root / "data"
-        manager_dir = data_dir / "cslol-manager"
+        data_dir = root / APP_NAME if raw else root / "data"
         cache_dir = data_dir / "cache"
         return cls(
-            project_root=root,
             data_dir=data_dir,
-            manager_dir=manager_dir,
-            installed_dir=manager_dir / "installed",
-            profiles_dir=manager_dir / "profiles",
             cache_dir=cache_dir,
             package_cache_dir=cache_dir / "packages",
             ltk_cache_dir=cache_dir / "ltk",
-            migration_report_dir=data_dir / "migration-reports",
-            ltk_archive_index_file=data_dir / "ltk_archive_index.json",
-            ltk_package_index_file=data_dir / "ltk_package_index.json",
-            ltk_data_dir=data_dir.parent / LTK_BUNDLE_IDENTIFIER,
+            ltk_data_dir=(root if raw else data_dir) / LTK_BUNDLE_IDENTIFIER,
             log_dir=data_dir / "logs",
             settings_file=data_dir / "settings.json",
-            managed_manifest_file=data_dir / "managed_skins.json",
-            manager_version_file=manager_dir / "version.txt",
-            cooldown_event_file=data_dir / "cooldown-events.csv",
         )
 
     def ensure(self) -> None:
         for directory in (
             self.data_dir,
-            self.manager_dir,
-            self.installed_dir,
-            self.profiles_dir,
             self.cache_dir,
             self.package_cache_dir,
             self.ltk_cache_dir,
-            self.migration_report_dir,
             self.log_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -121,17 +92,33 @@ class AppPaths:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
-    process_poll_seconds: float = 5.0
     download_workers: int = 6
-    download_attempts: int = 3
+    poll_seconds: float = 5.0
     shutdown_timeout_seconds: float = 15.0
 
     def __post_init__(self) -> None:
-        if self.process_poll_seconds <= 0:
-            raise ValueError("process_poll_seconds must be positive")
         if not 1 <= self.download_workers <= 16:
             raise ValueError("download_workers must be between 1 and 16")
-        if self.download_attempts < 1:
-            raise ValueError("download_attempts must be positive")
+        if self.poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
+
+
+__all__ = [
+    "APP_DISPLAY_NAME",
+    "APP_INFO_URL",
+    "APP_NAME",
+    "APP_PUBLISHER",
+    "APP_VERSION",
+    "LEAGUE_GAME_PROCESS_NAME",
+    "LTK_BUNDLE_IDENTIFIER",
+    "LTK_PROCESS_NAMES",
+    "LTK_RELEASES_URL",
+    "POROFESSOR_DOWNLOAD_URL",
+    "SKIN_SOURCE_BRANCH",
+    "SKIN_SOURCE_OWNER",
+    "SKIN_SOURCE_REPOSITORY",
+    "AppPaths",
+    "RuntimeConfig",
+]

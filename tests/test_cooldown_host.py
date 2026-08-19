@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from league_skin_manager.window_host import WindowHost
+from league_skin_manager.cooldown.host import WindowHost
 
 
 class FakeWindow:

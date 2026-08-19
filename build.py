@@ -1,11 +1,16 @@
-"""Build both Windows one-file entrypoints with PyInstaller."""
+"""Build the single Windows executable with PyInstaller.
+
+One artifact, not three.  The previous design shipped the application, a
+separate uninstaller, and a setup executable that embedded both as payload;
+the application is now portable, and uninstall is a tray action rather than a
+program, so there is nothing else to build.
+"""
 
 from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -13,52 +18,18 @@ SRC_DIR = PROJECT_ROOT / "src"
 PACKAGE_DIR = SRC_DIR / "league_skin_manager"
 DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build_main"
-BUILD_DIR_UNINSTALL = PROJECT_ROOT / "build_uninstall"
-BUILD_DIR_INSTALLER = PROJECT_ROOT / "build_installer"
 
-MAIN_NAME = "LeagueSkinManagerVN"
-UNINSTALL_NAME = "LeagueSkinManagerVNUninstall"
-INSTALLER_NAME = "LeagueSkinManagerVNSetup"
-_ALLOWED_OUTPUT_NAMES = frozenset({"build_main", "build_uninstall", "build_installer", "dist"})
+APP_NAME = "LeagueSkinManagerVN"
+ENTRYPOINT = PACKAGE_DIR / "__main__.py"
+HIDDEN_IMPORTS = ("tkinter", "tkinter.ttk", "pystray", "pystray._win32")
 
-
-@dataclass(frozen=True, slots=True)
-class BuildTarget:
-    name: str
-    entrypoint: Path
-    work_dir: Path
-    hidden_imports: tuple[str, ...] = ()
-    data_files: tuple[Path, ...] = ()
-    data_destination: str = "payload"
-
-
-MAIN_TARGET = BuildTarget(
-    MAIN_NAME,
-    PACKAGE_DIR / "__main__.py",
-    BUILD_DIR,
-    hidden_imports=("tkinter", "tkinter.ttk", "pystray", "pystray._win32"),
-)
-UNINSTALL_TARGET = BuildTarget(
-    UNINSTALL_NAME,
-    PACKAGE_DIR / "uninstall.py",
-    BUILD_DIR_UNINSTALL,
-)
-INSTALLER_TARGET = BuildTarget(
-    INSTALLER_NAME,
-    PACKAGE_DIR / "installer.py",
-    BUILD_DIR_INSTALLER,
-    data_files=(
-        DIST_DIR / f"{MAIN_NAME}.exe",
-        DIST_DIR / f"{UNINSTALL_NAME}.exe",
-    ),
-)
-BUILD_TARGETS = (MAIN_TARGET, UNINSTALL_TARGET, INSTALLER_TARGET)
+_ALLOWED_OUTPUT_NAMES = frozenset({"build_main", "dist"})
 
 BuildRunner = Callable[[list[str]], None]
 
 
 def _verified_output_path(project_root: Path, path: Path) -> Path:
-    """Accept only the three named, direct children used by this build."""
+    """Accept only the named direct children this build is allowed to clean."""
 
     root = project_root.resolve()
     candidate = Path(os.path.abspath(path))
@@ -75,40 +46,29 @@ def _verified_output_path(project_root: Path, path: Path) -> Path:
     return candidate
 
 
-def clean_outputs(
-    project_root: Path = PROJECT_ROOT,
-    outputs: Iterable[Path] | None = None,
-) -> None:
-    selected = (
-        tuple(outputs)
-        if outputs is not None
-        else (BUILD_DIR, BUILD_DIR_UNINSTALL, BUILD_DIR_INSTALLER, DIST_DIR)
-    )
-    for output in selected:
+def clean_outputs(project_root: Path = PROJECT_ROOT) -> None:
+    for output in (BUILD_DIR, DIST_DIR):
         verified = _verified_output_path(project_root, output)
         if verified.exists():
             print(f"Cleaning {verified}", flush=True)
             shutil.rmtree(verified)
 
 
-def build_arguments(
-    target: BuildTarget,
-    *,
-    project_root: Path = PROJECT_ROOT,
-    dist_dir: Path = DIST_DIR,
-) -> list[str]:
+def build_arguments(*, project_root: Path = PROJECT_ROOT, dist_dir: Path = DIST_DIR) -> list[str]:
     root = project_root.resolve()
     source_dir = root / "src"
     package_dir = source_dir / "league_skin_manager"
-    entrypoint = target.entrypoint.resolve()
+    entrypoint = (package_dir / "__main__.py").resolve()
     try:
         entrypoint.relative_to(package_dir)
-    except ValueError as exc:
-        raise RuntimeError(f"Build entrypoint is outside the package: {entrypoint}") from exc
+    except ValueError as error:
+        raise RuntimeError(f"Build entrypoint is outside the package: {entrypoint}") from error
     if not entrypoint.is_file():
         raise RuntimeError(f"Build entrypoint does not exist: {entrypoint}")
 
-    work_dir = _verified_output_path(root, target.work_dir)
+    # Derived from project_root, not the module constant, so a build driven at
+    # another root verifies against that root rather than this file's.
+    work_dir = _verified_output_path(root, root / BUILD_DIR.name)
     verified_dist = _verified_output_path(root, dist_dir)
     arguments = [
         "--onefile",
@@ -116,7 +76,7 @@ def build_arguments(
         "--clean",
         "--noconsole",
         "--name",
-        target.name,
+        APP_NAME,
         "--distpath",
         str(verified_dist),
         "--workpath",
@@ -126,15 +86,8 @@ def build_arguments(
         "--paths",
         str(source_dir),
     ]
-    for hidden_import in target.hidden_imports:
-        arguments.extend(("--hidden-import", hidden_import))
-    for data_file in target.data_files:
-        arguments.extend(
-            (
-                "--add-data",
-                f"{data_file.resolve()}{os.pathsep}{target.data_destination}",
-            )
-        )
+    for hidden in HIDDEN_IMPORTS:
+        arguments.extend(("--hidden-import", hidden))
     arguments.append(str(entrypoint))
     return arguments
 
@@ -145,18 +98,17 @@ def _run_pyinstaller(arguments: list[str]) -> None:
     PyInstaller.__main__.run(arguments)
 
 
-def build_target(
-    target: BuildTarget,
+def build(
     *,
     project_root: Path = PROJECT_ROOT,
     dist_dir: Path = DIST_DIR,
     runner: BuildRunner = _run_pyinstaller,
 ) -> Path:
-    arguments = build_arguments(target, project_root=project_root, dist_dir=dist_dir)
-    print(f"Building {target.name} from {target.entrypoint}", flush=True)
+    arguments = build_arguments(project_root=project_root, dist_dir=dist_dir)
+    print(f"Building {APP_NAME} from {ENTRYPOINT}", flush=True)
     runner(arguments)
 
-    executable = _verified_output_path(project_root, dist_dir) / f"{target.name}.exe"
+    executable = _verified_output_path(project_root, dist_dir) / f"{APP_NAME}.exe"
     if not executable.is_file() or executable.stat().st_size <= 0:
         raise RuntimeError(f"PyInstaller did not produce a valid executable: {executable}")
     print(f"Built {executable} ({executable.stat().st_size:,} bytes)", flush=True)
@@ -164,27 +116,13 @@ def build_target(
 
 
 def main() -> None:
-    # Validate both package entrypoints before removing any prior build output.
-    for target in BUILD_TARGETS:
-        build_arguments(target)
+    build_arguments()  # validate before removing any prior output
     clean_outputs()
-    built = [build_target(target) for target in (MAIN_TARGET, UNINSTALL_TARGET)]
-    built.append(build_target(INSTALLER_TARGET))
-    print("Builds complete:", flush=True)
-    for executable in built:
-        print(f"  {executable}", flush=True)
+    print(f"Build complete: {build()}", flush=True)
 
 
 if __name__ == "__main__":
     main()
 
 
-__all__ = [
-    "BUILD_TARGETS",
-    "INSTALLER_TARGET",
-    "BuildTarget",
-    "build_arguments",
-    "build_target",
-    "clean_outputs",
-    "main",
-]
+__all__ = ["APP_NAME", "ENTRYPOINT", "build", "build_arguments", "clean_outputs", "main"]

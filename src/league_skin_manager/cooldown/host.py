@@ -54,6 +54,13 @@ class WindowHost:
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def window(self) -> WindowBoundary | None:
+        """The live window object, or None before it has been created."""
+
+        with self._lock:
+            return self._window
+
     def show(self) -> bool:
         """Open the window, creating and starting it on first request."""
 
