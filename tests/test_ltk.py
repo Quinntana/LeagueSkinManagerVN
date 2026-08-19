@@ -411,23 +411,37 @@ def test_a_null_mod_storage_path_falls_back(tmp_path: Path) -> None:
     assert ltk.resolve_storage_dir(tmp_path) == tmp_path
 
 
-def test_the_watcher_is_enabled_when_off(tmp_path: Path) -> None:
+def test_the_requested_settings_are_applied(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text(
-        json.dumps({"firstRunComplete": True, "watcherEnabled": False, "theme": "dark"}),
+        json.dumps({"firstRunComplete": True, "enforceSkinhackScan": True, "theme": "dark"}),
         encoding="utf-8",
     )
     assert ltk.apply_settings(tmp_path) is True
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["watcherEnabled"] is True
+    assert saved["enforceSkinhackScan"] is False
     assert saved["theme"] == "dark", "unrelated LTK settings must survive"
 
 
-def test_the_watcher_is_left_alone_when_already_on(tmp_path: Path) -> None:
+def test_the_watcher_setting_is_never_touched(tmp_path: Path) -> None:
+    """LTK defaults it off, seeding does not need it, and forcing it on makes
+    packages adopt and self-enable mid-session."""
+
+    assert "watcherEnabled" not in ltk.MANAGED_SETTINGS
     path = tmp_path / "settings.json"
     path.write_text(
-        json.dumps({"firstRunComplete": True, "watcherEnabled": True}), encoding="utf-8"
+        json.dumps({"firstRunComplete": True, "watcherEnabled": False}), encoding="utf-8"
     )
+    ltk.apply_settings(tmp_path)
+    assert json.loads(path.read_text(encoding="utf-8"))["watcherEnabled"] is False
+
+
+def test_applying_settings_twice_is_a_no_op(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"firstRunComplete": True, "enforceSkinhackScan": True}), encoding="utf-8"
+    )
+    assert ltk.apply_settings(tmp_path) is True
     assert ltk.apply_settings(tmp_path) is False
 
 
@@ -440,5 +454,65 @@ def test_settings_are_never_written_from_scratch(tmp_path: Path) -> None:
 
 def test_a_partial_settings_file_is_not_patched(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
-    path.write_text(json.dumps({"watcherEnabled": False}), encoding="utf-8")
+    path.write_text(json.dumps({"enforceSkinhackScan": True}), encoding="utf-8")
     assert ltk.apply_settings(tmp_path) is False
+
+
+# --- the enabled baseline -------------------------------------------------
+
+
+def library(*enabled: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "mods": [{"id": name} for name in enabled],
+        "profiles": [
+            {
+                "id": "p1",
+                "name": "Default",
+                "enabledMods": list(enabled),
+                "modOrder": list(enabled),
+                "layerStates": {name: {} for name in enabled},
+            }
+        ],
+    }
+
+
+def test_enabled_mods_are_cleared(tmp_path: Path) -> None:
+    """171 of 173 champions have more than one skin; all-on means all compete."""
+
+    path = tmp_path / "library.json"
+    path.write_text(json.dumps(library("a", "b", "c")), encoding="utf-8")
+
+    assert ltk.clear_enabled_mods(tmp_path) == 3
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["profiles"][0]["enabledMods"] == []
+    assert saved["profiles"][0]["layerStates"] == {}
+
+
+def test_the_mods_themselves_are_kept(tmp_path: Path) -> None:
+    """Clearing switches skins off; it never removes them from the library."""
+
+    path = tmp_path / "library.json"
+    path.write_text(json.dumps(library("a", "b")), encoding="utf-8")
+    ltk.clear_enabled_mods(tmp_path)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert [m["id"] for m in saved["mods"]] == ["a", "b"]
+    assert saved["version"] == 1
+
+
+def test_clearing_an_already_clear_library_is_a_no_op(tmp_path: Path) -> None:
+    path = tmp_path / "library.json"
+    path.write_text(json.dumps(library()), encoding="utf-8")
+    assert ltk.clear_enabled_mods(tmp_path) == 0
+
+
+def test_clearing_a_missing_library_is_harmless(tmp_path: Path) -> None:
+    assert ltk.clear_enabled_mods(tmp_path) == 0
+
+
+def test_a_malformed_library_is_left_alone(tmp_path: Path) -> None:
+    path = tmp_path / "library.json"
+    path.write_text("[]", encoding="utf-8")
+    assert ltk.clear_enabled_mods(tmp_path) == 0
+    assert path.read_text(encoding="utf-8") == "[]"

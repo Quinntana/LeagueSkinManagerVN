@@ -96,16 +96,33 @@ Established by experiment against LTK Manager v1.13.0, not assumed:
 | Operation | Target |
 |---|---|
 | read | `settings.json` → `modStoragePath` |
-| read/write | `settings.json` → `watcherEnabled`, lazily and only in a file LTK already wrote |
+| write | `settings.json` → `enforceSkinhackScan` only, and only in a file LTK already wrote |
+| write | `library.json` → clears each profile's `enabledMods`, nothing else |
 | write | `archives/*.fantome`, under any filename |
 | delete | contents of `archives/` and `mods/` |
-| never | `library.json`, `wad-reports.json`, `profiles/`, LTK's own files |
+| never | `watcherEnabled` or any other setting, `wad-reports.json`, `profiles/`, LTK's own files |
+
+Both `settings.json` and `library.json` edits are skipped entirely while LTK
+is running, and neither file is ever authored from scratch: LTK requires
+`firstRunComplete` and discards a settings file lacking it.
 
 LTK reconciles its library from disk on **every** startup, regardless of any
 setting. A stale `library.json` referencing packages that no longer exist is
-repaired automatically, packages dropped into `archives/` are adopted and
-renamed, and adopted packages land *enabled* — so there is no activation step
-after a sync.
+repaired automatically, and packages dropped into `archives/` are adopted and
+renamed.
+
+### Nothing is enabled by default
+
+LTK switches a package **on** the moment it adopts it, with or without the
+file watcher. That is fine for a library of a few mods and wrong for this one:
+171 of 173 champions have more than one skin, and Miss Fortune alone has 23.
+Leaving everything enabled means a dozen skins compete per champion and the
+one that wins changes silently whenever the source updates.
+
+So the baseline is *present, but nothing switched on*. After a sync, the next
+launch that finds LTK closed clears every profile's `enabledMods`, and you
+turn on the skins you actually want. Nothing is ever removed from the library
+— only switched off.
 
 Syncing does not require LTK to be closed. If it happens to be open, its library
 will look empty until it is restarted, so the app says exactly that in a
@@ -113,6 +130,11 @@ notification.
 
 LTK ships its own updater, so this application never manages LTK versions. It
 verifies the first install and then gets out of the way.
+
+`watcherEnabled` is deliberately left alone. LTK defaults it off, seeding is
+proven not to need it, and forcing it on makes packages adopt — and switch
+themselves on — mid-session while you are looking at the library. Turn it on
+yourself if you want live pickup of files you drop in by hand.
 
 ### Installer verification
 

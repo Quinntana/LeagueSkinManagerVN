@@ -50,6 +50,11 @@ happens while LTK is closed, and the application launches it once afterwards.
 
 EXECUTABLE_NAMES = ("ltk-manager.exe", "LTK Manager.exe")
 
+MANAGED_SETTINGS: dict[str, object] = {
+    # Requested explicitly. Every other LTK setting is the user's to configure.
+    "enforceSkinhackScan": False,
+}
+
 _CHUNK = 256 * 1024
 _DIGEST = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 _INSTALLER = re.compile(
@@ -520,13 +525,16 @@ def resolve_storage_dir(data_dir: Path | None = None) -> Path:
 
 
 def apply_settings(data_dir: Path | None = None) -> bool:
-    """Enable LTK's library watcher if it is off, leaving every other key alone.
+    """Apply the few LTK settings this application has an opinion about.
 
-    Deliberately lazy and non-critical: seeding is proven not to depend on the
-    watcher, because LTK reconciles from disk on every start regardless.  A
-    partial settings file cannot be written from scratch -- LTK requires
-    firstRunComplete and rejects a file without it, restoring its own defaults
-    -- so this only ever edits a complete file LTK has already written.
+    Deliberately narrow. Every other key is the user's to configure, and this
+    only ever edits a complete file LTK has already written: LTK requires
+    firstRunComplete and discards a file lacking it, restoring its own
+    defaults, so a settings file is never authored from scratch.
+
+    watcherEnabled is deliberately *not* touched. LTK defaults it off, seeding
+    is proven not to depend on it, and forcing it on makes packages adopt (and
+    self-enable) mid-session while the user is looking at the library.
     """
 
     root = data_dir or default_data_dir()
@@ -534,17 +542,73 @@ def apply_settings(data_dir: Path | None = None) -> bool:
     raw = read_json(path, default=None)
     if not isinstance(raw, dict) or "firstRunComplete" not in raw:
         return False
-    if raw.get("watcherEnabled") is True:
-        return False
+
     updated = dict(raw)
-    updated["watcherEnabled"] = True
+    changed = False
+    for key, value in MANAGED_SETTINGS.items():
+        if updated.get(key) != value:
+            updated[key] = value
+            changed = True
+    if not changed:
+        return False
     try:
         atomic_write_json(path, updated)
     except OSError:
-        LOGGER.warning("Could not enable LTK's library watcher", exc_info=True)
+        LOGGER.warning("Could not update LTK settings", exc_info=True)
         return False
-    LOGGER.info("Enabled LTK's library watcher")
+    LOGGER.info("Applied LTK settings: %s", ", ".join(sorted(MANAGED_SETTINGS)))
     return True
+
+
+def clear_enabled_mods(data_dir: Path | None = None) -> int:
+    """Return the library to its baseline: present, but nothing switched on.
+
+    LTK enables a package the moment it adopts it, with or without the file
+    watcher. Since the library holds every skin in the source -- 171 of 173
+    champions have more than one, and Miss Fortune alone has 23 -- leaving
+    them all on means every champion has a dozen skins competing and the one
+    that wins changes silently whenever the source updates.
+
+    So the baseline is nothing enabled, and the user turns on what they want.
+    This is the only field outside settings.json that is ever written, and it
+    is skipped entirely while LTK is running.
+    """
+
+    root = data_dir or default_data_dir()
+    path = root / "library.json"
+    raw = read_json(path, default=None)
+    if not isinstance(raw, dict):
+        return 0
+    profiles = raw.get("profiles")
+    if not isinstance(profiles, list):
+        return 0
+
+    cleared = 0
+    updated_profiles: list[Any] = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            updated_profiles.append(profile)
+            continue
+        enabled = profile.get("enabledMods")
+        if isinstance(enabled, list) and enabled:
+            cleared += len(enabled)
+            profile = dict(profile)
+            profile["enabledMods"] = []
+            if isinstance(profile.get("layerStates"), dict):
+                profile["layerStates"] = {}
+        updated_profiles.append(profile)
+
+    if not cleared:
+        return 0
+    payload = dict(raw)
+    payload["profiles"] = updated_profiles
+    try:
+        atomic_write_json(path, payload)
+    except OSError:
+        LOGGER.warning("Could not clear LTK's enabled mods", exc_info=True)
+        return 0
+    LOGGER.info("Cleared %d enabled mods; the library baseline is nothing enabled", cleared)
+    return cleared
 
 
 def remove_data(data_dir: Path | None = None) -> bool:
@@ -572,7 +636,9 @@ __all__ = [
     "LtkVerificationError",
     "ReleaseAsset",
     "ReleaseClient",
+    "MANAGED_SETTINGS",
     "apply_settings",
+    "clear_enabled_mods",
     "default_data_dir",
     "install",
     "install_roots",
