@@ -24,11 +24,25 @@ LTK_PROCESS_NAMES = (
 )
 LEAGUE_PROCESS_NAME = "LeagueClient.exe"
 
+# The in-game process, not the client.  Only the cooldown panel watches for a
+# process at all now: LTK starts its own patcher, so nothing here needs to
+# react to the client launching.
+LEAGUE_GAME_PROCESS_NAME = "League of Legends.exe"
+
 CSLOL_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/cslol-manager/releases/latest"
 LTK_RELEASES_URL = "https://api.github.com/repos/LeagueToolkit/ltk-manager/releases/latest"
 SKIN_SOURCE_OWNER = "bettie9"
 SKIN_SOURCE_REPOSITORY = "LeagueSkins"
 SKIN_SOURCE_BRANCH = "main"
+
+# Porofessor is an Overwolf extension with no standalone installer to verify,
+# so this application never manages it: the tray opens this page and stops.
+POROFESSOR_DOWNLOAD_URL = "https://porofessor.gg/download"
+
+# LTK derives its data root from its Tauri bundle identifier, which is fixed
+# per Windows user.  An LTK install can relocate mod storage via its own
+# modStoragePath setting, so this is only the default starting point.
+LTK_BUNDLE_IDENTIFIER = "dev.leaguetoolkit.manager"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +60,7 @@ class AppPaths:
     ltk_package_index_file: Path
     ltk_data_dir: Path
     log_dir: Path
+    settings_file: Path
     managed_manifest_file: Path
     manager_version_file: Path
     cooldown_event_file: Path
@@ -81,8 +96,9 @@ class AppPaths:
             migration_report_dir=data_dir / "migration-reports",
             ltk_archive_index_file=data_dir / "ltk_archive_index.json",
             ltk_package_index_file=data_dir / "ltk_package_index.json",
-            ltk_data_dir=data_dir.parent / "dev.leaguetoolkit.manager",
+            ltk_data_dir=data_dir.parent / LTK_BUNDLE_IDENTIFIER,
             log_dir=data_dir / "logs",
+            settings_file=data_dir / "settings.json",
             managed_manifest_file=data_dir / "managed_skins.json",
             manager_version_file=manager_dir / "version.txt",
             cooldown_event_file=data_dir / "cooldown-events.csv",
