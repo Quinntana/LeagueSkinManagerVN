@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "LeagueSkinManagerVN"
-version = "3.0.0"
+version = "4.0.0"
 description = "A tool for managing League of Legends custom skins"
 authors = ["Quinntana <archimedesstar@gmail.com>"]
 license = "GPL-3.0"
@@ -9,8 +9,6 @@ packages = [{ include = "league_skin_manager", from = "src" }]
 
 [tool.poetry.scripts]
 league-skin-manager = "league_skin_manager.__main__:main"
-league-skin-manager-uninstall = "league_skin_manager.uninstall:main"
-league-skin-manager-setup = "league_skin_manager.installer:main"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.15"
@@ -55,6 +53,8 @@ addopts = "-q --cov=league_skin_manager --cov-report=term-missing --cov-fail-und
 [tool.coverage.run]
 omit = [
     "src/league_skin_manager/__main__.py",
-    "src/league_skin_manager/main.py",
-    "src/league_skin_manager/uninstall.py",
+    # The composition root and the Tk panel are exercised by running the
+    # application, not by unit tests; everything they wire is covered.
+    "src/league_skin_manager/app.py",
+    "src/league_skin_manager/cooldown/panel.py",
 ]

@@ -34,11 +34,18 @@ def champion(identifier: str, *, maxrank: int = 3, cooldown: list[float] | None 
     return {
         "id": identifier,
         "name": identifier,
-        "spells": [{"id": f"{identifier}Q"}, {"id": f"{identifier}W"}, {"id": f"{identifier}E"}, ultimate],
+        "spells": [
+            {"id": f"{identifier}Q"},
+            {"id": f"{identifier}W"},
+            {"id": f"{identifier}E"},
+            ultimate,
+        ],
     }
 
 
-def summoner(identifier: str, name: str, *, maxrank: int = 1, cooldown: list[float] | None = None) -> Any:
+def summoner(
+    identifier: str, name: str, *, maxrank: int = 1, cooldown: list[float] | None = None
+) -> Any:
     record: dict[str, Any] = {"id": identifier, "name": name, "maxrank": maxrank}
     if cooldown is not None:
         record["cooldown"] = cooldown

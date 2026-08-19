@@ -178,7 +178,9 @@ def test_an_implausible_level_becomes_none(level: Any) -> None:
 
 
 def test_a_non_object_payload_is_rejected() -> None:
-    assert client_for(["not", "an", "object"]).enemy_roster().status is RosterStatus.INVALID_RESPONSE
+    assert (
+        client_for(["not", "an", "object"]).enemy_roster().status is RosterStatus.INVALID_RESPONSE
+    )
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), True])
