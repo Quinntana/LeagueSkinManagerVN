@@ -234,6 +234,17 @@ Build the single executable:
 poetry run python build.py
 ```
 
+### Do not run the executable from a synced drive
+
+Running the built `.exe` from a Google Drive / OneDrive path makes every TLS
+handshake time out after ~34 seconds and fail, so the app cannot reach GitHub
+at all. The same interpreter and certificate bundle work instantly from a local
+path, and raw `ssl` handshakes succeed from either — it is the sync client's
+filesystem filter interfering with the frozen executable's network stack, not a
+certificate or proxy problem.
+
+Build wherever you like; put the `.exe` somewhere local before running it.
+
 ## Notice
 
 Custom skin tools, redistributed game assets, and game-file modification can
