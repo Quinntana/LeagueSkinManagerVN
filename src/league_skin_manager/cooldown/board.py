@@ -11,11 +11,13 @@ What the click no longer needs is a number.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from threading import Lock
+from pathlib import Path
+from threading import Event, Lock, Thread
 
-from .roster import RosterMember, RosterResult, RosterStatus
+from .roster import Role, RosterMember, RosterResult, RosterStatus
 from .timer import (
     CooldownDefinition,
     CooldownKey,
@@ -30,6 +32,12 @@ LOGGER = logging.getLogger(__name__)
 MAX_ROWS = 5
 SLOTS = (CooldownSlot.ULTIMATE, CooldownSlot.SPELL_ONE, CooldownSlot.SPELL_TWO)
 SLOT_LABELS = {CooldownSlot.ULTIMATE: "R", CooldownSlot.SPELL_ONE: "D", CooldownSlot.SPELL_TWO: "F"}
+
+# The order a player reads a scoreboard in. Anything the live client does not
+# position -- ARAM, and any mode without lanes -- sorts after these.
+LANE_ORDER = (Role.TOP, Role.JUNGLE, Role.MIDDLE, Role.BOTTOM, Role.UTILITY)
+
+ROSTER_POLL_SECONDS = 5.0
 
 RosterProvider = Callable[[], RosterResult]
 LoadoutResolver = Callable[[Iterable[RosterMember]], tuple[EnemyCooldownLoadout, ...]]
@@ -46,6 +54,7 @@ class SlotView:
     is_ready: bool
     enabled: bool
     reason: str | None
+    icon_path: Path | None = None
 
     @property
     def counting(self) -> bool:
@@ -54,11 +63,16 @@ class SlotView:
 
 @dataclass(frozen=True, slots=True)
 class RowView:
-    """One enemy."""
+    """One enemy.
+
+    ``level`` selects the cooldown rank and is deliberately not rendered: the
+    scoreboard already shows it, and this surface exists to be small.
+    """
 
     champion: str
     level: int | None
     slots: tuple[SlotView, ...]
+    champion_icon_path: Path | None = None
 
     @property
     def is_placeholder(self) -> bool:
@@ -107,13 +121,14 @@ class CooldownBoard:
             return False
 
         session = "|".join(sorted(member.participant_id for member in result.members))
+        members = order_by_lane(result.members)
         with self._lock:
             changed = session != self._session
             self._levels = {m.participant_id: m.level for m in result.members}
         if changed:
             self._store.reset_session(session)
             try:
-                loadouts = self._resolve(result.members)
+                loadouts = self._resolve(members)
             except Exception:  # noqa: BLE001 - a catalog failure must not break the board
                 self._logger.warning("Could not resolve cooldown metadata", exc_info=True)
                 loadouts = ()
@@ -138,6 +153,7 @@ class CooldownBoard:
                     champion=loadout.champion_name,
                     level=level,
                     slots=tuple(self._slot_view(loadout, slot, level) for slot in SLOTS),
+                    champion_icon_path=loadout.champion_icon_path,
                 )
             )
         while len(views) < MAX_ROWS:
@@ -153,7 +169,9 @@ class CooldownBoard:
         counting = snapshot is not None and not snapshot.is_ready
 
         if snapshot is not None and counting:
-            caption = f"{int(snapshot.remaining) + 1}"
+            # ceil, not int()+1: at the instant of the press remaining is exactly
+            # the duration, and int()+1 would show one second too many.
+            caption = f"{math.ceil(snapshot.remaining)}"
         elif snapshot is not None:
             caption = "up"
         elif duration is not None:
@@ -171,6 +189,7 @@ class CooldownBoard:
             # therefore be cancelled.
             enabled=duration is not None or counting,
             reason=definition.unsupported_reason or _why_not(definition, level),
+            icon_path=definition.icon_path,
         )
 
     # -- interaction -----------------------------------------------------
@@ -205,6 +224,77 @@ class CooldownBoard:
         return self._store.clear_all()
 
 
+def order_by_lane(members: Iterable[RosterMember]) -> tuple[RosterMember, ...]:
+    """Sort enemies into scoreboard order, stably.
+
+    Stability is the whole fallback: modes without lanes report no position at
+    all, so every enemy sorts equal and the live client's own order survives
+    untouched. It also stops rows shuffling between polls.
+    """
+
+    ordered = tuple(members)
+    return tuple(
+        sorted(
+            ordered,
+            key=lambda member: (
+                LANE_ORDER.index(member.role) if member.role in LANE_ORDER else len(LANE_ORDER)
+            ),
+        )
+    )
+
+
+class RosterPoller:
+    """Drives :meth:`CooldownBoard.refresh` off the interface thread.
+
+    The live client is a network call with a timeout measured in whole seconds.
+    Polling it from the thread that repaints made the countdown stall, so it
+    gets a thread of its own, built to the same shape as ``GameWatcher``.
+    """
+
+    def __init__(
+        self,
+        board: CooldownBoard,
+        *,
+        poll_seconds: float = ROSTER_POLL_SECONDS,
+        logger: logging.Logger = LOGGER,
+    ) -> None:
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        self._board = board
+        self._poll_seconds = poll_seconds
+        self._logger = logger
+        self._stop = Event()
+        self._thread: Thread | None = None
+
+    def start(self) -> bool:
+        if self._thread is not None:
+            return False
+        self._stop.clear()
+        self._thread = Thread(target=self._run, name="cooldown-roster", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def poll_once(self) -> bool:
+        try:
+            return self._board.refresh()
+        except Exception:  # noqa: BLE001 - polling must survive anything
+            self._logger.warning("Roster polling failed", exc_info=True)
+            return False
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.poll_once()
+            self._stop.wait(self._poll_seconds)
+
+
 def _empty_slots() -> list[SlotView]:
     return [
         SlotView(
@@ -229,10 +319,14 @@ def _why_not(definition: CooldownDefinition, level: int | None) -> str | None:
 
 
 __all__ = [
+    "LANE_ORDER",
     "MAX_ROWS",
+    "ROSTER_POLL_SECONDS",
     "SLOTS",
     "SLOT_LABELS",
     "CooldownBoard",
+    "RosterPoller",
     "RowView",
     "SlotView",
+    "order_by_lane",
 ]

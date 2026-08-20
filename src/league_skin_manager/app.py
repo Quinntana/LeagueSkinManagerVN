@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock, Thread
+from typing import Any
 
 from . import ltk, porofessor, windows
 from . import settings as settings_module
@@ -20,7 +21,7 @@ from .config import APP_DISPLAY_NAME, AppPaths
 from .github import GitHubSkinSource
 from .logging_setup import configure_logging
 from .process_watch import GameWatcher
-from .settings import Settings
+from .settings import OPACITY_CHOICES, SCALE_CHOICES, Settings
 from .sync import synchronize
 from .tray import Tray, TrayActions, TrayState
 from .uninstall import uninstall
@@ -51,7 +52,6 @@ class App:
         self._cache = PackageCache(self.paths.package_cache_dir, self.logger.getChild("cache"))
         self._blocked: str | None = None
         self._cooldown_open = False
-        self._suppressed_for_match = False
 
         self.tray = Tray(
             actions=TrayActions(
@@ -101,7 +101,7 @@ class App:
         worker = self._worker
         if worker is not None and worker.is_alive():
             worker.join(timeout)
-        self._close_cooldowns()
+        self._release_cooldowns()
         try:
             self._source.close()
         except Exception:  # noqa: BLE001 - shutdown must not raise
@@ -128,18 +128,59 @@ class App:
                 self._block(BLOCKED_MESSAGE)
                 return
 
-            # Lazy and skipped while LTK runs; only ever edits a settings
-            # file LTK has already written.
-            if not ltk.is_running(windows.ProcessLookup):
-                ltk.apply_settings(self.paths.ltk_data_dir)
+            applied = self._apply_ltk_settings()
 
             first_sync = self.settings.commit is None
             self._sync()
             if first_sync and self.settings.commit is not None:
                 self._advertise()
+            if not applied:
+                # On a first run the call above was a no-op: LTK had never run,
+                # so it had written no settings file to edit. _advertise has
+                # just started LTK, which creates that file with LTK's own
+                # defaults, so the managed settings need applying once it
+                # closes again -- otherwise they first take effect on the
+                # second launch of this application.
+                self._start_worker_thread(self._await_ltk_settings, "ltk-settings")
         except Exception as error:  # noqa: BLE001 - the worker is the boundary
             self.logger.exception("Startup failed")
             self._fail("Startup failed", str(error))
+
+    def _apply_ltk_settings(self) -> bool:
+        """Apply the managed LTK settings if this is a moment they will stick.
+
+        Only ever edits a settings file LTK has already written, and never
+        while LTK is running. Measured: LTK does not rewrite that file on exit
+        and does not enforce the value back, so one successful write holds.
+        """
+
+        if ltk.is_running(windows.ProcessLookup):
+            self.logger.info("Deferred LTK settings: LTK is running")
+            return False
+        return bool(ltk.apply_settings(self.paths.ltk_data_dir))
+
+    def _await_ltk_settings(self, poll_seconds: float = 10.0) -> None:
+        """Wait for a closed LTK with a settings file, then apply once.
+
+        Without this the managed settings first take effect on the *second*
+        launch of this application, because a first run has no settings file to
+        edit until the advertised launch of LTK creates one.
+        """
+
+        while not self._stop.is_set():
+            if self._apply_ltk_settings():
+                return
+            settings_file = self.paths.ltk_data_dir / "settings.json"
+            if settings_file.is_file() and not ltk.is_running(windows.ProcessLookup):
+                # The file exists, LTK is closed, and nothing changed: the
+                # managed values are already in place.
+                return
+            self._stop.wait(poll_seconds)
+
+    def _start_worker_thread(self, target: Any, name: str) -> None:
+        """Start a detached daemon helper that shutdown does not wait on."""
+
+        Thread(target=target, name=name, daemon=True).start()
 
     def _install_ltk(self) -> None:
         self.tray.refresh(working=True, detail="Installing LTK Manager...")
@@ -231,7 +272,7 @@ class App:
         if not self.watcher.match_active:
             self.tray.notify(APP_DISPLAY_NAME, "Cooldown timers open during a match.")
             return
-        self._show_cooldowns(automatic=False)
+        self._show_cooldowns()
 
     def _set_cooldown_auto_run(self, enabled: bool) -> None:
         self._save(_replace(self.settings, cooldown_auto_run=enabled))
@@ -276,50 +317,82 @@ class App:
     # -- cooldown panel --------------------------------------------------
 
     def _on_game_change(self, running: bool) -> None:
+        """The board's lifetime is the match: built on entry, released on exit."""
+
         self.tray.refresh(match_active=running)
         if running:
-            self._suppressed_for_match = False
             if self.settings.cooldown_auto_run:
-                self._show_cooldowns(automatic=True)
+                self._show_cooldowns()
         else:
-            self._suppressed_for_match = False
-            self._close_cooldowns()
+            self._release_cooldowns()
 
-    def _show_cooldowns(self, *, automatic: bool) -> None:
-        if automatic and self._suppressed_for_match:
-            return
+    def _show_cooldowns(self) -> None:
         try:
             from .cooldown import open_panel
         except ImportError:
             self.logger.warning("The cooldown panel is unavailable")
             return
         with _logged(self.logger, "opening the cooldown panel"):
-            self._cooldown_open = bool(
+            opened = bool(
                 open_panel(
                     cache_dir=self.paths.ltk_cache_dir.parent / "cooldowns",
                     opacity=self.settings.cooldown_opacity,
                     scale=self.settings.cooldown_scale,
+                    left=self.settings.cooldown_left,
+                    top=self.settings.cooldown_top,
+                    opacity_choices=OPACITY_CHOICES,
+                    scale_choices=SCALE_CHOICES,
                     on_closed=self._on_cooldowns_closed,
+                    on_display=self._on_cooldown_display,
+                    on_move=self._on_cooldown_moved,
+                    on_hidden=self._on_cooldown_hidden,
                 )
             )
+            self._cooldown_open = self._cooldown_open or opened
+            self.tray.refresh(cooldown_visible=opened)
+
+    def _on_cooldown_display(self, opacity: float, scale: float) -> None:
+        """The board's own controls changed a display setting; persist it.
+
+        Called from the panel's thread, so it only touches settings and the
+        tray's own thread-safe refresh.
+        """
+
+        updated = self.settings.with_display(opacity=opacity, scale=scale)
+        self._save(updated)
+        self.tray.refresh(opacity=updated.cooldown_opacity, scale=updated.cooldown_scale)
+
+    def _on_cooldown_hidden(self, hidden: bool) -> None:
+        """The board was hidden or shown from its own control.
+
+        The tray offers the open action again once the board is off screen,
+        which is what makes hiding release the one-board-per-game lock.
+        """
+
+        self.tray.refresh(cooldown_visible=not hidden)
+
+    def _on_cooldown_moved(self, left: int, top: int) -> None:
+        self._save(_replace(self.settings, cooldown_left=left, cooldown_top=top))
 
     def _on_cooldowns_closed(self) -> None:
-        """A manual close during a match suppresses re-opening for that match only."""
+        """The session ended -- the window's loop exited and it tore itself down."""
 
         self._cooldown_open = False
-        if self.watcher.match_active:
-            self._suppressed_for_match = True
+        self.tray.refresh(cooldown_visible=False)
 
-    def _close_cooldowns(self) -> None:
+    def _release_cooldowns(self) -> None:
+        """End the session. The match is over, so the timers go with it."""
+
         if not self._cooldown_open:
             return
         try:
-            from .cooldown import close_panel
+            from .cooldown import release_panel
         except ImportError:
             return
-        with _logged(self.logger, "closing the cooldown panel"):
-            close_panel()
+        with _logged(self.logger, "releasing the cooldown panel"):
+            release_panel()
         self._cooldown_open = False
+        self.tray.refresh(cooldown_visible=False)
 
     def _apply_display(self) -> None:
         try:

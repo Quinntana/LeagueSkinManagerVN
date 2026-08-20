@@ -79,6 +79,7 @@ class TrayState:
     ltk_installed: bool = False
     blocked_reason: str | None = None
     match_active: bool = False
+    cooldown_visible: bool = False
     cooldown_auto_run: bool = False
     startup_enabled: bool = False
     opacity: float = 0.85
@@ -179,9 +180,11 @@ class Tray:
             ),
             separator,
             item(
+                # One board per game: offered only when a match is running and
+                # the board is not already on screen. Hiding it offers it again.
                 "Cooldown timers",
                 self._wrap(self.actions.open_cooldowns),
-                enabled=self.state.match_active,
+                enabled=self.state.match_active and not self.state.cooldown_visible,
             ),
             item("Get Porofessor", self._wrap(self.actions.get_porofessor)),
             separator,

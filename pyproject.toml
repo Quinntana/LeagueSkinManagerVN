@@ -49,11 +49,9 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q --cov=league_skin_manager --cov-report=term-missing --cov-fail-under=80"
+markers = [
+    "slow: spawns a subprocess; the only way to assert on a Tcl abort, which kills the process rather than raising",
+]
 
 [tool.coverage.run]
-omit = [
-    "src/league_skin_manager/__main__.py",
-    # The Tk panel is exercised by running the application, not by unit
-    # tests; the composition root's sequencing decisions are covered.
-    "src/league_skin_manager/cooldown/panel.py",
-]
+omit = ["src/league_skin_manager/__main__.py"]

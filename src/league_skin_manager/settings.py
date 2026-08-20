@@ -25,13 +25,19 @@ LOGGER = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# Presets offered in the tray. The panel is sized for a 1080p client, so the
-# choices run mostly smaller with a single larger option.
-OPACITY_CHOICES: tuple[float, ...] = (1.0, 0.85, 0.70, 0.55)
+# Presets offered from the board and the tray. The panel is sized for a 1080p
+# client, so the choices run mostly smaller with a single larger option.
+#
+# The range reaches 0.30 because trials over a live game settled below the old
+# 0.55 floor whenever the countdown was hard to read. The default stays high:
+# once a counting slot darkens its own icon and outlines its number, legibility
+# no longer depends on the window being opaque, and the same trials then
+# settled at full opacity with the *smallest* scale. Small beats faint.
+OPACITY_CHOICES: tuple[float, ...] = (1.0, 0.85, 0.70, 0.55, 0.45, 0.35, 0.30)
 SCALE_CHOICES: tuple[float, ...] = (0.70, 0.85, 1.0, 1.25)
 
 DEFAULT_OPACITY = 0.85
-DEFAULT_SCALE = 1.0
+DEFAULT_SCALE = 0.70
 
 
 @dataclass(frozen=True, slots=True)

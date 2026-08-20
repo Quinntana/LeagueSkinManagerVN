@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -456,3 +457,69 @@ def test_a_partial_settings_file_is_not_patched(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"enforceSkinhackScan": True}), encoding="utf-8")
     assert ltk.apply_settings(tmp_path) is False
+
+
+# --- the ordering that left the setting on through a whole first run -------
+
+
+def test_a_missing_settings_file_is_logged_as_deferred(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The silent False is what hid this for a whole release.
+
+    On a first run LTK has never written settings.json, so there is nothing to
+    edit; the advertised launch afterwards creates it with LTK's defaults.
+    """
+
+    with caplog.at_level(logging.INFO, logger="league_skin_manager.ltk"):
+        assert ltk.apply_settings(tmp_path) is False
+    assert "Deferred LTK settings" in caplog.text
+
+
+def test_a_partial_settings_file_is_logged_as_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"enforceSkinhackScan": True}), encoding="utf-8"
+    )
+    with caplog.at_level(logging.INFO, logger="league_skin_manager.ltk"):
+        assert ltk.apply_settings(tmp_path) is False
+    assert "Skipped LTK settings" in caplog.text
+
+
+def test_a_successful_application_names_what_changed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"firstRunComplete": True, "enforceSkinhackScan": True}), encoding="utf-8"
+    )
+    with caplog.at_level(logging.INFO, logger="league_skin_manager.ltk"):
+        assert ltk.apply_settings(tmp_path) is True
+    assert "enforceSkinhackScan" in caplog.text
+
+
+def test_settings_are_written_without_a_byte_order_mark(tmp_path: Path) -> None:
+    """Measured 2026-08-20: a BOM makes LTK reject the entire file.
+
+    It logs `Failed to parse settings file: expected value at line 1 column 1`
+    and replaces the file with its own defaults, so the managed value is lost
+    along with every setting the user had chosen.
+    """
+
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"firstRunComplete": True, "enforceSkinhackScan": True}), encoding="utf-8"
+    )
+    ltk.apply_settings(tmp_path)
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert json.loads(path.read_text(encoding="utf-8"))["enforceSkinhackScan"] is False
+
+
+def test_a_settings_file_that_is_already_correct_is_left_alone(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"firstRunComplete": True, "enforceSkinhackScan": False}), encoding="utf-8"
+    )
+    before = path.stat().st_mtime_ns
+    assert ltk.apply_settings(tmp_path) is False
+    assert path.stat().st_mtime_ns == before, "no change means no write"

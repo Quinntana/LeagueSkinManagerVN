@@ -203,31 +203,85 @@ def test_ltk_settings_are_applied_lazily(
     assert wired["settings_applied"] == 1
 
 
-# --- cooldown suppression -------------------------------------------------
+# --- the board's lifetime is the match -------------------------------------
 
 
-def test_closing_the_board_suppresses_it_for_that_match_only(
+def test_there_is_no_suppression_state_left(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
 ) -> None:
+    """Hiding replaced closing, so there is no re-open left to suppress."""
+
     app = make_app(tmp_path, monkeypatch, Settings(cooldown_auto_run=True))
-    app.watcher.match_active = True  # type: ignore[attr-defined]
+    assert not hasattr(app, "_suppressed_for_match")
 
-    app._on_cooldowns_closed()
-    assert app._suppressed_for_match is True
 
-    # A new match clears it.
-    app.watcher.match_active = False  # type: ignore[attr-defined]
+def test_the_game_ending_releases_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    released: list[bool] = []
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "league_skin_manager.cooldown",
+        _FakeCooldown(released),
+    )
+    app = make_app(tmp_path, monkeypatch, Settings(cooldown_auto_run=True))
+    app._cooldown_open = True
+
     app._on_game_change(False)
-    assert app._suppressed_for_match is False
+
+    assert released == [True], "the match is over, so the timers go with it"
+    assert app._cooldown_open is False
 
 
-def test_closing_the_board_outside_a_match_does_not_suppress(
+def test_hiding_the_board_re_offers_the_tray_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    """Hiding releases the one-board-per-game lock."""
+
+    app = make_app(tmp_path, monkeypatch, Settings())
+
+    app._on_cooldown_hidden(True)
+    assert {"cooldown_visible": False} in app.tray.refreshes
+
+    app._on_cooldown_hidden(False)
+    assert {"cooldown_visible": True} in app.tray.refreshes
+
+
+def test_the_open_action_is_refused_outside_a_match(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
 ) -> None:
     app = make_app(tmp_path, monkeypatch, Settings())
     app.watcher.match_active = False  # type: ignore[attr-defined]
-    app._on_cooldowns_closed()
-    assert app._suppressed_for_match is False
+
+    app._open_cooldowns()
+
+    assert any("during a match" in message for _title, message in app.tray.notifications)
+
+
+class _FakeCooldown:
+    """Stands in for the cooldown package so no Tk is involved."""
+
+    def __init__(self, released: list[bool]) -> None:
+        self._released = released
+
+    def release_panel(self, *_a: Any, **_k: Any) -> bool:
+        self._released.append(True)
+        return True
+
+    def close_panel(self, *_a: Any, **_k: Any) -> bool:
+        return True
+
+    def open_panel(self, *_a: Any, **_k: Any) -> bool:
+        return True
+
+    def apply_display(self, *_a: Any, **_k: Any) -> bool:
+        return True
+
+    def is_open(self) -> bool:
+        return False
+
+    def is_visible(self) -> bool:
+        return False
 
 
 def test_a_failed_startup_is_reported_not_raised(
@@ -246,3 +300,133 @@ def test_a_failed_startup_is_reported_not_raised(
     app._startup()  # must not raise
 
     assert any("Startup failed" in title for title, _ in app.tray.notifications)
+
+
+# --- the LTK settings ordering --------------------------------------------
+
+
+def test_a_successful_application_starts_no_waiter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    started: list[str] = []
+    monkeypatch.setattr(app_module.ltk, "locate", lambda *a: Path("C:/LTK/ltk-manager.exe"))
+    monkeypatch.setattr(app_module, "synchronize", fake_sync(SyncOutcome.UP_TO_DATE, "abc"))
+    app = make_app(tmp_path, monkeypatch, Settings(ltk_installed_by_app=True, commit="abc"))
+    monkeypatch.setattr(app, "_start_worker_thread", lambda _t, name: started.append(name))
+
+    app._startup()
+
+    assert wired["settings_applied"] == 1
+    assert started == [], "nothing to wait for once the settings are in place"
+
+
+def test_a_first_run_waits_for_ltk_to_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    """The defect: on a first run LTK has written no settings file yet.
+
+    apply_settings can only fail, and the advertised launch immediately after
+    creates the file with LTK's own defaults. Without a waiter the managed
+    settings first take effect on the *second* launch of this application.
+    """
+
+    started: list[str] = []
+    monkeypatch.setattr(app_module.ltk, "locate", lambda *a: Path("C:/LTK/ltk-manager.exe"))
+    monkeypatch.setattr(app_module.ltk, "apply_settings", lambda _d=None: False)
+    monkeypatch.setattr(app_module, "synchronize", fake_sync(SyncOutcome.UPDATED, "abc", 3))
+    app = make_app(tmp_path, monkeypatch, Settings(ltk_installed_by_app=True))
+    monkeypatch.setattr(app, "_start_worker_thread", lambda _t, name: started.append(name))
+
+    app._startup()
+
+    assert started == ["ltk-settings"]
+
+
+def test_settings_are_never_applied_while_ltk_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(app_module.ltk, "locate", lambda *a: Path("C:/LTK/ltk-manager.exe"))
+    monkeypatch.setattr(app_module.ltk, "is_running", lambda _lookup: True)
+    app = make_app(tmp_path, monkeypatch, Settings(ltk_installed_by_app=True, commit="abc"))
+
+    assert app._apply_ltk_settings() is False
+    assert wired["settings_applied"] == 0
+
+
+def test_the_waiter_stops_once_the_settings_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(app_module.ltk, "locate", lambda *a: Path("C:/LTK/ltk-manager.exe"))
+    app = make_app(tmp_path, monkeypatch, Settings(ltk_installed_by_app=True, commit="abc"))
+
+    app._await_ltk_settings(poll_seconds=0.01)
+
+    assert wired["settings_applied"] == 1
+
+
+def test_the_waiter_stops_when_the_values_are_already_correct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    """apply_settings returning False can mean 'nothing to change'."""
+
+    monkeypatch.setattr(app_module.ltk, "locate", lambda *a: Path("C:/LTK/ltk-manager.exe"))
+    monkeypatch.setattr(app_module.ltk, "apply_settings", lambda _d=None: False)
+    app = make_app(tmp_path, monkeypatch, Settings(ltk_installed_by_app=True, commit="abc"))
+    app.paths.ltk_data_dir.mkdir(parents=True, exist_ok=True)
+    (app.paths.ltk_data_dir / "settings.json").write_text("{}", encoding="utf-8")
+
+    app._await_ltk_settings(poll_seconds=0.01)  # must return, not spin
+
+
+def test_the_waiter_gives_up_when_the_application_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(app_module.ltk, "locate", lambda *a: Path("C:/LTK/ltk-manager.exe"))
+    monkeypatch.setattr(app_module.ltk, "apply_settings", lambda _d=None: False)
+    app = make_app(tmp_path, monkeypatch, Settings(ltk_installed_by_app=True, commit="abc"))
+    app._stop.set()
+
+    app._await_ltk_settings(poll_seconds=0.01)  # must return immediately
+
+
+# --- what the board itself changes ----------------------------------------
+
+
+def test_the_board_persists_its_own_display_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    app = make_app(tmp_path, monkeypatch, Settings())
+
+    app._on_cooldown_display(0.30, 0.70)
+
+    assert app.settings.cooldown_opacity == 0.30
+    assert app.settings.cooldown_scale == 0.70
+    assert {"opacity": 0.30, "scale": 0.70} in app.tray.refreshes
+
+
+def test_an_off_preset_from_the_board_snaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    app = make_app(tmp_path, monkeypatch, Settings())
+    app._on_cooldown_display(0.31, 0.71)
+    assert app.settings.cooldown_opacity == 0.30
+    assert app.settings.cooldown_scale == 0.70
+
+
+def test_the_board_persists_where_it_was_dragged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    app = make_app(tmp_path, monkeypatch, Settings())
+
+    app._on_cooldown_moved(1710, 433)
+
+    assert (app.settings.cooldown_left, app.settings.cooldown_top) == (1710, 433)
+
+
+def test_moving_the_board_leaves_other_settings_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    app = make_app(tmp_path, monkeypatch, Settings(commit="abc", cooldown_auto_run=True))
+    app._on_cooldown_moved(10, 20)
+    assert app.settings.commit == "abc"
+    assert app.settings.cooldown_auto_run is True

@@ -168,6 +168,25 @@ def test_cooldowns_are_enabled_during_a_match() -> None:
     assert find(tray, "Cooldown timers").enabled is True
 
 
+def test_cooldowns_are_disabled_while_the_board_is_on_screen() -> None:
+    """One board per game: a second could only disagree with the first."""
+
+    tray, _ = make_tray(match_active=True, cooldown_visible=True)
+    assert find(tray, "Cooldown timers").enabled is False
+
+
+def test_hiding_the_board_offers_the_action_again() -> None:
+    tray, _ = make_tray(match_active=True, cooldown_visible=False)
+    assert find(tray, "Cooldown timers").enabled is True
+
+
+def test_a_visible_board_outside_a_match_is_still_disabled() -> None:
+    """Both rules apply; neither is a substitute for the other."""
+
+    tray, _ = make_tray(match_active=False, cooldown_visible=True)
+    assert find(tray, "Cooldown timers").enabled is False
+
+
 def test_the_cooldown_half_stays_usable_when_skins_are_blocked() -> None:
     """Isolation shows up in the UI: an LTK problem must not disable the board."""
 

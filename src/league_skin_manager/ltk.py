@@ -540,23 +540,30 @@ def apply_settings(data_dir: Path | None = None) -> bool:
     root = data_dir or default_data_dir()
     path = root / "settings.json"
     raw = read_json(path, default=None)
+    if raw is None:
+        # LTK writes settings.json on its first run. Before that there is
+        # nothing to edit, and authoring the file is not an option -- see the
+        # firstRunComplete note above.
+        LOGGER.info("Deferred LTK settings: %s has not been written yet", path.name)
+        return False
     if not isinstance(raw, dict) or "firstRunComplete" not in raw:
+        LOGGER.info("Skipped LTK settings: %s is not a complete settings file", path.name)
         return False
 
     updated = dict(raw)
-    changed = False
-    for key, value in MANAGED_SETTINGS.items():
-        if updated.get(key) != value:
-            updated[key] = value
-            changed = True
+    changed = sorted(key for key, value in MANAGED_SETTINGS.items() if updated.get(key) != value)
     if not changed:
         return False
+    updated.update(MANAGED_SETTINGS)
     try:
+        # Must be BOM-free: LTK's parser rejects a file that starts with one,
+        # logs "expected value at line 1 column 1", and silently replaces the
+        # whole file with its defaults. atomic_write_json encodes plain UTF-8.
         atomic_write_json(path, updated)
     except OSError:
         LOGGER.warning("Could not update LTK settings", exc_info=True)
         return False
-    LOGGER.info("Applied LTK settings: %s", ", ".join(sorted(MANAGED_SETTINGS)))
+    LOGGER.info("Applied LTK settings: %s", ", ".join(changed))
     return True
 
 

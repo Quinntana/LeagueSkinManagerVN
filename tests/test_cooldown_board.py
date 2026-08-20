@@ -6,12 +6,21 @@ timer store — the piece that removes typing durations by hand.
 
 from __future__ import annotations
 
+import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from league_skin_manager.cooldown.board import MAX_ROWS, CooldownBoard
+from league_skin_manager.cooldown.board import (
+    MAX_ROWS,
+    CooldownBoard,
+    RosterPoller,
+    order_by_lane,
+)
 from league_skin_manager.cooldown.roster import (
+    Role,
     RosterMember,
     RosterResult,
     RosterStatus,
@@ -290,3 +299,202 @@ def test_summoner_spells_use_their_own_duration() -> None:
     snapshot = board.press(0, CooldownSlot.SPELL_ONE)
     assert snapshot is not None
     assert snapshot.remaining == pytest.approx(300.0), "Flash, from Data Dragon"
+
+
+# --- lane ordering ---------------------------------------------------------
+
+
+def positioned(name: str, role: Role) -> RosterMember:
+    return RosterMember(
+        champion_name=name,
+        role=role,
+        participant_id=f"participant-{name}",
+        champion_id=name,
+        level=11,
+        summoner_spells=(SummonerSpellRef("SummonerFlash", "Flash"),),
+    )
+
+
+def test_rows_are_ordered_by_lane() -> None:
+    scrambled = [
+        positioned("Lux", Role.MIDDLE),
+        positioned("Ornn", Role.TOP),
+        positioned("Leona", Role.UTILITY),
+        positioned("Jinx", Role.BOTTOM),
+        positioned("LeeSin", Role.JUNGLE),
+    ]
+    ordered = order_by_lane(scrambled)
+    assert [m.champion_name for m in ordered] == ["Ornn", "LeeSin", "Lux", "Jinx", "Leona"]
+
+
+def test_a_mode_without_lanes_keeps_the_live_client_order() -> None:
+    """ARAM reports no position at all; a stable sort leaves it untouched."""
+
+    given = [member(name) for name in ("Zed", "Lux", "Ornn", "Jinx", "Leona")]
+    ordered = order_by_lane(given)
+    assert [m.champion_name for m in ordered] == ["Zed", "Lux", "Ornn", "Jinx", "Leona"]
+
+
+def test_unpositioned_enemies_sort_after_positioned_ones() -> None:
+    given = [member("Zed"), positioned("Ornn", Role.TOP), member("Lux")]
+    ordered = order_by_lane(given)
+    assert [m.champion_name for m in ordered] == ["Ornn", "Zed", "Lux"]
+
+
+def test_ordering_is_stable_across_repeated_calls() -> None:
+    given = [member(name) for name in ("A", "B", "C")]
+    assert order_by_lane(order_by_lane(given)) == order_by_lane(given)
+
+
+def test_the_board_presents_rows_in_lane_order() -> None:
+    board, _clock, _calls = make_board(
+        [positioned("Jinx", Role.BOTTOM), positioned("Ornn", Role.TOP)]
+    )
+    board.refresh()
+    assert [row.champion for row in board.rows()][:2] == ["Ornn", "Jinx"]
+
+
+# --- the countdown caption -------------------------------------------------
+
+
+def test_the_first_displayed_second_is_not_inflated() -> None:
+    """int(remaining)+1 showed N+1 at the instant of the press."""
+
+    board, clock, _calls = make_board()
+    board.refresh()
+    board.press(0, CooldownSlot.SPELL_ONE)
+    assert board.rows()[0].slots[1].caption == "300"
+
+
+def test_the_caption_is_a_ceiling_while_counting() -> None:
+    board, clock, _calls = make_board()
+    board.refresh()
+    board.press(0, CooldownSlot.SPELL_ONE)
+    clock.advance(0.25)
+    assert board.rows()[0].slots[1].caption == "300"
+    clock.advance(0.75)
+    assert board.rows()[0].slots[1].caption == "299"
+
+
+def test_the_last_second_still_reads_one() -> None:
+    board, clock, _calls = make_board()
+    board.refresh()
+    board.press(0, CooldownSlot.SPELL_ONE)
+    clock.advance(299.5)
+    assert board.rows()[0].slots[1].caption == "1"
+    clock.advance(0.5)
+    assert board.rows()[0].slots[1].caption == "up"
+
+
+# --- icon paths reach the view --------------------------------------------
+
+
+def test_icon_paths_are_carried_through_to_the_views() -> None:
+    portrait = Path("C:/cache/icons/16.16.1/champion/Zed.png")
+    spell = Path("C:/cache/icons/16.16.1/spell/ZedR.png")
+
+    def resolve(people: Any) -> tuple[EnemyCooldownLoadout, ...]:
+        return tuple(
+            EnemyCooldownLoadout(
+                participant_id=m.participant_id,
+                champion_name=m.champion_name,
+                champion_icon_path=portrait,
+                ultimate=CooldownDefinition(
+                    identifier="R",
+                    display_name="R",
+                    icon_path=spell,
+                    cooldowns=(120.0, 100.0, 80.0),
+                    max_rank=3,
+                    unsupported_reason=None,
+                ),
+                summoner_spells=(definition("Flash", (300.0,)), unsupported("Smite")),
+            )
+            for m in people
+        )
+
+    board, _clock, _calls = make_board(resolver=resolve)
+    board.refresh()
+    row = board.rows()[0]
+    assert row.champion_icon_path == portrait
+    assert row.slots[0].icon_path == spell
+
+
+def test_a_placeholder_row_carries_no_icon() -> None:
+    board, _clock, _calls = make_board([member("Zed")])
+    board.refresh()
+    assert board.rows()[MAX_ROWS - 1].champion_icon_path is None
+
+
+# --- the roster poller -----------------------------------------------------
+
+
+def test_the_poller_drives_refresh_off_the_calling_thread() -> None:
+    board, _clock, calls = make_board()
+    poller = RosterPoller(board, poll_seconds=0.01)
+    assert poller.start() is True
+    deadline = time.time() + 3.0
+    while time.time() < deadline and calls["roster"] == 0:
+        time.sleep(0.01)
+    assert poller.stop(timeout=3.0) is True
+    assert calls["roster"] >= 1
+
+
+def test_a_slow_roster_never_blocks_reading_rows() -> None:
+    """The stall that made the countdown jump: a poll on the paint thread."""
+
+    started = threading.Event()
+
+    def slow_roster() -> RosterResult:
+        started.set()
+        time.sleep(0.6)
+        return RosterResult(RosterStatus.ACTIVE, (member("Zed"),))
+
+    board = CooldownBoard(
+        CooldownTimerStore(FakeClock(), None),
+        roster=slow_roster,
+        resolve=lambda people: tuple(loadout(m.champion_name) for m in people),
+    )
+    poller = RosterPoller(board, poll_seconds=0.01)
+    poller.start()
+    try:
+        assert started.wait(2.0)
+        began = time.monotonic()
+        board.rows()
+        assert time.monotonic() - began < 0.2
+    finally:
+        poller.stop(timeout=3.0)
+
+
+def test_a_raising_roster_does_not_kill_the_poller() -> None:
+    def explode() -> RosterResult:
+        raise OSError("the live client went away")
+
+    board = CooldownBoard(
+        CooldownTimerStore(FakeClock(), None), roster=explode, resolve=lambda people: ()
+    )
+    poller = RosterPoller(board, poll_seconds=0.01)
+    assert poller.poll_once() is False
+    assert poller.start() is True
+    assert poller.stop(timeout=3.0) is True
+
+
+def test_starting_the_poller_twice_is_refused() -> None:
+    board, _clock, _calls = make_board()
+    poller = RosterPoller(board, poll_seconds=0.01)
+    poller.start()
+    try:
+        assert poller.start() is False
+    finally:
+        poller.stop(timeout=3.0)
+
+
+def test_stopping_a_poller_that_never_started_is_harmless() -> None:
+    board, _clock, _calls = make_board()
+    assert RosterPoller(board).stop() is True
+
+
+@pytest.mark.parametrize("poll", [0, -1])
+def test_an_invalid_poll_interval_is_rejected(poll: float) -> None:
+    board, _clock, _calls = make_board()
+    with pytest.raises(ValueError, match="poll_seconds must be positive"):
+        RosterPoller(board, poll_seconds=poll)

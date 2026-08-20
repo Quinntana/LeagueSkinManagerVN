@@ -124,7 +124,7 @@ def test_every_scale_preset_survives_a_round_trip(tmp_path: Path, value: float) 
 
 @pytest.mark.parametrize(
     "written,expected",
-    [(0.99, 1.0), (0.8, 0.85), (0.6, 0.55), (0.0, 0.55), (5.0, 1.0)],
+    [(0.99, 1.0), (0.8, 0.85), (0.6, 0.55), (0.0, 0.30), (5.0, 1.0), (0.36, 0.35)],
 )
 def test_an_off_preset_opacity_snaps_to_the_nearest(
     tmp_path: Path, written: float, expected: float

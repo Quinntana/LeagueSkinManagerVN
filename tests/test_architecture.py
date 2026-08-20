@@ -171,15 +171,27 @@ def test_the_composition_root_is_the_only_place_wiring_everything() -> None:
 
 
 def test_the_cooldown_package_exposes_only_its_public_functions() -> None:
-    """The isolation boundary: the shell must not reach past these four."""
+    """The isolation boundary: the shell must not reach past these six.
+
+    Hiding and releasing are separate functions rather than a flag on one,
+    because they differ in consequence: one keeps the match's timers, the other
+    destroys them along with the interpreter.
+    """
 
     from league_skin_manager import cooldown
 
-    assert set(cooldown.__all__) == {"open_panel", "close_panel", "is_open", "apply_display"}
+    assert set(cooldown.__all__) == {
+        "open_panel",
+        "close_panel",
+        "release_panel",
+        "is_open",
+        "is_visible",
+        "apply_display",
+    }
 
 
 def test_nothing_outside_cooldown_imports_its_internals() -> None:
-    internals = {"timer", "panel", "host", "live", "catalog", "roster", "board"}
+    internals = {"timer", "panel", "host", "live", "catalog", "roster", "board", "overlay"}
     for path in module_files():
         if _is_subpackage(path):
             continue

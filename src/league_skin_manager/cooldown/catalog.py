@@ -27,7 +27,7 @@ from typing import Any
 
 import requests
 
-from ..atomic import atomic_write_json, read_json
+from ..atomic import atomic_write_bytes, atomic_write_json, read_json
 from .roster import RosterMember, SummonerSpellRef
 from .timer import CooldownDefinition, EnemyCooldownLoadout
 
@@ -41,6 +41,12 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 CACHE_TTL_SECONDS = 24 * 60 * 60
+
+# Data Dragon portraits are 128px and spell icons 64px, both PNG. Tk decodes
+# both natively, so nothing here needs an imaging library.
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_ICON_BYTES = 1024 * 1024
+ICON_FILENAME = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.png$")
 
 # Ultimates whose rank count is not three but which still map onto levels.
 ALLOWED_FOUR_RANK_ULTIMATES = frozenset({"elise", "karma", "nidalee"})
@@ -174,6 +180,49 @@ class CooldownCatalog:
         except Exception as error:
             raise CatalogUnavailable(f"Could not read {url}") from error
 
+    # -- icons -------------------------------------------------------------
+
+    def _icon(self, version: str, kind: str, payload: Mapping[str, Any] | None) -> Path | None:
+        """Return a cached icon path, downloading it once per patch.
+
+        Failure is always ``None``: an icon is decoration, and the board falls
+        back to a text caption. Nothing here may raise into roster resolution.
+        """
+
+        if payload is None:
+            return None
+        image = payload.get("image")
+        filename = _text(image.get("full")) if isinstance(image, Mapping) else None
+        if filename is None or not ICON_FILENAME.fullmatch(filename):
+            return None
+
+        target = self.cache_dir / "icons" / version / kind / filename
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+
+        try:
+            if self._session is None:
+                self._session = requests.Session()
+            response = self._session.get(
+                f"{CDN_ROOT}/{version}/img/{kind}/{filename}", timeout=self.timeout
+            )
+            response.raise_for_status()
+            content = response.content
+        except Exception:  # noqa: BLE001 - an icon is never worth an exception
+            self.logger.debug("Could not fetch the %s icon %s", kind, filename, exc_info=True)
+            return None
+
+        if not content.startswith(PNG_SIGNATURE) or len(content) > MAX_ICON_BYTES:
+            self.logger.debug("Discarded %s/%s: not a plausible PNG", kind, filename)
+            return None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(target, content)
+        except OSError:
+            self.logger.debug("Could not cache the icon %s", filename, exc_info=True)
+            return None
+        return target
+
     def _cache_path(self, key: str) -> Path:
         safe = _NON_ALNUM.sub("-", key.casefold()).strip("-")
         return self.cache_dir / f"{safe}.json"
@@ -205,10 +254,17 @@ class CooldownCatalog:
     def _loadout(self, catalog: Catalog | None, member: RosterMember) -> EnemyCooldownLoadout:
         ultimate = self._ultimate(catalog, member)
         spells = list(member.summoner_spells) + [None, None]
+        record = (
+            catalog.champions.get(_normalize(member.champion_id or member.champion_name))
+            if catalog
+            else None
+        )
         return EnemyCooldownLoadout(
             participant_id=member.participant_id or member.champion_name.casefold(),
             champion_name=member.champion_name,
-            champion_icon_path=None,
+            champion_icon_path=(
+                self._icon(catalog.version, "champion", record) if catalog else None
+            ),
             ultimate=ultimate,
             summoner_spells=(
                 self._summoner(catalog, spells[0], 1),
@@ -253,7 +309,7 @@ class CooldownCatalog:
         return CooldownDefinition(
             identifier=_text(payload.get("id")) or f"{identifier}R",
             display_name=name,
-            icon_path=None,
+            icon_path=self._icon(catalog.version, "spell", payload) if catalog else None,
             cooldowns=cooldowns or (),
             max_rank=max_rank,
             unsupported_reason=reason,
@@ -288,7 +344,7 @@ class CooldownCatalog:
         return CooldownDefinition(
             identifier=identifier,
             display_name=name,
-            icon_path=None,
+            icon_path=self._icon(catalog.version, "spell", record) if catalog else None,
             cooldowns=cooldowns or (),
             max_rank=max_rank,
             unsupported_reason=reason,

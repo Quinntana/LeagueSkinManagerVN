@@ -31,7 +31,7 @@ The tray icon is the only permanent interface.
   Open app folder
   ---------------------------
   [ ] Cooldown timers with game
-  Cooldown display  >  Opacity: 100% / 85% / 70% / 55%
+  Cooldown display  >  Opacity: 100% / 85% / 70% / 55% / 45% / 35% / 30%
                        Size:    70% / 85% / 100% / 125%
   [ ] Start with Windows
   ---------------------------
@@ -46,7 +46,8 @@ raises the question of which condition wins when two of them hold, and answering
 it grows priority rules that nobody wants to maintain.
 
 `Open LTK Manager` reads `Install LTK Manager` when LTK is absent.
-`Cooldown timers` is greyed outside a match. When LTK exists but this
+`Cooldown timers` is greyed outside a match, and also while the board is
+already on screen — there is one board per game. When LTK exists but this
 application did not install it, skin syncing is disabled and the tooltip says
 so, while the cooldown board stays fully usable.
 
@@ -157,14 +158,39 @@ Any failure deletes the file and raises. Nothing is downgraded to a warning.
 
 ## Cooldown board
 
-A click-to-start timer board for enemy ultimates and summoner spells.
+A click-to-start timer board for enemy ultimates and summoner spells, drawn as
+a borderless overlay over the game.
+
+> **Set League to Borderless or Windowed.** The board cannot draw over
+> exclusive fullscreen. Nothing can, short of hooking DirectX the way Overwolf
+> does for Porofessor, and that is not something this application will do.
 
 Riot's Live Client Data API supplies who the enemies are, their level, and their
-summoner spells. Data Dragon supplies the durations. Neither exposes enemy cast
-events, which is why a click starts the timer — but nothing is typed by hand.
+summoner spells. Data Dragon supplies the durations and the icons. Neither
+exposes enemy cast events, which is why a click starts the timer — but nothing
+is typed by hand.
 
 Left click only: idle → counting → cancel → counting again, as a fresh timer
-rather than a resumed one.
+rather than a resumed one. **Right click does nothing anywhere on the board** —
+it is how you move, so a stray one costs nothing.
+
+An ability that cannot be tracked — an ultimate the enemy has not learned yet,
+or a charge-based spell like Smite — is crossed out rather than dimmed, so its
+icon stays recognisable.
+
+One row per enemy, ordered top, jungle, mid, bot, support. Rows are identified
+by champion portrait rather than by name, and level is read but never drawn;
+the scoreboard already shows it and this surface exists to be small.
+
+A counting slot darkens its own icon and draws the seconds outlined over it, so
+it stays readable however faint the board is. That matters because window
+opacity is uniform in Tk — it cannot fade the background while leaving the
+number solid, so the contrast has to come from inside the slot.
+
+The board has three controls in its top-right corner — opacity, size, and close
+— and a readout of the current two. It hides itself whenever League is not the
+foreground window, and drags from anywhere else; where you leave it is
+remembered.
 
 Ultimates are **not** uniformly three ranks, so the level mapping is not a
 guess. Jayce has one rank; Elise, Karma and Nidalee have four; ten champions
@@ -173,9 +199,17 @@ cooldown; and Smite recharges on charges. All of those render as disabled with
 a reason rather than showing a number that would be wrong. Against patch
 16.16.1 that resolves 162 of 173 ultimates.
 
-The board is off by default, opens with `League of Legends.exe` when enabled,
-and closes when the match ends. Closing it by hand mid-match suppresses
-re-opening for that match only.
+The board is off by default and opens with `League of Legends.exe` when
+enabled. **Its lifetime is the match, not the window.** Closing it with the
+corner control hides it — every timer keeps running, and re-opening it from the
+tray brings the same board back with the countdowns where you left them.
+Everything is released when the game exits.
+
+There is one board per game. While it is on screen the tray's `Cooldown timers`
+entry is greyed out; hiding the board offers it again.
+
+Turning the automatic toggle on *during* a match does not open it — that takes
+effect next match; use `Cooldown timers` to open it now.
 
 It lives in its own package behind four functions, on its own thread with its
 own Tk root. A Data Dragon outage or a panel crash cannot affect skins, and a
