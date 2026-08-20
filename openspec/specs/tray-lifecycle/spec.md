@@ -1,6 +1,16 @@
 # Tray, lifecycle, and ownership
 
-## Requirement: The tray is not a state machine
+## Purpose
+
+Define the application's only permanent interface, what happens on a first
+run, and what it owns. The ownership rule is the one that decides every other
+question: if running this application is why a file exists, it removes it.
+
+## Requirements
+
+### Requirement: The tray is not a state machine
+
+The tray SHALL convey state through a two-colour icon and a tooltip, and SHALL surface failures as notifications rather than as persistent modes. The menu SHALL contain only actions.
 
 The previous design put a computed status line at the top of the menu, which
 raised the question of which condition wins when two hold, and grew priority
@@ -20,7 +30,9 @@ rules to answer it.
 - **WHEN** no match is active **THEN** cooldown timers is disabled
 - **WHEN** syncing is blocked **THEN** the cooldown board stays usable
 
-## Requirement: First launch needs no manual steps
+### Requirement: First launch needs no manual steps
+
+A first run SHALL install LTK if absent, seed the skin set, and open LTK once, without prompting the user at any point.
 
 #### Scenario: A fresh machine
 - **WHEN** the application is run for the first time
@@ -30,7 +42,9 @@ rules to answer it.
 - **AND** LTK SHALL then be opened **once**, so the result is visible
 - **AND** no prompt SHALL be shown at any point
 
-## Requirement: The executable carries no state
+### Requirement: The executable carries no state
+
+All application data SHALL live under %APPDATA% and SHALL NOT depend on the executable's location. A moved executable SHALL have its shortcut and any existing startup entry re-pointed.
 
 #### Scenario: Where data lives
 - **THEN** all data SHALL live under `%APPDATA%\LeagueSkinManagerVN\`
@@ -42,7 +56,9 @@ rules to answer it.
 - **BUT** an absent startup entry SHALL stay absent, because that means the
   user never asked for it
 
-## Requirement: Everything caused is removed
+### Requirement: Everything caused is removed
+
+Uninstall SHALL remove every file whose existence is due to running this application, including LTK and its data when this application installed it, and SHALL shut down logging first.
 
 If running this application is why a file exists, this application removes it.
 
@@ -61,7 +77,9 @@ If running this application is why a file exists, this application removes it.
 - **WHEN** a sync is running
 - **THEN** uninstall SHALL refuse and say so
 
-## Requirement: Porofessor is not managed
+### Requirement: Porofessor is not managed
+
+The application SHALL open Porofessor's download page and SHALL NOT detect, install, launch, or remove it.
 
 #### Scenario: The tray entry
 - **THEN** it SHALL open `porofessor.gg/download` and do nothing else
@@ -69,7 +87,9 @@ If running this application is why a file exists, this application removes it.
   installer to verify, and silently installing a game-overlay platform is the
   class of behaviour that trips anti-cheat heuristics
 
-## Requirement: Platform access is confined
+### Requirement: Platform access is confined
+
+Registry access SHALL be limited to one HKCU value, PowerShell SHALL be resolved from the system directory, paths SHALL be passed through the environment rather than interpolated into scripts, and the single-instance mutex SHALL use the Local namespace.
 
 #### Scenario: Registry
 - **THEN** only `HKCU\…\CurrentVersion\Run` SHALL be touched, one value named
@@ -87,7 +107,9 @@ If running this application is why a file exists, this application removes it.
 - **THEN** the mutex SHALL use the `Local\` namespace, not `Global\`, so a
   second logged-in user can run their own copy
 
-## Requirement: Known operational constraint
+### Requirement: Known operational constraint
+
+The built executable SHALL be run from local storage; on a synced drive every TLS handshake fails.
 
 #### Scenario: Running from a synced drive
 - **WHEN** the built executable is run from a Google Drive or OneDrive path

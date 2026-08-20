@@ -1,9 +1,10 @@
 # LeagueSkinManagerVN
 
-**Read `openspec/project.md` and `openspec/AGENTS.md` first.** They hold the
-architecture, conventions, and the working rules. The four capability specs in
-`openspec/specs/` hold the behaviour. Everything below is a summary pointing at
-them.
+**OpenSpec drives this project.** `openspec/config.yaml` holds the context that
+is injected into every OpenSpec request; the four capability specs in
+`openspec/specs/` hold the behaviour. Use the `/opsx:` commands — `propose`,
+`apply`, `archive`, `explore`, `update`, `sync` — for any non-trivial change.
+Everything below is a summary pointing at those.
 
 ## What this is
 

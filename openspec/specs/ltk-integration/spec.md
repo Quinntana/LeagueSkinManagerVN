@@ -1,5 +1,11 @@
 # LTK integration
 
+## Purpose
+
+Bound what this application does to someone else's application. LTK Manager
+updates itself, so the contract is kept as small as it can be and every claim
+in it was established by experiment rather than inferred.
+
 The riskiest part of the system, because LTK is someone else's application
 that updates itself. Everything below was established by experiment against
 LTK Manager v1.13.0 and re-checked on v1.13.3 — not inferred from its source.
@@ -8,7 +14,11 @@ Four decisions reached by reasoning alone were **disproved** by those
 experiments. Do not "simplify" any requirement here without re-running the
 corresponding test against a copy of the LTK data root.
 
-## Requirement: The write surface stays minimal
+## Requirements
+
+### Requirement: The write surface stays minimal
+
+The application SHALL confine itself to the operations tabulated below, and SHALL skip every settings edit while LTK is running.
 
 The application SHALL confine itself to the operations below, and SHALL skip
 every settings and library edit while LTK is running.
@@ -38,7 +48,9 @@ every settings and library edit while LTK is running.
   struct; a file lacking it fails to parse and LTK silently restores its own
   defaults, discarding the write
 
-## Requirement: Reconciliation is unconditional
+### Requirement: Reconciliation is unconditional
+
+The application SHALL rely on LTK's startup reconciliation rather than its file watcher, and SHALL NOT write the watcherEnabled setting.
 
 LTK reconciles its library from disk on **every** startup regardless of
 `watcherEnabled`. The watcher governs only live pickup while LTK is running.
@@ -54,7 +66,9 @@ LTK reconciles its library from disk on **every** startup regardless of
   makes packages adopt and self-enable mid-session while the user is looking
   at the library
 
-## Requirement: The enabled selection is LTK's to own
+### Requirement: The enabled selection is LTK's to own
+
+The application SHALL NOT write library.json. The enabled selection SHALL be left for the user to manage in LTK's own interface.
 
 LTK switches a package **on** the moment it adopts it, with or without the
 watcher. Since the library holds every skin in the source — 171 of 173
@@ -75,7 +89,9 @@ dozen skins enabled per champion, with the winner decided by LTK's ordering.
 - **AND** those choices SHALL survive until the next sync, which wipes and
   reseeds the library
 
-## Requirement: Syncing does not require LTK to be closed
+### Requirement: Syncing does not require LTK to be closed
+
+Synchronisation SHALL proceed regardless of whether LTK is running, and SHALL notify the user to restart LTK when it was open.
 
 #### Scenario: Mutating storage while LTK runs
 - **WHEN** `archives/` and `mods/` are emptied and reseeded while LTK is open
@@ -85,7 +101,9 @@ dozen skins enabled per champion, with the winner decided by LTK's ordering.
 - **SO** the application SHALL notify: *"Skins updated — restart LTK Manager
   to load them."*
 
-## Requirement: The first install is verified, and only the first
+### Requirement: The first install is verified, and only the first
+
+An installer SHALL NOT be executed until its host, size, SHA-256, and Authenticode signature have all been verified. The application SHALL NOT compare LTK versions or re-install.
 
 LTK ships Tauri's own updater with a hardcoded endpoint and minisign key. The
 application SHALL NOT compare versions, cache release metadata, or re-install.
@@ -105,7 +123,9 @@ application SHALL NOT compare versions, cache release metadata, or re-install.
 - **WHEN** the response's final URL is not an allowed GitHub host
 - **THEN** the download SHALL be rejected mid-transfer
 
-## Requirement: Only an LTK we installed is ever touched
+### Requirement: Only an LTK we installed is ever touched
+
+The application SHALL refuse to modify an LTK installation it did not create, and SHALL record ownership at install time.
 
 #### Scenario: LTK was already present
 - **WHEN** LTK is installed and `ltk_installed_by_app` is false

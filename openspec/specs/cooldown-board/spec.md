@@ -1,8 +1,18 @@
 # Enemy cooldown board
 
+## Purpose
+
+Show enemy ultimate and summoner-spell timers during a match, sourcing every
+duration from the game and Data Dragon rather than from the user. Isolated so
+that its failure cannot reach the skin pipeline, and vice versa.
+
 An optional overlay, off by default, isolated behind four functions.
 
-## Requirement: Durations come from the game, not from the user
+## Requirements
+
+### Requirement: Durations come from the game, not from the user
+
+The board SHALL source enemy identities from Riot's Live Client Data API and base cooldowns from Data Dragon. A duration SHALL NOT be entered by the user.
 
 #### Scenario: A match is in progress
 - **WHEN** the board polls
@@ -19,7 +29,9 @@ An optional overlay, off by default, isolated behind four functions.
 - **THEN** participants SHALL be keyed by a one-way hash
 - **SO** no Riot ID reaches memory or a log
 
-## Requirement: Ranks are not assumed
+### Requirement: Ranks are not assumed
+
+A duration SHALL be derived only from a rank layout that can be inferred from champion level. Any other layout, and any charge, resource, toggle, or repeat-cast ability, SHALL render disabled with a reason.
 
 Ultimates are **not** uniformly three ranks. A naive 6/11/16 mapping is wrong
 for a real set of champions.
@@ -39,7 +51,9 @@ for a real set of champions.
 - **BECAUSE** a flat base cooldown would be actively misleading
 - **NOTE** at patch 16.16.1 this resolves 162 of 173 ultimates
 
-## Requirement: Left click only
+### Requirement: Left click only
+
+A slot SHALL respond to left click alone, cycling idle to counting to cancelled and starting afresh rather than resuming. Right click SHALL have no behaviour.
 
 #### Scenario: The cycle
 - **WHEN** an idle slot is clicked **THEN** its timer starts
@@ -47,7 +61,9 @@ for a real set of champions.
 - **WHEN** it is clicked again **THEN** a **fresh** timer starts, not a resume
 - **AND** there SHALL be no right-click behaviour
 
-## Requirement: The board follows the match
+### Requirement: The board follows the match
+
+The board SHALL open with the game process when enabled, SHALL close when the match ends however it was opened, and SHALL default to disabled.
 
 #### Scenario: Opening and closing
 - **WHEN** `League of Legends.exe` starts and the toggle is on
@@ -63,7 +79,9 @@ for a real set of champions.
 - **BECAUSE** carrying a previous game's countdowns forward is worse than
   showing nothing
 
-## Requirement: Failure here cannot reach the skin pipeline
+### Requirement: Failure here cannot reach the skin pipeline
+
+A failure in this package SHALL NOT affect skin synchronisation, and a synchronisation failure SHALL NOT affect the board. The package SHALL expose exactly four functions.
 
 #### Scenario: A data source fails
 - **WHEN** the live client or Data Dragon is unavailable or raises
@@ -75,7 +93,9 @@ for a real set of champions.
   `is_open`, and `apply_display`
 - **AND** it SHALL run on its own thread with its own Tk root
 
-## Requirement: Display settings live in the tray
+### Requirement: Display settings live in the tray
+
+Opacity and scale SHALL be chosen from the tray, applied to a live panel, and persisted. The board itself SHALL NOT carry permanent controls.
 
 #### Scenario: Adjusting the board
 - **THEN** opacity and scale SHALL be chosen from the tray, applied live, and

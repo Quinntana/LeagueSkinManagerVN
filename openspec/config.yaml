@@ -1,0 +1,77 @@
+schema: spec-driven
+
+context: |
+  LeagueSkinManagerVN — one portable Windows tray executable. It mirrors a set
+  of League of Legends skin packages into LTK Manager, opens an enemy-cooldown
+  board during a match, and owns every file it creates.
+
+  It is NOT a skin manager. It is a tray-resident supervisor of external tools,
+  one of which happens to need a skin pipeline. Every rewrite before this one
+  happened because the code was organised around whichever backend was current,
+  so when the backend changed everything changed. Which external tool is in use
+  must stay a plug-in point, never a structural assumption.
+
+  Stack: Python 3.10–3.14, Windows only. requests, psutil, pystray, Pillow,
+  tkinter. Built with PyInstaller into one --onefile --noconsole executable.
+  Gates: ruff format, ruff check, mypy --strict, pytest with an 80% floor.
+
+  Architecture: Ports and Adapters (Cockburn, 2005) over a layered import rule,
+  in a modular monolith. Enforced by tests/test_architecture.py, which parses
+  the import graph and fails on any upward import, any module without a layer
+  assignment, and any direct use of requests/psutil/ctypes/winreg outside an
+  adapter.
+
+    L0  config atomic hashing logging_setup windows
+    L1  settings fantome
+    L2  github cache seed ltk porofessor process_watch uninstall
+    L3  sync
+    L4  tray cooldown/
+    L5  app __main__
+
+  app.py is the composition root and the only module that knows concrete types.
+  cooldown/ is the one enforced internal boundary, exposing exactly open_panel,
+  close_panel, is_open, apply_display.
+
+  THE RULE THAT MATTERS MOST: anything asserted about LTK Manager's on-disk
+  behaviour must be measured, not inferred. During this rebuild four decisions
+  reached by careful reasoning were disproved by experiment, and two further
+  facts surfaced that no amount of reading would have produced. The procedure:
+  copy %APPDATA%\dev.leaguetoolkit.manager, mutate, launch LTK, read its log
+  under logs/, restore the copy.
+
+  Traps that cost real time:
+  - Do not run the built .exe from a Google Drive / OneDrive path. Every TLS
+    handshake times out after ~34s. The same binary works instantly from local
+    storage. .venv-build lives on the synced drive and has the same problem, so
+    use the system Python for live network checks.
+  - LTK requires firstRunComplete in settings.json; a partial file is rejected
+    and silently replaced with its defaults, so never author that file.
+  - Four upstream skin packages are malformed (missing Description) and are
+    skipped; the reported count must match what LTK actually accepts.
+
+  Deliberately absent — do not helpfully re-add: CSLOL as a backend, an
+  installed-vs-portable split, separate setup and uninstaller executables, a
+  tray status-row state machine, journalled transactions, digest indexes, an
+  install manifest, LTK version management, and automatic clearing of LTK's
+  enabled mods (it cannot tell LTK's auto-enable from the user's own choices,
+  so it deletes their selections every launch).
+
+rules:
+  proposal:
+    - State what is measured and what is inferred; never blur the two
+    - Include a "Rejected alternatives" section when a simpler option exists
+  tasks:
+    - Keep the suite green at every step, not only at the end
+    - A task that changes LTK behaviour must name the experiment that verifies it
+
+operations:
+  apply:
+    guidance:
+      - Run all four gates before reporting a task complete
+      - Validate against live data where a free fixture exists — cache
+        filenames are upstream Git blob SHAs, package validation must accept
+        exactly what LTK accepts, and the Data Dragon rank rules should be run
+        over all 173 champions
+  archive:
+    guidance:
+      - Fold measured findings into the capability spec, not only the changelog

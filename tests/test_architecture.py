@@ -230,12 +230,30 @@ def test_every_capability_has_a_spec() -> None:
     them. A capability without one is undocumented behaviour."""
 
     root = PACKAGE.parents[1] / "openspec"
-    assert (root / "project.md").is_file()
-    assert (root / "AGENTS.md").is_file()
+    assert (root / "config.yaml").is_file(), "OpenSpec context is injected from config.yaml"
     for capability in ("skin-sync", "ltk-integration", "cooldown-board", "tray-lifecycle"):
         spec = root / "specs" / capability / "spec.md"
         assert spec.is_file(), f"missing spec for {capability}"
-        assert "## Requirement:" in spec.read_text(encoding="utf-8")
+        text = spec.read_text(encoding="utf-8")
+        # The structure `openspec validate` requires.
+        assert "## Purpose" in text
+        assert "## Requirements" in text
+        assert "### Requirement:" in text
+        assert "#### Scenario:" in text
+
+
+def test_every_requirement_is_normative() -> None:
+    """`openspec validate` requires SHALL or MUST in each requirement body."""
+
+    root = PACKAGE.parents[1] / "openspec" / "specs"
+    for spec in sorted(root.glob("*/spec.md")):
+        blocks = spec.read_text(encoding="utf-8").split("### Requirement: ")[1:]
+        for block in blocks:
+            title = block.splitlines()[0]
+            body = block.split("#### Scenario:")[0]
+            assert "SHALL" in body or "MUST" in body, (
+                f"{spec.parent.name}: requirement {title!r} has no normative statement"
+            )
 
 
 def test_the_ltk_spec_records_what_was_measured() -> None:
