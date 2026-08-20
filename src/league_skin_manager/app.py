@@ -128,12 +128,10 @@ class App:
                 self._block(BLOCKED_MESSAGE)
                 return
 
-            # Both are lazy and skipped while LTK runs. apply_settings only
-            # edits a file LTK has already written; clearing enabled mods
-            # restores the baseline LTK undoes every time it adopts a package.
+            # Lazy and skipped while LTK runs; only ever edits a settings
+            # file LTK has already written.
             if not ltk.is_running(windows.ProcessLookup):
                 ltk.apply_settings(self.paths.ltk_data_dir)
-                ltk.clear_enabled_mods(self.paths.ltk_data_dir)
 
             first_sync = self.settings.commit is None
             self._sync()
@@ -191,8 +189,6 @@ class App:
         )
         if result.changed:
             self._save(updated)
-            # LTK enables whatever it adopts, so the baseline is restored on
-            # the next launch that finds LTK closed.
             if ltk.is_running(windows.ProcessLookup):
                 self.tray.notify(
                     APP_DISPLAY_NAME,

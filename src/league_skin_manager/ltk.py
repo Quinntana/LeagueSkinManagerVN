@@ -560,57 +560,6 @@ def apply_settings(data_dir: Path | None = None) -> bool:
     return True
 
 
-def clear_enabled_mods(data_dir: Path | None = None) -> int:
-    """Return the library to its baseline: present, but nothing switched on.
-
-    LTK enables a package the moment it adopts it, with or without the file
-    watcher. Since the library holds every skin in the source -- 171 of 173
-    champions have more than one, and Miss Fortune alone has 23 -- leaving
-    them all on means every champion has a dozen skins competing and the one
-    that wins changes silently whenever the source updates.
-
-    So the baseline is nothing enabled, and the user turns on what they want.
-    This is the only field outside settings.json that is ever written, and it
-    is skipped entirely while LTK is running.
-    """
-
-    root = data_dir or default_data_dir()
-    path = root / "library.json"
-    raw = read_json(path, default=None)
-    if not isinstance(raw, dict):
-        return 0
-    profiles = raw.get("profiles")
-    if not isinstance(profiles, list):
-        return 0
-
-    cleared = 0
-    updated_profiles: list[Any] = []
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            updated_profiles.append(profile)
-            continue
-        enabled = profile.get("enabledMods")
-        if isinstance(enabled, list) and enabled:
-            cleared += len(enabled)
-            profile = dict(profile)
-            profile["enabledMods"] = []
-            if isinstance(profile.get("layerStates"), dict):
-                profile["layerStates"] = {}
-        updated_profiles.append(profile)
-
-    if not cleared:
-        return 0
-    payload = dict(raw)
-    payload["profiles"] = updated_profiles
-    try:
-        atomic_write_json(path, payload)
-    except OSError:
-        LOGGER.warning("Could not clear LTK's enabled mods", exc_info=True)
-        return 0
-    LOGGER.info("Cleared %d enabled mods; the library baseline is nothing enabled", cleared)
-    return cleared
-
-
 def remove_data(data_dir: Path | None = None) -> bool:
     """Delete LTK's entire data root. Used only by uninstall."""
 
@@ -638,7 +587,6 @@ __all__ = [
     "ReleaseClient",
     "MANAGED_SETTINGS",
     "apply_settings",
-    "clear_enabled_mods",
     "default_data_dir",
     "install",
     "install_roots",

@@ -97,32 +97,39 @@ Established by experiment against LTK Manager v1.13.0, not assumed:
 |---|---|
 | read | `settings.json` → `modStoragePath` |
 | write | `settings.json` → `enforceSkinhackScan` only, and only in a file LTK already wrote |
-| write | `library.json` → clears each profile's `enabledMods`, nothing else |
 | write | `archives/*.fantome`, under any filename |
 | delete | contents of `archives/` and `mods/` |
-| never | `watcherEnabled` or any other setting, `wad-reports.json`, `profiles/`, LTK's own files |
+| never | `library.json`, `watcherEnabled` or any other setting, `wad-reports.json`, `profiles/`, LTK's own files |
 
-Both `settings.json` and `library.json` edits are skipped entirely while LTK
-is running, and neither file is ever authored from scratch: LTK requires
-`firstRunComplete` and discards a settings file lacking it.
+The `settings.json` edit is skipped entirely while LTK is running, and the
+file is never authored from scratch: LTK requires `firstRunComplete` and
+discards a settings file lacking it.
 
 LTK reconciles its library from disk on **every** startup, regardless of any
 setting. A stale `library.json` referencing packages that no longer exist is
 repaired automatically, and packages dropped into `archives/` are adopted and
 renamed.
 
-### Nothing is enabled by default
+### Everything arrives switched on
 
 LTK switches a package **on** the moment it adopts it, with or without the
-file watcher. That is fine for a library of a few mods and wrong for this one:
-171 of 173 champions have more than one skin, and Miss Fortune alone has 23.
-Leaving everything enabled means a dozen skins compete per champion and the
-one that wins changes silently whenever the source updates.
+file watcher, and this application does not interfere with that.
 
-So the baseline is *present, but nothing switched on*. After a sync, the next
-launch that finds LTK closed clears every profile's `enabledMods`, and you
-turn on the skins you actually want. Nothing is ever removed from the library
-— only switched off.
+Be aware of what it means: 171 of 173 champions have more than one skin, and
+Miss Fortune alone has 23, so after a sync every champion has a dozen skins
+enabled at once. Which one you actually see is whatever LTK's ordering picks,
+and it can change when the source updates.
+
+Managing that is LTK's job, not this application's. Turn off what you do not
+want in LTK's own library view; those choices survive until the next sync,
+which wipes and reseeds the library from scratch.
+
+This was deliberate. Clearing the selection automatically is easy to write and
+cannot tell LTK's auto-enable apart from skins *you* switched on, so it ends
+up deleting your choices on every launch. Telling the two apart properly needs
+a content-hash ledger mapping your selection across LTK's UUID renaming —
+which is exactly the bookkeeping this rebuild removed, and too much machinery
+for an annoyance.
 
 Syncing does not require LTK to be closed. If it happens to be open, its library
 will look empty until it is restarted, so the app says exactly that in a

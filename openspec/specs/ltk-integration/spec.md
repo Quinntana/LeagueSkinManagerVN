@@ -17,7 +17,6 @@ every settings and library edit while LTK is running.
 |---|---|
 | read | `settings.json` → `modStoragePath` |
 | write | `settings.json` → `enforceSkinhackScan` only |
-| write | `library.json` → each profile's `enabledMods` and `layerStates` |
 | write | `archives/*.fantome`, under any filename |
 | delete | contents of `archives/` and `mods/` |
 
@@ -55,23 +54,26 @@ LTK reconciles its library from disk on **every** startup regardless of
   makes packages adopt and self-enable mid-session while the user is looking
   at the library
 
-## Requirement: Nothing is enabled by default
+## Requirement: The enabled selection is LTK's to own
 
 LTK switches a package **on** the moment it adopts it, with or without the
-watcher. The library holds every skin in the source: 171 of 173 champions have
-more than one, and Miss Fortune alone has 23. Leaving them all enabled makes a
-dozen skins compete per champion, with the winner changing silently whenever
-the source updates.
+watcher. Since the library holds every skin in the source — 171 of 173
+champions have more than one, and Miss Fortune alone has 23 — a sync leaves a
+dozen skins enabled per champion, with the winner decided by LTK's ordering.
 
-#### Scenario: The baseline is restored after a sync
-- **WHEN** the application starts and LTK is not running
-- **THEN** it SHALL empty every profile's `enabledMods` and `layerStates`
-- **AND** it SHALL leave every mod in the library
+#### Scenario: The application does not intervene
+- **WHEN** LTK auto-enables adopted packages
+- **THEN** the application SHALL NOT write `library.json`
+- **BECAUSE** an automatic clear cannot distinguish LTK's auto-enable from
+  skins the user switched on, so it deletes their choices on every launch;
+  distinguishing them properly needs a content-hash ledger to carry a
+  selection across LTK's UUID renaming, which is the bookkeeping this design
+  exists to avoid
 
-#### Scenario: Skins are switched off, never removed
-- **WHEN** enabled mods are cleared
-- **THEN** `mods`, `archives/`, and every other `library.json` field are
-  unchanged
+#### Scenario: Curating skins
+- **THEN** the user SHALL manage the selection in LTK's own library view
+- **AND** those choices SHALL survive until the next sync, which wipes and
+  reseeds the library
 
 ## Requirement: Syncing does not require LTK to be closed
 
